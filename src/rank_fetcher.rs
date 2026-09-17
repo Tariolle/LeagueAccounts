@@ -137,7 +137,7 @@ impl RankFetcher {
         }
 
         let profile_level =
-            Regex::new(r"profile_icons/profileIcon\d+\.jpg.{0,1200}?<span[^>]*>(\d+)</span>")
+            Regex::new(r"(?s)profile_icons/profileIcon\d+\.jpg.{0,1200}?<span[^>]*>(\d+)</span>")
                 .expect("valid profile level regex");
         if let Some(captures) = profile_level.captures(decoded_payload) {
             return captures
@@ -147,7 +147,7 @@ impl RankFetcher {
         }
 
         let react_level =
-            Regex::new(r#"profile_icons/profileIcon\d+\.jpg.{0,1600}?"children":(\d+)"#)
+            Regex::new(r#"(?s)profile_icons/profileIcon\d+\.jpg.{0,1600}?"children":(\d+)"#)
                 .expect("valid react level regex");
         react_level
             .captures(decoded_payload)
@@ -158,7 +158,7 @@ impl RankFetcher {
 
     pub fn parse_last_season_from_opgg(&self, decoded_payload: &str) -> (String, String) {
         let history = Regex::new(
-            r#""season":"(?P<season>[^"]+)","rank_entries":\{"high_rank_info":\{"tier":"(?P<high_tier>[^"]*)","lp":(?P<high_lp>null|"[^"]*").*?\},"rank_info":\{"tier":"(?P<rank_tier>[^"]*)","lp":(?P<rank_lp>null|"[^"]*)""#,
+            r#"(?s)"season":"(?P<season>[^"]+)","rank_entries":\{"high_rank_info":\{"tier":"(?P<high_tier>[^"]*)","lp":(?P<high_lp>null|"[^"]*").*?\},"rank_info":\{"tier":"(?P<rank_tier>[^"]*)","lp":(?P<rank_lp>null|"[^"]*")"#,
         )
         .expect("valid history regex");
 

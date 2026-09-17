@@ -14,7 +14,10 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+mod shortcuts;
+
 const RANKS_IMAGE: &[u8] = include_bytes!("../assets/ranks_compatibilities.webp");
+const TABLE_HEIGHT: f32 = 270.0;
 
 #[derive(Clone)]
 struct RankUpdate {
@@ -56,6 +59,8 @@ struct LeagueAccountsApp {
     show_help: bool,
     show_ranks: bool,
     ranks_texture: Option<TextureHandle>,
+    #[cfg(windows)]
+    native_auto_type: Option<shortcuts::NativeAutoType>,
 }
 
 impl LeagueAccountsApp {
@@ -68,6 +73,29 @@ impl LeagueAccountsApp {
             Err(error) => format!("Could not load accounts: {error}"),
         };
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        #[cfg(windows)]
+        {
+            let mut app = Self::with_manager(manager, status);
+            if let Some(window) = cc.winit_window() {
+                let window = Arc::clone(window);
+                match shortcuts::NativeAutoType::install(cc.egui_ctx.clone(), move || {
+                    window.has_focus()
+                }) {
+                    Ok(hook) => app.native_auto_type = Some(hook),
+                    Err(error) => {
+                        app.status = format!("{}; Auto-type shortcut unavailable: {error}", app.status);
+                    }
+                }
+            }
+            app
+        }
+        #[cfg(not(windows))]
+        {
+            Self::with_manager(manager, status)
+        }
+    }
+
+    fn with_manager(manager: AccountManager, status: String) -> Self {
         Self {
             manager,
             search: String::new(),
@@ -90,6 +118,8 @@ impl LeagueAccountsApp {
             show_help: false,
             show_ranks: false,
             ranks_texture: None,
+            #[cfg(windows)]
+            native_auto_type: None,
         }
     }
 
@@ -404,7 +434,7 @@ impl LeagueAccountsApp {
         self.status = if completed {
             "Switched to the previous window and entered credentials.".to_owned()
         } else {
-            "Auto-type failed: Windows rejected the clipboard or keyboard input.".to_owned()
+            "Auto-type failed: shortcut keys were not released, or clipboard/keyboard input was rejected.".to_owned()
         };
     }
 
@@ -603,24 +633,7 @@ impl LeagueAccountsApp {
     fn render(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.poll_rank_jobs();
-        let (delete, copy, auto_type) = ctx.input_mut(|input| {
-            // Consume the most specific shortcut first. This prevents a
-            // focused text field from treating Ctrl+Shift+V as paste and
-            // guarantees the app receives the full auto-type chord.
-            let auto_type = input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::V);
-            let copy = !auto_type && input.consume_key(Modifiers::CTRL, Key::C);
-            let delete = input.consume_key(Modifiers::NONE, Key::Delete);
-            (delete, copy, auto_type)
-        });
-        if delete {
-            self.delete_selected();
-        }
-        if copy {
-            self.copy_shortcut();
-        }
-        if auto_type {
-            self.auto_type_selected();
-        }
+        let mut table_cell_ids = Vec::new();
 
         egui::Panel::top("header").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
@@ -631,6 +644,7 @@ impl LeagueAccountsApp {
                 ui.label("Search:");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.search)
+                        .id(egui::Id::new("search"))
                         .hint_text("Filter by name or account ID…")
                         .desired_width(300.0),
                 );
@@ -642,222 +656,239 @@ impl LeagueAccountsApp {
         });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(
-                        (ui.available_width() - 170.0).max(400.0),
-                        ui.available_height(),
-                    ),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.set_min_height(270.0);
-                            egui::ScrollArea::both()
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    egui::Grid::new("accounts_table")
-                                        .striped(true)
-                                        .min_col_width(80.0)
-                                        .spacing([10.0, 5.0])
+            // The bounded table must leave space for the forms. The outer
+            // scroll area keeps every control reachable on smaller windows.
+            egui::ScrollArea::vertical()
+                .id_salt("main_content_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), TABLE_HEIGHT),
+                        egui::Layout::left_to_right(egui::Align::Min),
+                        |ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(
+                                (ui.available_width() - 170.0).max(400.0),
+                                TABLE_HEIGHT,
+                            ),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    egui::ScrollArea::both()
+                                        .id_salt("accounts_scroll")
+                                        .max_height(TABLE_HEIGHT)
+                                        .auto_shrink([false, false])
                                         .show(ui, |ui| {
-                                            for header in [
-                                                "Account ID",
-                                                "Summoner Name",
-                                                "Region",
-                                                "Level",
-                                                "Tier",
-                                                "Division",
-                                                "LP",
-                                                "Reached Last Season",
-                                                "Finished Last Season",
-                                                "Description",
-                                            ] {
-                                                ui.label(RichText::new(header).strong());
-                                            }
-                                            ui.end_row();
-                                            for account in self.visible_accounts() {
-                                                let selected =
-                                                    self.selected.as_ref() == Some(&account.key());
-                                                let values = [
-                                                    account.account_id.clone(),
-                                                    account.name.clone(),
-                                                    account.region_display.clone(),
-                                                    if account.level.is_empty() {
-                                                        "...".to_owned()
-                                                    } else {
-                                                        account.level.clone()
-                                                    },
-                                                    if account.tier.is_empty()
-                                                        || account.tier == "Unranked"
-                                                    {
-                                                        "...".to_owned()
-                                                    } else {
-                                                        account.tier.clone()
-                                                    },
-                                                    if account.division.is_empty() {
-                                                        "...".to_owned()
-                                                    } else {
-                                                        account.division.clone()
-                                                    },
-                                                    if account.lp.is_empty() {
-                                                        "...".to_owned()
-                                                    } else {
-                                                        account.lp.clone()
-                                                    },
-                                                    if account.reached_last_season.is_empty() {
-                                                        "N/A".to_owned()
-                                                    } else {
-                                                        account.reached_last_season.clone()
-                                                    },
-                                                    if account.finished_last_season.is_empty() {
-                                                        "N/A".to_owned()
-                                                    } else {
-                                                        account.finished_last_season.clone()
-                                                    },
-                                                    account.description.clone(),
-                                                ];
-                                                for (column, value) in values.iter().enumerate() {
-                                                    let response =
-                                                        ui.selectable_label(selected, value);
-                                                    if response.clicked() {
-                                                        self.selected = Some(account.key());
+                                            egui::Grid::new("accounts_table")
+                                                .striped(true)
+                                                .min_col_width(80.0)
+                                                .spacing([10.0, 5.0])
+                                                .show(ui, |ui| {
+                                                    for header in [
+                                                        "Account ID",
+                                                        "Summoner Name",
+                                                        "Region",
+                                                        "Level",
+                                                        "Tier",
+                                                        "Division",
+                                                        "LP",
+                                                        "Reached Last Season",
+                                                        "Finished Last Season",
+                                                        "Description",
+                                                    ] {
+                                                        ui.label(RichText::new(header).strong());
                                                     }
-                                                    if response.double_clicked()
-                                                        && (column == 1 || column == 9)
-                                                    {
-                                                        self.show_edit(
-                                                            &account,
-                                                            if column == 1 {
-                                                                EditField::Name
+                                                    ui.end_row();
+                                                    for account in self.visible_accounts() {
+                                                        let selected = self.selected.as_ref()
+                                                            == Some(&account.key());
+                                                        let values = [
+                                                            account.account_id.clone(),
+                                                            account.name.clone(),
+                                                            account.region_display.clone(),
+                                                            if account.level.is_empty() {
+                                                                "...".to_owned()
                                                             } else {
-                                                                EditField::Description
+                                                                account.level.clone()
                                                             },
-                                                        );
+                                                            if account.tier.is_empty()
+                                                                || account.tier == "Unranked"
+                                                            {
+                                                                "...".to_owned()
+                                                            } else {
+                                                                account.tier.clone()
+                                                            },
+                                                            if account.division.is_empty() {
+                                                                "...".to_owned()
+                                                            } else {
+                                                                account.division.clone()
+                                                            },
+                                                            if account.lp.is_empty() {
+                                                                "...".to_owned()
+                                                            } else {
+                                                                account.lp.clone()
+                                                            },
+                                                            if account.reached_last_season.is_empty() {
+                                                                "N/A".to_owned()
+                                                            } else {
+                                                                account.reached_last_season.clone()
+                                                            },
+                                                            if account.finished_last_season.is_empty() {
+                                                                "N/A".to_owned()
+                                                            } else {
+                                                                account.finished_last_season.clone()
+                                                            },
+                                                            account.description.clone(),
+                                                        ];
+                                                        for (column, value) in values.iter().enumerate() {
+                                                            // Keep focus attached to the account,
+                                                            // not its position after filtering/sorting.
+                                                            let id = ui.make_persistent_id((account.key(), column));
+                                                            let response = ui.push_id(id, |ui| {
+                                                                ui.selectable_label(selected, value)
+                                                            }).inner;
+                                                            table_cell_ids.push(response.id);
+                                                            if response.clicked() {
+                                                                self.selected = Some(account.key());
+                                                                response.request_focus();
+                                                            }
+                                                            if response.double_clicked()
+                                                                && (column == 1 || column == 9)
+                                                            {
+                                                                self.show_edit(
+                                                                    &account,
+                                                                    if column == 1 {
+                                                                        EditField::Name
+                                                                    } else {
+                                                                        EditField::Description
+                                                                    },
+                                                                );
+                                                            }
+                                                        }
+                                                        ui.end_row();
                                                     }
-                                                }
-                                                ui.end_row();
-                                            }
+                                                });
                                         });
                                 });
-                        });
-                    },
-                );
-                ui.separator();
-                ui.vertical(|ui| {
-                    ui.heading("Actions");
-                    ui.add_enabled_ui(self.selected.is_some(), |ui| {
-                        if ui.button("Copy Account ID").clicked() {
-                            self.copy_account_id();
-                        }
-                        if ui.button("Copy Password").clicked() {
-                            self.copy_password();
-                        }
-                    });
-                    if ui.button("Refresh Ranks").clicked() {
-                        self.refresh_all_ranks();
-                    }
-                    if ui.button("Export Data").clicked() {
-                        self.export_data();
-                    }
-                    if ui.button("Import Data").clicked() {
-                        self.import_data();
-                    }
-                    if ui.button("Shortcuts Help").clicked() {
-                        self.show_help = true;
-                    }
-                });
-            });
-
-            ui.add_space(10.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.heading("Add New Account");
-                egui::Grid::new("add_form")
-                    .num_columns(2)
-                    .spacing([8.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label("Account ID:");
-                        ui.text_edit_singleline(&mut self.add_account_id);
-                        ui.end_row();
-                        ui.label("Summoner Name:");
-                        ui.text_edit_singleline(&mut self.add_name);
-                        ui.end_row();
-                        ui.label("Region:");
-                        egui::ComboBox::from_id_salt("add_region")
-                            .selected_text(&self.add_region)
-                            .show_ui(ui, |ui| {
-                                for (label, _) in REGION_MAP {
-                                    ui.selectable_value(
-                                        &mut self.add_region,
-                                        (*label).to_owned(),
-                                        *label,
-                                    );
+                            },
+                        );
+                        ui.separator();
+                        ui.vertical(|ui| {
+                            ui.heading("Actions");
+                            ui.add_enabled_ui(self.selected.is_some(), |ui| {
+                                if ui.button("Copy Account ID").clicked() {
+                                    self.copy_account_id();
+                                }
+                                if ui.button("Copy Password").clicked() {
+                                    self.copy_password();
                                 }
                             });
-                        ui.end_row();
-                        ui.label("Password:");
-                        ui.add(egui::TextEdit::singleline(&mut self.add_password).password(true));
-                        ui.end_row();
-                        ui.label("Description:");
-                        ui.text_edit_singleline(&mut self.add_description);
-                        ui.end_row();
+                            if ui.button("Refresh Ranks").clicked() {
+                                self.refresh_all_ranks();
+                            }
+                            if ui.button("Export Data").clicked() {
+                                self.export_data();
+                            }
+                            if ui.button("Import Data").clicked() {
+                                self.import_data();
+                            }
+                            if ui.button("Shortcuts Help").clicked() {
+                                self.show_help = true;
+                            }
+                        });
                     });
-                let add_button = ui.button("Add Account");
-                let add_with_enter =
-                    add_button.has_focus() && ctx.input(|input| input.key_pressed(Key::Enter));
-                if add_button.clicked() || add_with_enter {
-                    self.add_account();
-                }
-                ui.separator();
-                ui.heading("Multi Add");
-                ui.label("One account per line: AccountID--InGameName#TAG--password");
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.multi_add)
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY),
-                );
-                if ui.button("Multi Add").clicked() {
-                    self.multi_add_accounts();
-                }
-            });
 
-            ui.add_space(10.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Friend Elo:");
-                    egui::ComboBox::from_id_salt("friend_tier")
-                        .selected_text(&self.friend_tier)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.friend_tier,
-                                "Show All".to_owned(),
-                                "Show All",
-                            );
-                            for tier in TIER_ORDER.iter().take(TIER_ORDER.len() - 2) {
-                                if !matches!(*tier, "Challenger" | "Grandmaster") {
+                    ui.add_space(10.0);
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.heading("Add New Account");
+                        egui::Grid::new("add_form")
+                            .num_columns(2)
+                            .spacing([8.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label("Account ID:");
+                                ui.text_edit_singleline(&mut self.add_account_id);
+                                ui.end_row();
+                                ui.label("Summoner Name:");
+                                ui.text_edit_singleline(&mut self.add_name);
+                                ui.end_row();
+                                ui.label("Region:");
+                                egui::ComboBox::from_id_salt("add_region")
+                                    .selected_text(&self.add_region)
+                                    .show_ui(ui, |ui| {
+                                        for (label, _) in REGION_MAP {
+                                            ui.selectable_value(
+                                                &mut self.add_region,
+                                                (*label).to_owned(),
+                                                *label,
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
+                                ui.label("Password:");
+                                ui.add(egui::TextEdit::singleline(&mut self.add_password).password(true));
+                                ui.end_row();
+                                ui.label("Description:");
+                                ui.text_edit_singleline(&mut self.add_description);
+                                ui.end_row();
+                            });
+                        let add_button = ui.button("Add Account");
+                        let add_with_enter = add_button.has_focus()
+                            && ctx.input(|input| input.key_pressed(Key::Enter));
+                        if add_button.clicked() || add_with_enter {
+                            self.add_account();
+                        }
+                        ui.separator();
+                        ui.heading("Multi Add");
+                        ui.label("One account per line: AccountID--InGameName#TAG--password");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.multi_add)
+                                .desired_rows(3)
+                                .desired_width(f32::INFINITY),
+                        );
+                        if ui.button("Multi Add").clicked() {
+                            self.multi_add_accounts();
+                        }
+                    });
+
+                    ui.add_space(10.0);
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Friend Elo:");
+                            egui::ComboBox::from_id_salt("friend_tier")
+                                .selected_text(&self.friend_tier)
+                                .show_ui(ui, |ui| {
                                     ui.selectable_value(
                                         &mut self.friend_tier,
-                                        (*tier).to_owned(),
-                                        *tier,
+                                        "Show All".to_owned(),
+                                        "Show All",
                                     );
-                                }
+                                    for tier in TIER_ORDER.iter().take(TIER_ORDER.len() - 2) {
+                                        if !matches!(*tier, "Challenger" | "Grandmaster") {
+                                            ui.selectable_value(
+                                                &mut self.friend_tier,
+                                                (*tier).to_owned(),
+                                                *tier,
+                                            );
+                                        }
+                                    }
+                                });
+                            egui::ComboBox::from_id_salt("friend_division")
+                                .selected_text(&self.friend_division)
+                                .show_ui(ui, |ui| {
+                                    for division in ["I", "II", "III", "IV"] {
+                                        ui.selectable_value(
+                                            &mut self.friend_division,
+                                            division.to_owned(),
+                                            division,
+                                        );
+                                    }
+                                });
+                            if ui.button("Ranks Compatibilities").clicked() {
+                                self.show_ranks = true;
                             }
                         });
-                    egui::ComboBox::from_id_salt("friend_division")
-                        .selected_text(&self.friend_division)
-                        .show_ui(ui, |ui| {
-                            for division in ["I", "II", "III", "IV"] {
-                                ui.selectable_value(
-                                    &mut self.friend_division,
-                                    division.to_owned(),
-                                    division,
-                                );
-                            }
-                        });
-                    if ui.button("Ranks Compatibilities").clicked() {
-                        self.show_ranks = true;
-                    }
+                    });
                 });
-            });
         });
 
         if let Some(edit) = &mut self.edit_state {
@@ -870,7 +901,10 @@ impl LeagueAccountsApp {
             .collapsible(false)
             .resizable(false)
             .show(&ctx, |ui| {
-                ui.text_edit_singleline(&mut edit.value);
+                ui.add(
+                    egui::TextEdit::singleline(&mut edit.value)
+                        .id(egui::Id::new("account_edit")),
+                );
                 ui.horizontal(|ui| {
                     save = ui.button("Save").clicked();
                     cancel = ui.button("Cancel").clicked();
@@ -886,9 +920,9 @@ impl LeagueAccountsApp {
         if self.show_help {
             egui::Window::new("Shortcuts Help").open(&mut self.show_help).resizable(false).show(&ctx, |ui| {
                 ui.label("Keyboard Shortcuts:");
-                ui.label("• Ctrl+C: Copy Account ID (press again to copy Password)");
+                ui.label("• Ctrl+C in the account table: Copy Account ID (press again to copy Password)");
                 ui.label("• Ctrl+Shift+V: Auto-type Account ID and Password into another window");
-                ui.label("• Delete: Delete selected account");
+                ui.label("• Delete in the account table: Delete selected account");
                 ui.label("• Double-click Summoner Name or Description: Edit in place");
                 ui.label("• Enter on Add Account: Add a new account");
                 ui.separator();
@@ -896,6 +930,34 @@ impl LeagueAccountsApp {
             });
         }
         self.show_ranks_window(&ctx);
+
+        // Check focus after all widgets have handled input. A selected account
+        // alone is not permission to steal Delete or Copy from a text editor.
+        let table_has_focus = self.selected.is_some()
+            && self.edit_state.is_none()
+            && !self.show_help
+            && !self.show_ranks
+            && ctx.memory(|memory| {
+                memory.focused().is_some_and(|id| table_cell_ids.contains(&id))
+            });
+        let actions = shortcuts::take_table_actions(&ctx, table_has_focus);
+        if actions.delete {
+            self.delete_selected();
+        } else if actions.copy {
+            self.copy_shortcut();
+        }
+
+        // Native Windows events are intercepted before clipboard translation.
+        // Keep the key-event path for integrations that pass the chord through.
+        let auto_type = ctx.input_mut(|input| {
+            input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::V)
+        });
+        #[cfg(windows)]
+        let auto_type = self.native_auto_type.as_ref()
+            .is_some_and(shortcuts::NativeAutoType::take_requested) || auto_type;
+        if auto_type {
+            self.auto_type_selected();
+        }
         ctx.request_repaint_after(Duration::from_millis(100));
     }
 }
@@ -907,9 +969,10 @@ impl eframe::App for LeagueAccountsApp {
 }
 
 fn auto_type_credentials(account_id: &str, password: &str) -> bool {
-    // The shortcut callback runs while Ctrl+Shift+V may still be physically
-    // held. Wait for those keys to be released before injecting Alt+Tab.
-    wait_for_shortcut_release();
+    // Do not inject input if the physical shortcut is still held at timeout.
+    if !wait_for_shortcut_release() {
+        return false;
+    }
     let Ok(mut clipboard) = arboard::Clipboard::new() else {
         return false;
     };
@@ -976,7 +1039,7 @@ fn auto_type_credentials(account_id: &str, password: &str) -> bool {
 }
 
 #[cfg(windows)]
-fn wait_for_shortcut_release() {
+fn wait_for_shortcut_release() -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, VK_CONTROL, VK_SHIFT, VK_V,
     };
@@ -989,16 +1052,18 @@ fn wait_for_shortcut_release() {
             unsafe { GetAsyncKeyState(key as i32) < 0 }
         });
         if !shortcut_still_down {
-            break;
+            thread::sleep(Duration::from_millis(20));
+            return true;
         }
         thread::sleep(Duration::from_millis(10));
     }
-    thread::sleep(Duration::from_millis(20));
+    false
 }
 
 #[cfg(not(windows))]
-fn wait_for_shortcut_release() {
+fn wait_for_shortcut_release() -> bool {
     thread::sleep(Duration::from_millis(120));
+    true
 }
 
 #[cfg(windows)]
@@ -1047,3 +1112,7 @@ fn main() -> eframe::Result {
         Box::new(|cc| Ok(Box::new(LeagueAccountsApp::new(cc)))),
     )
 }
+
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod app_tests;

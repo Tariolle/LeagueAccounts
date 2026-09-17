@@ -1,0 +1,28 @@
+name: Rust (Windows)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install stable Rust and Clippy
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Unit and regression tests
+        run: cargo +stable test --locked --all-targets
+      - name: Clippy
+        run: cargo +stable clippy --locked --all-targets -- -D warnings
+      - name: Release build
+        run: cargo +stable build --locked --release
