@@ -54,12 +54,15 @@ impl AutoTypeChord {
                 trigger: false,
             };
         }
-        if self.captured {
+        if self.captured && repeat {
             return ChordAction {
                 consume: true,
                 trigger: false,
             };
         }
+        // A fresh key-down also rearms the latch if key-up went to another
+        // window after Alt+Tab. Queued repeats remain consumed until then.
+        self.captured = false;
         if !repeat && modifiers.ctrl && modifiers.shift && !modifiers.alt && !modifiers.mac_cmd {
             self.captured = true;
             return ChordAction {
@@ -146,12 +149,7 @@ mod native {
                     .as_mut()
                     .is_some_and(|state| {
                         let requested = std::mem::take(&mut state.requested);
-                        if (state.is_focused)() {
-                            requested
-                        } else {
-                            state.chord = AutoTypeChord::default();
-                            false
-                        }
+                        requested && (state.is_focused)()
                     })
             })
         }
@@ -179,20 +177,25 @@ mod native {
                 let Some(state) = slot.as_mut() else {
                     return false;
                 };
-                if !(state.is_focused)() {
-                    state.chord = AutoTypeChord::default();
+                let focused = (state.is_focused)();
+                if !focused {
                     state.requested = false;
-                    return false;
                 }
                 // GetKeyState reflects the modifiers associated with this
                 // queued message, unlike polling their later physical state.
                 let down = |key: u16| unsafe { GetKeyState(i32::from(key)) < 0 };
-                let modifiers = Modifiers {
-                    ctrl: down(VK_CONTROL),
-                    shift: down(VK_SHIFT),
-                    alt: down(VK_MENU),
-                    mac_cmd: down(VK_LWIN) || down(VK_RWIN),
-                    ..Modifiers::default()
+                let modifiers = if focused {
+                    Modifiers {
+                        ctrl: down(VK_CONTROL),
+                        shift: down(VK_SHIFT),
+                        alt: down(VK_MENU),
+                        mac_cmd: down(VK_LWIN) || down(VK_RWIN),
+                        ..Modifiers::default()
+                    }
+                } else {
+                    // Do not trigger in another window, but still consume
+                    // repeats/key-up from the chord captured before Alt+Tab.
+                    Modifiers::NONE
                 };
                 let action = state.chord.on_v_key(
                     flags & (1_isize << 31) == 0,
@@ -309,4 +312,30 @@ mod tests {
             ChordAction::default()
         );
     }
+    #[test]
+    fn captured_repeats_stay_consumed_after_focus_or_modifiers_change() {
+        let mut chord = AutoTypeChord::default();
+        assert!(chord.on_v_key(true, false, Modifiers::CTRL | Modifiers::SHIFT).trigger);
+        assert_eq!(
+            chord.on_v_key(true, true, Modifiers::NONE),
+            ChordAction { consume: true, trigger: false }
+        );
+        assert_eq!(
+            chord.on_v_key(false, true, Modifiers::NONE),
+            ChordAction { consume: true, trigger: false }
+        );
+    }
+
+    #[test]
+    fn fresh_press_rearms_when_keyup_went_to_another_window() {
+        let mut chord = AutoTypeChord::default();
+        let modifiers = Modifiers::CTRL | Modifiers::SHIFT;
+        assert!(chord.on_v_key(true, false, modifiers).trigger);
+        // A missing key-up must not swallow the next ordinary paste.
+        assert_eq!(chord.on_v_key(true, false, Modifiers::CTRL), ChordAction::default());
+        assert!(chord.on_v_key(true, false, modifiers).trigger);
+        // A second complete chord can also arrive without a local key-up.
+        assert!(chord.on_v_key(true, false, modifiers).trigger);
+    }
+
 }
