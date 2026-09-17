@@ -1,5 +1,5 @@
 use super::*;
-use egui::{Event, OutputCommand, RawInput, Rect, Vec2};
+use egui::{Context, Event, OutputCommand, RawInput, Rect, Vec2};
 
 struct NoNetwork;
 
@@ -11,10 +11,8 @@ impl RankProvider for NoNetwork {
 
 fn test_app(count: usize) -> (tempfile::TempDir, LeagueAccountsApp) {
     let directory = tempfile::tempdir().unwrap();
-    let mut manager = AccountManager::with_path(
-        directory.path().join("accounts.json"),
-        Arc::new(NoNetwork),
-    );
+    let mut manager =
+        AccountManager::with_path(directory.path().join("accounts.json"), Arc::new(NoNetwork));
     manager.accounts = (0..count)
         .map(|index| Account {
             account_id: format!("review-regression-test-{index}"),
@@ -31,7 +29,12 @@ fn test_app(count: usize) -> (tempfile::TempDir, LeagueAccountsApp) {
     (directory, app)
 }
 
-fn frame(ctx: &Context, app: &mut LeagueAccountsApp, size: Vec2, events: Vec<Event>) -> egui::FullOutput {
+fn frame(
+    ctx: &Context,
+    app: &mut LeagueAccountsApp,
+    size: Vec2,
+    events: Vec<Event>,
+) -> egui::FullOutput {
     ctx.run_ui(
         RawInput {
             screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
@@ -67,7 +70,10 @@ fn delete_in_search_edits_text_without_deleting_selected_account() {
         &ctx,
         &mut app,
         size,
-        vec![key(Key::Home, Modifiers::NONE), key(Key::Delete, Modifiers::NONE)],
+        vec![
+            key(Key::Home, Modifiers::NONE),
+            key(Key::Delete, Modifiers::NONE),
+        ],
     );
     assert_eq!(app.search, "earchtext");
     assert_eq!(app.manager.accounts, accounts);
@@ -88,7 +94,10 @@ fn delete_in_description_editor_does_not_delete_selected_account() {
         &ctx,
         &mut app,
         size,
-        vec![key(Key::Home, Modifiers::NONE), key(Key::Delete, Modifiers::NONE)],
+        vec![
+            key(Key::Home, Modifiers::NONE),
+            key(Key::Delete, Modifiers::NONE),
+        ],
     );
     assert_eq!(app.edit_state.as_ref().unwrap().value, "escription");
     assert_eq!(app.manager.accounts, vec![account]);
@@ -108,13 +117,22 @@ fn copy_in_search_preserves_text_copy_instead_of_copying_credentials() {
         &mut app,
         size,
         vec![
-            key(Key::A, Modifiers { ctrl: true, command: true, ..Modifiers::NONE }),
+            key(
+                Key::A,
+                Modifiers {
+                    ctrl: true,
+                    command: true,
+                    ..Modifiers::NONE
+                },
+            ),
             Event::Copy,
         ],
     );
-    assert!(output.platform_output.commands.iter().any(|command| {
-        matches!(command, OutputCommand::CopyText(text) if text == "copy me")
-    }));
+    assert!(output
+        .platform_output
+        .commands
+        .iter()
+        .any(|command| { matches!(command, OutputCommand::CopyText(text) if text == "copy me") }));
     assert_eq!(app.copy_counter, 0);
 }
 
@@ -131,9 +149,10 @@ fn text_is_visible(output: &egui::FullOutput, text: &str, viewport: Rect) -> boo
             _ => false,
         }
     }
-    output.shapes.iter().any(|shape| {
-        in_shape(&shape.shape, text, shape.clip_rect.intersect(viewport))
-    })
+    output
+        .shapes
+        .iter()
+        .any(|shape| in_shape(&shape.shape, text, shape.clip_rect.intersect(viewport)))
 }
 
 #[test]
@@ -148,7 +167,10 @@ fn forms_and_filters_are_visible_with_empty_and_full_tables() {
         }
         let output = frame(&ctx, &mut app, size, vec![]);
         for text in ["Add New Account", "Multi Add", "Friend Elo:"] {
-            assert!(text_is_visible(&output, text, viewport), "{text} hidden with {count} accounts");
+            assert!(
+                text_is_visible(&output, text, viewport),
+                "{text} hidden with {count} accounts"
+            );
         }
     }
 }

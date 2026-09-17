@@ -2,8 +2,6 @@
 
 **LeagueAccounts** helps you manage multiple **League of Legends** accounts from one Windows app, with secure password storage, quick login helpers, and automatic rank updates. The application is implemented in Rust and ships as a native Windows desktop executable.
 
-![LeagueAccounts screenshot](assets/screenshot.png)
-
 ## Features
 
 - **Quick Account Switching**: Keep all accounts in one list, searchable by account ID or summoner name.

@@ -1,6 +1,6 @@
 [package]
 name = "leagueaccounts"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 description = "League of Legends account manager for Windows"
 license = "MIT"
@@ -9,7 +9,6 @@ license = "MIT"
 arboard = "3.6"
 eframe = "0.34"
 html-escape = "0.2"
-image = { version = "0.25", default-features = false, features = ["webp"] }
 keyring = { version = "3.6", features = ["windows-native"] }
 regex = "1.12"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
@@ -28,6 +27,11 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile = "3.23"
+
+[build-dependencies]
+ico = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+winresource = "0.1"
 
 [[bin]]
 name = "LeagueAccounts"

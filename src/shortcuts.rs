@@ -152,13 +152,10 @@ mod native {
 
         pub fn take_requested(&self) -> bool {
             STATE.with(|state| {
-                state
-                    .borrow_mut()
-                    .as_mut()
-                    .is_some_and(|state| {
-                        let requested = std::mem::take(&mut state.requested);
-                        requested && (state.is_focused)()
-                    })
+                state.borrow_mut().as_mut().is_some_and(|state| {
+                    let requested = std::mem::take(&mut state.requested);
+                    requested && (state.is_focused)()
+                })
             })
         }
     }
@@ -236,9 +233,7 @@ mod native {
         use super::*;
         use std::cell::Cell;
         use std::rc::Rc;
-        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-            GetKeyboardState, SetKeyboardState,
-        };
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState};
         use windows_sys::Win32::UI::WindowsAndMessaging::HC_NOREMOVE;
 
         // SetKeyboardState changes only this test thread's message-time state.
@@ -274,9 +269,17 @@ mod native {
             assert!(handle_keyboard_event(HC_ACTION as i32, key, 1));
             assert!(hook.take_requested());
             assert!(!hook.take_requested());
-            assert!(handle_keyboard_event(HC_ACTION as i32, key, (1_isize << 30) | 1));
+            assert!(handle_keyboard_event(
+                HC_ACTION as i32,
+                key,
+                (1_isize << 30) | 1
+            ));
             assert!(!hook.take_requested());
-            assert!(handle_keyboard_event(HC_ACTION as i32, key, (1_isize << 31) | 1));
+            assert!(handle_keyboard_event(
+                HC_ACTION as i32,
+                key,
+                (1_isize << 31) | 1
+            ));
             assert!(!hook.take_requested());
             drop(hook);
             assert!(STATE.with(|state| state.borrow().is_none()));
@@ -287,14 +290,23 @@ mod native {
             let _keyboard = KeyboardStateGuard::control_shift();
             let focused = Rc::new(Cell::new(true));
             let focus_probe = Rc::clone(&focused);
-            let hook = NativeAutoType::install(Context::default(), move || focus_probe.get()).unwrap();
+            let hook =
+                NativeAutoType::install(Context::default(), move || focus_probe.get()).unwrap();
             let key = VK_V as usize;
             assert!(handle_keyboard_event(HC_ACTION as i32, key, 1));
             focused.set(false);
             assert!(!hook.take_requested());
-            assert!(handle_keyboard_event(HC_ACTION as i32, key, (1_isize << 30) | 1));
+            assert!(handle_keyboard_event(
+                HC_ACTION as i32,
+                key,
+                (1_isize << 30) | 1
+            ));
             assert!(!hook.take_requested());
-            assert!(handle_keyboard_event(HC_ACTION as i32, key, (1_isize << 31) | 1));
+            assert!(handle_keyboard_event(
+                HC_ACTION as i32,
+                key,
+                (1_isize << 31) | 1
+            ));
             assert!(!handle_keyboard_event(HC_ACTION as i32, key, 1));
             focused.set(true);
             assert!(handle_keyboard_event(HC_ACTION as i32, key, 1));
@@ -335,13 +347,20 @@ mod tests {
     fn focused_table_consumes_copy_event_and_delete_but_not_paste() {
         let ctx = Context::default();
         let input = eframe::egui::RawInput {
-            events: vec![Event::Copy, delete_event(), Event::Paste("ordinary paste".into())],
+            events: vec![
+                Event::Copy,
+                delete_event(),
+                Event::Paste("ordinary paste".into()),
+            ],
             ..Default::default()
         };
         let _ = ctx.run_ui(input, |_| {
             assert_eq!(
                 take_table_actions(&ctx, true),
-                TableActions { copy: true, delete: true }
+                TableActions {
+                    copy: true,
+                    delete: true
+                }
             );
             ctx.input(|input| {
                 assert_eq!(input.events, vec![Event::Paste("ordinary paste".into())]);
@@ -393,7 +412,10 @@ mod tests {
         // No clipboard read or Paste event is needed, even when it is empty.
         assert_eq!(
             chord.on_v_key(true, false, Modifiers::CTRL | Modifiers::SHIFT),
-            ChordAction { consume: true, trigger: true }
+            ChordAction {
+                consume: true,
+                trigger: true
+            }
         );
     }
 
@@ -404,12 +426,18 @@ mod tests {
         assert!(chord.on_v_key(true, false, modifiers).trigger);
         assert_eq!(
             chord.on_v_key(true, true, modifiers),
-            ChordAction { consume: true, trigger: false }
+            ChordAction {
+                consume: true,
+                trigger: false
+            }
         );
         // The modifiers may be released before V.
         assert_eq!(
             chord.on_v_key(false, false, Modifiers::NONE),
-            ChordAction { consume: true, trigger: false }
+            ChordAction {
+                consume: true,
+                trigger: false
+            }
         );
         assert!(chord.on_v_key(true, false, modifiers).trigger);
     }
@@ -423,8 +451,14 @@ mod tests {
             Modifiers::CTRL | Modifiers::SHIFT | Modifiers::ALT,
         ] {
             let mut chord = AutoTypeChord::default();
-            assert_eq!(chord.on_v_key(true, false, modifiers), ChordAction::default());
-            assert_eq!(chord.on_v_key(false, false, modifiers), ChordAction::default());
+            assert_eq!(
+                chord.on_v_key(true, false, modifiers),
+                ChordAction::default()
+            );
+            assert_eq!(
+                chord.on_v_key(false, false, modifiers),
+                ChordAction::default()
+            );
         }
     }
 
@@ -440,14 +474,24 @@ mod tests {
     #[test]
     fn captured_repeats_stay_consumed_after_focus_or_modifiers_change() {
         let mut chord = AutoTypeChord::default();
-        assert!(chord.on_v_key(true, false, Modifiers::CTRL | Modifiers::SHIFT).trigger);
+        assert!(
+            chord
+                .on_v_key(true, false, Modifiers::CTRL | Modifiers::SHIFT)
+                .trigger
+        );
         assert_eq!(
             chord.on_v_key(true, true, Modifiers::NONE),
-            ChordAction { consume: true, trigger: false }
+            ChordAction {
+                consume: true,
+                trigger: false
+            }
         );
         assert_eq!(
             chord.on_v_key(false, true, Modifiers::NONE),
-            ChordAction { consume: true, trigger: false }
+            ChordAction {
+                consume: true,
+                trigger: false
+            }
         );
     }
 
@@ -457,7 +501,10 @@ mod tests {
         let modifiers = Modifiers::CTRL | Modifiers::SHIFT;
         assert!(chord.on_v_key(true, false, modifiers).trigger);
         // A missing key-up must not swallow the next ordinary paste.
-        assert_eq!(chord.on_v_key(true, false, Modifiers::CTRL), ChordAction::default());
+        assert_eq!(
+            chord.on_v_key(true, false, Modifiers::CTRL),
+            ChordAction::default()
+        );
         assert!(chord.on_v_key(true, false, modifiers).trigger);
         // A second complete chord can also arrive without a local key-up.
         assert!(chord.on_v_key(true, false, modifiers).trigger);

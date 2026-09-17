@@ -1,6 +1,5 @@
 # Rust build artifacts
 target/
-target-pr/
 
 # Local build logs
 *.log
@@ -14,7 +13,7 @@ target-pr/
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# User data (if sensitive)
-data/league_accounts.json
+# Local agent settings
 .claude/settings.local.json

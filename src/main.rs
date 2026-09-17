@@ -1,8 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use eframe::egui::{
-    self, Color32, Context, Key, Modifiers, RichText, TextureHandle, TextureOptions,
-};
+use eframe::egui::{self, Color32, Key, Modifiers, RichText};
 use leagueaccounts::account_manager::KEYRING_SERVICE;
 use leagueaccounts::credentials;
 use leagueaccounts::models::{Account, AccountKey, RankInfo};
@@ -16,7 +14,7 @@ use std::time::Duration;
 
 mod shortcuts;
 
-const RANKS_IMAGE: &[u8] = include_bytes!("../assets/ranks_compatibilities.webp");
+const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 const TABLE_HEIGHT: f32 = 270.0;
 
 #[derive(Clone)]
@@ -57,8 +55,6 @@ struct LeagueAccountsApp {
     rank_jobs_pending: usize,
     edit_state: Option<EditState>,
     show_help: bool,
-    show_ranks: bool,
-    ranks_texture: Option<TextureHandle>,
     #[cfg(windows)]
     native_auto_type: Option<shortcuts::NativeAutoType>,
 }
@@ -83,7 +79,8 @@ impl LeagueAccountsApp {
                 }) {
                     Ok(hook) => app.native_auto_type = Some(hook),
                     Err(error) => {
-                        app.status = format!("{}; Auto-type shortcut unavailable: {error}", app.status);
+                        app.status =
+                            format!("{}; Auto-type shortcut unavailable: {error}", app.status);
                     }
                 }
             }
@@ -116,8 +113,6 @@ impl LeagueAccountsApp {
             rank_jobs_pending: 0,
             edit_state: None,
             show_help: false,
-            show_ranks: false,
-            ranks_texture: None,
             #[cfg(windows)]
             native_auto_type: None,
         }
@@ -591,42 +586,6 @@ impl LeagueAccountsApp {
             _ => false,
         }
     }
-
-    fn show_ranks_window(&mut self, ctx: &Context) {
-        if !self.show_ranks {
-            return;
-        }
-        if self.ranks_texture.is_none() {
-            if let Ok(image) = image::load_from_memory(RANKS_IMAGE) {
-                let image = image.to_rgba8();
-                let size = [image.width() as usize, image.height() as usize];
-                self.ranks_texture = Some(ctx.load_texture(
-                    "rank-compatibilities",
-                    egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw()),
-                    TextureOptions::LINEAR,
-                ));
-            }
-        }
-        let mut open = true;
-        egui::Window::new("Ranks Compatibilities")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .show(ctx, |ui| {
-                if let Some(texture) = &self.ranks_texture {
-                    let available = ui.available_size();
-                    let scale = (available.x / texture.size_vec2().x)
-                        .min(available.y / texture.size_vec2().y)
-                        .min(1.0);
-                    ui.image((texture.id(), texture.size_vec2() * scale));
-                } else {
-                    ui.label("Ranks image could not be loaded.");
-                }
-            });
-        if !open {
-            self.show_ranks = false;
-        }
-    }
 }
 
 impl LeagueAccountsApp {
@@ -666,137 +625,157 @@ impl LeagueAccountsApp {
                         egui::vec2(ui.available_width(), TABLE_HEIGHT),
                         egui::Layout::left_to_right(egui::Align::Min),
                         |ui| {
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(
-                                (ui.available_width() - 170.0).max(400.0),
-                                TABLE_HEIGHT,
-                            ),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                egui::Frame::group(ui.style()).show(ui, |ui| {
-                                    egui::ScrollArea::both()
-                                        .id_salt("accounts_scroll")
-                                        .max_height(TABLE_HEIGHT)
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            egui::Grid::new("accounts_table")
-                                                .striped(true)
-                                                .min_col_width(80.0)
-                                                .spacing([10.0, 5.0])
-                                                .show(ui, |ui| {
-                                                    for header in [
-                                                        "Account ID",
-                                                        "Summoner Name",
-                                                        "Region",
-                                                        "Level",
-                                                        "Tier",
-                                                        "Division",
-                                                        "LP",
-                                                        "Reached Last Season",
-                                                        "Finished Last Season",
-                                                        "Description",
-                                                    ] {
-                                                        ui.label(RichText::new(header).strong());
-                                                    }
-                                                    ui.end_row();
-                                                    for account in self.visible_accounts() {
-                                                        let selected = self.selected.as_ref()
-                                                            == Some(&account.key());
-                                                        let values = [
-                                                            account.account_id.clone(),
-                                                            account.name.clone(),
-                                                            account.region_display.clone(),
-                                                            if account.level.is_empty() {
-                                                                "...".to_owned()
-                                                            } else {
-                                                                account.level.clone()
-                                                            },
-                                                            if account.tier.is_empty()
-                                                                || account.tier == "Unranked"
-                                                            {
-                                                                "...".to_owned()
-                                                            } else {
-                                                                account.tier.clone()
-                                                            },
-                                                            if account.division.is_empty() {
-                                                                "...".to_owned()
-                                                            } else {
-                                                                account.division.clone()
-                                                            },
-                                                            if account.lp.is_empty() {
-                                                                "...".to_owned()
-                                                            } else {
-                                                                account.lp.clone()
-                                                            },
-                                                            if account.reached_last_season.is_empty() {
-                                                                "N/A".to_owned()
-                                                            } else {
-                                                                account.reached_last_season.clone()
-                                                            },
-                                                            if account.finished_last_season.is_empty() {
-                                                                "N/A".to_owned()
-                                                            } else {
-                                                                account.finished_last_season.clone()
-                                                            },
-                                                            account.description.clone(),
-                                                        ];
-                                                        for (column, value) in values.iter().enumerate() {
-                                                            // Keep focus attached to the account,
-                                                            // not its position after filtering/sorting.
-                                                            let id = ui.make_persistent_id((account.key(), column));
-                                                            let response = ui.push_id(id, |ui| {
-                                                                ui.selectable_label(selected, value)
-                                                            }).inner;
-                                                            table_cell_ids.push(response.id);
-                                                            if response.clicked() {
-                                                                self.selected = Some(account.key());
-                                                                response.request_focus();
-                                                            }
-                                                            if response.double_clicked()
-                                                                && (column == 1 || column == 9)
-                                                            {
-                                                                self.show_edit(
-                                                                    &account,
-                                                                    if column == 1 {
-                                                                        EditField::Name
-                                                                    } else {
-                                                                        EditField::Description
-                                                                    },
-                                                                );
-                                                            }
+                            ui.allocate_ui_with_layout(
+                                egui::vec2((ui.available_width() - 170.0).max(400.0), TABLE_HEIGHT),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                                        egui::ScrollArea::both()
+                                            .id_salt("accounts_scroll")
+                                            .max_height(TABLE_HEIGHT)
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                egui::Grid::new("accounts_table")
+                                                    .striped(true)
+                                                    .min_col_width(80.0)
+                                                    .spacing([10.0, 5.0])
+                                                    .show(ui, |ui| {
+                                                        for header in [
+                                                            "Account ID",
+                                                            "Summoner Name",
+                                                            "Region",
+                                                            "Level",
+                                                            "Tier",
+                                                            "Division",
+                                                            "LP",
+                                                            "Reached Last Season",
+                                                            "Finished Last Season",
+                                                            "Description",
+                                                        ] {
+                                                            ui.label(
+                                                                RichText::new(header).strong(),
+                                                            );
                                                         }
                                                         ui.end_row();
-                                                    }
-                                                });
-                                        });
+                                                        for account in self.visible_accounts() {
+                                                            let selected = self.selected.as_ref()
+                                                                == Some(&account.key());
+                                                            let values = [
+                                                                account.account_id.clone(),
+                                                                account.name.clone(),
+                                                                account.region_display.clone(),
+                                                                if account.level.is_empty() {
+                                                                    "...".to_owned()
+                                                                } else {
+                                                                    account.level.clone()
+                                                                },
+                                                                if account.tier.is_empty()
+                                                                    || account.tier == "Unranked"
+                                                                {
+                                                                    "...".to_owned()
+                                                                } else {
+                                                                    account.tier.clone()
+                                                                },
+                                                                if account.division.is_empty() {
+                                                                    "...".to_owned()
+                                                                } else {
+                                                                    account.division.clone()
+                                                                },
+                                                                if account.lp.is_empty() {
+                                                                    "...".to_owned()
+                                                                } else {
+                                                                    account.lp.clone()
+                                                                },
+                                                                if account
+                                                                    .reached_last_season
+                                                                    .is_empty()
+                                                                {
+                                                                    "N/A".to_owned()
+                                                                } else {
+                                                                    account
+                                                                        .reached_last_season
+                                                                        .clone()
+                                                                },
+                                                                if account
+                                                                    .finished_last_season
+                                                                    .is_empty()
+                                                                {
+                                                                    "N/A".to_owned()
+                                                                } else {
+                                                                    account
+                                                                        .finished_last_season
+                                                                        .clone()
+                                                                },
+                                                                account.description.clone(),
+                                                            ];
+                                                            for (column, value) in
+                                                                values.iter().enumerate()
+                                                            {
+                                                                // Keep focus attached to the account,
+                                                                // not its position after filtering/sorting.
+                                                                let id = ui.make_persistent_id((
+                                                                    account.key(),
+                                                                    column,
+                                                                ));
+                                                                let response = ui
+                                                                    .push_id(id, |ui| {
+                                                                        ui.selectable_label(
+                                                                            selected, value,
+                                                                        )
+                                                                    })
+                                                                    .inner;
+                                                                table_cell_ids.push(response.id);
+                                                                if response.clicked() {
+                                                                    self.selected =
+                                                                        Some(account.key());
+                                                                    response.request_focus();
+                                                                }
+                                                                if response.double_clicked()
+                                                                    && (column == 1 || column == 9)
+                                                                {
+                                                                    self.show_edit(
+                                                                        &account,
+                                                                        if column == 1 {
+                                                                            EditField::Name
+                                                                        } else {
+                                                                            EditField::Description
+                                                                        },
+                                                                    );
+                                                                }
+                                                            }
+                                                            ui.end_row();
+                                                        }
+                                                    });
+                                            });
+                                    });
+                                },
+                            );
+                            ui.separator();
+                            ui.vertical(|ui| {
+                                ui.heading("Actions");
+                                ui.add_enabled_ui(self.selected.is_some(), |ui| {
+                                    if ui.button("Copy Account ID").clicked() {
+                                        self.copy_account_id();
+                                    }
+                                    if ui.button("Copy Password").clicked() {
+                                        self.copy_password();
+                                    }
                                 });
-                            },
-                        );
-                        ui.separator();
-                        ui.vertical(|ui| {
-                            ui.heading("Actions");
-                            ui.add_enabled_ui(self.selected.is_some(), |ui| {
-                                if ui.button("Copy Account ID").clicked() {
-                                    self.copy_account_id();
+                                if ui.button("Refresh Ranks").clicked() {
+                                    self.refresh_all_ranks();
                                 }
-                                if ui.button("Copy Password").clicked() {
-                                    self.copy_password();
+                                if ui.button("Export Data").clicked() {
+                                    self.export_data();
+                                }
+                                if ui.button("Import Data").clicked() {
+                                    self.import_data();
+                                }
+                                if ui.button("Shortcuts Help").clicked() {
+                                    self.show_help = true;
                                 }
                             });
-                            if ui.button("Refresh Ranks").clicked() {
-                                self.refresh_all_ranks();
-                            }
-                            if ui.button("Export Data").clicked() {
-                                self.export_data();
-                            }
-                            if ui.button("Import Data").clicked() {
-                                self.import_data();
-                            }
-                            if ui.button("Shortcuts Help").clicked() {
-                                self.show_help = true;
-                            }
-                        });
-                    });
+                        },
+                    );
 
                     ui.add_space(10.0);
                     egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -825,7 +804,10 @@ impl LeagueAccountsApp {
                                     });
                                 ui.end_row();
                                 ui.label("Password:");
-                                ui.add(egui::TextEdit::singleline(&mut self.add_password).password(true));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.add_password)
+                                        .password(true),
+                                );
                                 ui.end_row();
                                 ui.label("Description:");
                                 ui.text_edit_singleline(&mut self.add_description);
@@ -883,9 +865,6 @@ impl LeagueAccountsApp {
                                         );
                                     }
                                 });
-                            if ui.button("Ranks Compatibilities").clicked() {
-                                self.show_ranks = true;
-                            }
                         });
                     });
                 });
@@ -902,8 +881,7 @@ impl LeagueAccountsApp {
             .resizable(false)
             .show(&ctx, |ui| {
                 ui.add(
-                    egui::TextEdit::singleline(&mut edit.value)
-                        .id(egui::Id::new("account_edit")),
+                    egui::TextEdit::singleline(&mut edit.value).id(egui::Id::new("account_edit")),
                 );
                 ui.horizontal(|ui| {
                     save = ui.button("Save").clicked();
@@ -929,16 +907,16 @@ impl LeagueAccountsApp {
                 ui.label("Use Search to filter by name or ID, and Friend Elo to show compatible accounts.");
             });
         }
-        self.show_ranks_window(&ctx);
 
         // Check focus after all widgets have handled input. A selected account
         // alone is not permission to steal Delete or Copy from a text editor.
         let table_has_focus = self.selected.is_some()
             && self.edit_state.is_none()
             && !self.show_help
-            && !self.show_ranks
             && ctx.memory(|memory| {
-                memory.focused().is_some_and(|id| table_cell_ids.contains(&id))
+                memory
+                    .focused()
+                    .is_some_and(|id| table_cell_ids.contains(&id))
             });
         let actions = shortcuts::take_table_actions(&ctx, table_has_focus);
         if actions.delete {
@@ -949,12 +927,14 @@ impl LeagueAccountsApp {
 
         // Native Windows events are intercepted before clipboard translation.
         // Keep the key-event path for integrations that pass the chord through.
-        let auto_type = ctx.input_mut(|input| {
-            input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::V)
-        });
+        let auto_type =
+            ctx.input_mut(|input| input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::V));
         #[cfg(windows)]
-        let auto_type = self.native_auto_type.as_ref()
-            .is_some_and(shortcuts::NativeAutoType::take_requested) || auto_type;
+        let auto_type = self
+            .native_auto_type
+            .as_ref()
+            .is_some_and(shortcuts::NativeAutoType::take_requested)
+            || auto_type;
         if auto_type {
             self.auto_type_selected();
         }
@@ -1100,9 +1080,12 @@ fn paste_current_clipboard() -> bool {
 }
 
 fn main() -> eframe::Result {
+    let icon =
+        eframe::icon_data::from_png_bytes(APP_ICON_PNG).expect("app icon must be a valid PNG");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("League Accounts")
+            .with_icon(icon)
             .with_maximized(true),
         ..Default::default()
     };
