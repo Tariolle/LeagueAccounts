@@ -176,7 +176,7 @@ fn forms_and_filters_are_visible_with_empty_and_full_tables() {
 }
 
 #[test]
-fn small_windows_can_scroll_to_the_filters_below_the_table() {
+fn small_windows_keep_filters_visible_and_sidebar_actions_reachable() {
     let (_directory, mut app) = test_app(100);
     let ctx = Context::default();
     let size = egui::vec2(1024.0, 480.0);
@@ -184,13 +184,15 @@ fn small_windows_can_scroll_to_the_filters_below_the_table() {
     for _ in 0..3 {
         let _ = frame(&ctx, &mut app, size, vec![]);
     }
+    let output = frame(&ctx, &mut app, size, vec![]);
+    assert!(text_is_visible(&output, "Friend Elo:", viewport));
     for _ in 0..10 {
         let _ = frame(
             &ctx,
             &mut app,
             size,
             vec![
-                Event::PointerMoved(egui::pos2(40.0, 440.0)),
+                Event::PointerMoved(egui::pos2(900.0, 400.0)),
                 Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(0.0, -1000.0),
@@ -202,4 +204,5 @@ fn small_windows_can_scroll_to_the_filters_below_the_table() {
     }
     let output = frame(&ctx, &mut app, size, vec![]);
     assert!(text_is_visible(&output, "Friend Elo:", viewport));
+    assert!(text_is_visible(&output, "Shortcuts Help", viewport));
 }
