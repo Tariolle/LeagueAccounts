@@ -15,20 +15,28 @@ pub fn take_table_actions(ctx: &Context, table_has_focus: bool) -> TableActions 
         return TableActions::default();
     }
     ctx.input_mut(|input| {
-        let mut copy = false;
-        // egui-winit emits Copy, not a pressed Key::C, for Ctrl+C.
-        input.events.retain(|event| {
-            if matches!(event, Event::Copy) {
-                copy = true;
+        let mut actions = TableActions::default();
+        input.events.retain(|event| match event {
+            // egui-winit emits Copy, not a pressed Key::C, for Ctrl+C.
+            Event::Copy => {
+                actions.copy = true;
                 false
-            } else {
-                true
             }
+            Event::Key {
+                key: Key::Delete,
+                pressed: true,
+                repeat,
+                modifiers,
+                ..
+            } if *modifiers == Modifiers::NONE => {
+                // Require a fresh, unmodified press. consume_key matches
+                // repeats and can ignore extra Shift/Alt modifiers.
+                actions.delete |= !repeat;
+                false
+            }
+            _ => true,
         });
-        TableActions {
-            copy,
-            delete: input.consume_key(Modifiers::NONE, Key::Delete),
-        }
+        actions
     })
 }
 
@@ -165,55 +173,133 @@ mod native {
         }
     }
 
-    unsafe extern "system" fn keyboard_hook(code: i32, key: WPARAM, flags: LPARAM) -> LRESULT {
+    // Kept separate from CallNextHookEx so regression tests can exercise the
+    // real Windows modifier lookup and request lifecycle without injecting
+    // keyboard input into a user's foreground window.
+    fn handle_keyboard_event(code: i32, key: WPARAM, flags: LPARAM) -> bool {
         // HC_NOREMOVE is only a peek; do not trigger or change the latch until
         // Windows actually removes the key message from the thread's queue.
-        if code == HC_ACTION as i32 && key == VK_V as usize {
-            let consumed = STATE.with(|slot| {
-                // Never panic across the Windows callback boundary on reentry.
-                let Ok(mut slot) = slot.try_borrow_mut() else {
-                    return false;
-                };
-                let Some(state) = slot.as_mut() else {
-                    return false;
-                };
-                let focused = (state.is_focused)();
-                if !focused {
-                    state.requested = false;
-                }
-                // GetKeyState reflects the modifiers associated with this
-                // queued message, unlike polling their later physical state.
-                let down = |key: u16| unsafe { GetKeyState(i32::from(key)) < 0 };
-                let modifiers = if focused {
-                    Modifiers {
-                        ctrl: down(VK_CONTROL),
-                        shift: down(VK_SHIFT),
-                        alt: down(VK_MENU),
-                        mac_cmd: down(VK_LWIN) || down(VK_RWIN),
-                        ..Modifiers::default()
-                    }
-                } else {
-                    // Do not trigger in another window, but still consume
-                    // repeats/key-up from the chord captured before Alt+Tab.
-                    Modifiers::NONE
-                };
-                let action = state.chord.on_v_key(
-                    flags & (1_isize << 31) == 0,
-                    flags & (1_isize << 30) != 0,
-                    modifiers,
-                );
-                if action.trigger {
-                    state.requested = true;
-                    state.ctx.request_repaint();
-                }
-                action.consume
-            });
-            if consumed {
-                return 1;
+        if code != HC_ACTION as i32 || key != VK_V as usize {
+            return false;
+        }
+        STATE.with(|slot| {
+            // Never panic across the Windows callback boundary on reentry.
+            let Ok(mut slot) = slot.try_borrow_mut() else {
+                return false;
+            };
+            let Some(state) = slot.as_mut() else {
+                return false;
+            };
+            let focused = (state.is_focused)();
+            if !focused {
+                state.requested = false;
             }
+            // GetKeyState reflects the modifiers associated with this
+            // queued message, unlike polling their later physical state.
+            let down = |key: u16| unsafe { GetKeyState(i32::from(key)) < 0 };
+            let modifiers = if focused {
+                Modifiers {
+                    ctrl: down(VK_CONTROL),
+                    shift: down(VK_SHIFT),
+                    alt: down(VK_MENU),
+                    mac_cmd: down(VK_LWIN) || down(VK_RWIN),
+                    ..Modifiers::default()
+                }
+            } else {
+                // Do not trigger in another window, but still consume
+                // repeats/key-up from the chord captured before Alt+Tab.
+                Modifiers::NONE
+            };
+            let action = state.chord.on_v_key(
+                flags & (1_isize << 31) == 0,
+                flags & (1_isize << 30) != 0,
+                modifiers,
+            );
+            if action.trigger {
+                state.requested = true;
+                state.ctx.request_repaint();
+            }
+            action.consume
+        })
+    }
+
+    unsafe extern "system" fn keyboard_hook(code: i32, key: WPARAM, flags: LPARAM) -> LRESULT {
+        if handle_keyboard_event(code, key, flags) {
+            return 1;
         }
         // SAFETY: forward untouched arguments to the remaining hook chain.
         unsafe { CallNextHookEx(std::ptr::null_mut(), code, key, flags) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardState, SetKeyboardState,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::HC_NOREMOVE;
+
+        // SetKeyboardState changes only this test thread's message-time state.
+        // It does not press physical keys or alter the global clipboard.
+        struct KeyboardStateGuard([u8; 256]);
+
+        impl KeyboardStateGuard {
+            fn control_shift() -> Self {
+                let mut saved = [0u8; 256];
+                assert_ne!(unsafe { GetKeyboardState(saved.as_mut_ptr()) }, 0);
+                let guard = Self(saved);
+                let mut chord = [0u8; 256];
+                chord[VK_CONTROL as usize] = 0x80;
+                chord[VK_SHIFT as usize] = 0x80;
+                assert_ne!(unsafe { SetKeyboardState(chord.as_ptr()) }, 0);
+                guard
+            }
+        }
+
+        impl Drop for KeyboardStateGuard {
+            fn drop(&mut self) {
+                unsafe { SetKeyboardState(self.0.as_ptr()) };
+            }
+        }
+
+        #[test]
+        fn native_handler_ignores_peeks_and_queues_once_without_clipboard_events() {
+            let _keyboard = KeyboardStateGuard::control_shift();
+            let hook = NativeAutoType::install(Context::default(), || true).unwrap();
+            let key = VK_V as usize;
+            assert!(!handle_keyboard_event(HC_NOREMOVE as i32, key, 1));
+            assert!(!hook.take_requested());
+            assert!(handle_keyboard_event(HC_ACTION as i32, key, 1));
+            assert!(hook.take_requested());
+            assert!(!hook.take_requested());
+            assert!(handle_keyboard_event(HC_ACTION as i32, key, (1_isize << 30) | 1));
+            assert!(!hook.take_requested());
+            assert!(handle_keyboard_event(HC_ACTION as i32, key, (1_isize << 31) | 1));
+            assert!(!hook.take_requested());
+            drop(hook);
+            assert!(STATE.with(|state| state.borrow().is_none()));
+        }
+
+        #[test]
+        fn native_handler_cancels_stale_requests_and_rearms_after_focus_returns() {
+            let _keyboard = KeyboardStateGuard::control_shift();
+            let focused = Rc::new(Cell::new(true));
+            let focus_probe = Rc::clone(&focused);
+            let hook = NativeAutoType::install(Context::default(), move || focus_probe.get()).unwrap();
+            let key = VK_V as usize;
+            assert!(handle_keyboard_event(HC_ACTION as i32, key, 1));
+            focused.set(false);
+            assert!(!hook.take_requested());
+            assert!(handle_keyboard_event(HC_ACTION as i32, key, (1_isize << 30) | 1));
+            assert!(!hook.take_requested());
+            assert!(handle_keyboard_event(HC_ACTION as i32, key, (1_isize << 31) | 1));
+            assert!(!handle_keyboard_event(HC_ACTION as i32, key, 1));
+            focused.set(true);
+            assert!(handle_keyboard_event(HC_ACTION as i32, key, 1));
+            assert!(hook.take_requested());
+        }
     }
 }
 
@@ -261,6 +347,44 @@ mod tests {
                 assert_eq!(input.events, vec![Event::Paste("ordinary paste".into())]);
             });
         });
+    }
+
+    #[test]
+    fn repeated_delete_is_consumed_without_deleting_again() {
+        let ctx = Context::default();
+        for expected_delete in [true, false] {
+            let input = eframe::egui::RawInput {
+                // egui marks the second press as a repeat because there was no key-up.
+                events: vec![delete_event()],
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |_| {
+                assert_eq!(take_table_actions(&ctx, true).delete, expected_delete);
+                assert!(ctx.input(|input| input.events.is_empty()));
+            });
+        }
+    }
+
+    #[test]
+    fn modified_delete_is_not_an_account_delete_command() {
+        for modifiers in [Modifiers::SHIFT, Modifiers::ALT, Modifiers::CTRL] {
+            let ctx = Context::default();
+            let event = Event::Key {
+                key: Key::Delete,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            };
+            let input = eframe::egui::RawInput {
+                events: vec![event.clone()],
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |_| {
+                assert_eq!(take_table_actions(&ctx, true), TableActions::default());
+                ctx.input(|input| assert_eq!(input.events, vec![event.clone()]));
+            });
+        }
     }
 
     #[test]
@@ -312,6 +436,7 @@ mod tests {
             ChordAction::default()
         );
     }
+
     #[test]
     fn captured_repeats_stay_consumed_after_focus_or_modifiers_change() {
         let mut chord = AutoTypeChord::default();
@@ -337,5 +462,4 @@ mod tests {
         // A second complete chord can also arrive without a local key-up.
         assert!(chord.on_v_key(true, false, modifiers).trigger);
     }
-
 }
