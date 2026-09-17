@@ -1,15 +1,9 @@
-# Build artifacts
-build/
-dist/
-*.pyc
-__pycache__/
+# Rust build artifacts
+target/
+target-pr/
 
-# PyInstaller
-*.spec.bak
+# Local build logs
 *.log
-
-# Inno Setup
-config/output/
 
 # IDE
 .vscode/
