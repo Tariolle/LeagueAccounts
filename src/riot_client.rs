@@ -10,9 +10,10 @@
 //! only after the API confirms the intended account is signed in.
 
 use crate::autotype::type_credentials;
+use crate::logging::{self, Event, Reason};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -67,6 +68,22 @@ pub enum LoginStep {
 }
 
 impl LoginStep {
+    pub fn record(self) {
+        let reason = match self {
+            Self::CloseLeague => Reason::CloseLeague,
+            Self::OpenClient => Reason::OpenClient,
+            Self::WaitAuth => Reason::WaitAuth,
+            Self::SignOut => Reason::SignOut,
+            Self::FindWindow => Reason::FindWindow,
+            Self::Focus => Reason::Focus,
+            Self::Type => Reason::Type,
+            Self::Confirm => Reason::Confirm,
+            Self::LaunchGame => Reason::LaunchGame,
+            Self::Done => Reason::Done,
+        };
+        logging::record(Event::LoginProgress, reason);
+    }
+
     pub fn code(self) -> &'static str {
         match self {
             LoginStep::CloseLeague => "closeLeague",
@@ -99,8 +116,11 @@ pub enum LoginError {
     LeagueRunning,
     /// The League/TFT client did not close.
     CloseFailed,
-    /// Signed in, but the game client did not start.
+    /// The game client did not confirm the selected account in time.
     GameLaunchFailed,
+    /// Riot or League reports a different account during launch.
+    AccountMismatch,
+    WorkerPanicked,
 }
 
 impl LoginError {
@@ -115,8 +135,46 @@ impl LoginError {
             LoginError::LeagueRunning => "league_running",
             LoginError::CloseFailed => "league_close_failed",
             LoginError::GameLaunchFailed => "game_launch_failed",
+            LoginError::AccountMismatch => "game_account_mismatch",
+            LoginError::WorkerPanicked => "autotype_failed",
         }
     }
+}
+
+/// Only fixed categories cross the logging boundary; never account identifiers.
+pub fn record_login_result(result: &Result<LoginOutcome, LoginError>) {
+    let (event, reason) = match result {
+        Ok(outcome) => (
+            Event::LoginCompleted,
+            match outcome {
+                LoginOutcome::SignedIn => Reason::SignedIn,
+                LoginOutcome::Typed => Reason::Typed,
+                LoginOutcome::AlreadySignedIn => Reason::AlreadySignedIn,
+                LoginOutcome::OtherAccount => Reason::OtherAccount,
+            },
+        ),
+        Err(error) => (
+            if *error == LoginError::Cancelled {
+                Event::LoginCancelled
+            } else {
+                Event::LoginFailed
+            },
+            match error {
+                LoginError::ClientMissing => Reason::ClientMissing,
+                LoginError::LaunchFailed => Reason::LaunchFailed,
+                LoginError::Timeout => Reason::Timeout,
+                LoginError::SignOutFailed => Reason::SignOutFailed,
+                LoginError::TypingFailed => Reason::TypingFailed,
+                LoginError::Cancelled => Reason::Cancelled,
+                LoginError::LeagueRunning => Reason::LeagueRunning,
+                LoginError::CloseFailed => Reason::CloseFailed,
+                LoginError::GameLaunchFailed => Reason::GameLaunchFailed,
+                LoginError::AccountMismatch => Reason::AccountMismatch,
+                LoginError::WorkerPanicked => Reason::WorkerPanicked,
+            },
+        ),
+    };
+    logging::record(event, reason);
 }
 
 fn program_data() -> PathBuf {
@@ -155,59 +213,84 @@ fn open_client(path: &PathBuf) -> bool {
     std::process::Command::new(path).spawn().is_ok()
 }
 
-/// Process names that show a game client has started.
-fn game_processes(game: Game) -> &'static [&'static str] {
-    match game {
-        Game::League => &["leagueclient.exe", "leagueclientux.exe", "league of legends.exe"],
-        Game::Tft => &["tftclient.exe", "leagueclient.exe", "leagueclientux.exe"],
-    }
-}
-
-fn game_started(game: Game) -> bool {
-    let processes = running_processes();
-    game_processes(game).iter().any(|name| processes.contains(*name))
-}
-
 /// Start `game` for the signed-in account and wait until its client process
-/// appears. A running Riot Client only selects the product for
-/// `--launch-product` ("willAutoLaunch=false"), so the local API is used;
-/// the command line remains a last resort.
-fn launch_game(path: &PathBuf, game: Game, cancel: &AtomicBool) -> bool {
-    if game_started(game) {
-        return true;
-    }
+/// confirms the same account. Requests go through the local API, after
+/// rechecking the Riot session immediately before each launch request.
+fn launch_game(game: Game, account_id: &str, cancel: &AtomicBool) -> Result<(), LoginError> {
+    launch_game_with(
+        account_id,
+        cancel,
+        status,
+        || {
+            let Some(api) = LocalApi::read().filter(|api| api.session() == Session::SignedIn)
+            else {
+                return Ok(false);
+            };
+            let Some(name) = api.username() else {
+                return Ok(false);
+            };
+            check_cancelled(cancel)?;
+            if !name.eq_ignore_ascii_case(account_id) {
+                return Err(LoginError::AccountMismatch);
+            }
+            Ok(api.launch(game))
+        },
+        || thread::sleep(Duration::from_secs(1)),
+    )
+}
+
+fn launch_game_with(
+    account_id: &str,
+    cancel: &AtomicBool,
+    mut observe: impl FnMut() -> GameStatus,
+    mut request: impl FnMut() -> Result<bool, LoginError>,
+    mut wait: impl FnMut(),
+) -> Result<(), LoginError> {
     let mut requested = false;
     for attempt in 0..40 {
-        if cancel.load(Ordering::SeqCst) {
-            return false;
+        check_cancelled(cancel)?;
+        let current = observe();
+        check_cancelled(cancel)?;
+        if launch_confirmed(&current, account_id)? {
+            return Ok(());
         }
-        if !requested && attempt % 2 == 0 {
-            requested = LocalApi::read().is_some_and(|api| api.launch(game));
-            if !requested && attempt == 10 {
-                // API refused repeatedly: try the command line once.
-                let _ = std::process::Command::new(path)
-                    .arg(format!("--launch-product={}", game.product()))
-                    .arg("--launch-patchline=live")
-                    .spawn();
-            }
+        // Never launch through a restored or newly changed Riot session.
+        // An existing game with an unreadable identity must become observable
+        // before it can count as success; do not launch another copy over it.
+        if !requested
+            && !current.league_running()
+            && current.signed_in_as(account_id)
+            && attempt % 2 == 0
+        {
+            requested = request()?;
         }
-        if game_started(game) {
-            return true;
-        }
-        thread::sleep(Duration::from_secs(1));
+        wait();
     }
-    game_started(game)
+    check_cancelled(cancel)?;
+    Err(LoginError::GameLaunchFailed)
+}
+
+fn launch_confirmed(current: &GameStatus, account_id: &str) -> Result<bool, LoginError> {
+    let different = |name: &Option<String>| {
+        name.as_deref()
+            .is_some_and(|name| !name.eq_ignore_ascii_case(account_id))
+    };
+    if different(&current.signed_in_user)
+        || (current.league_running() && different(&current.game_user))
+    {
+        return Err(LoginError::AccountMismatch);
+    }
+    Ok(current.league_running() && current.signed_in_as(account_id))
 }
 
 /// Launch the requested game; TFT falls back to the League client, which
 /// also hosts TFT, when the standalone TFT client cannot start.
-fn start_game(path: &PathBuf, game: Game, cancel: &AtomicBool) -> Result<(), LoginError> {
-    if launch_game(path, game, cancel) || (game == Game::Tft && launch_game(path, Game::League, cancel)) {
-        Ok(())
-    } else if cancel.load(Ordering::SeqCst) {
-        Err(LoginError::Cancelled)
-    } else {
-        Err(LoginError::GameLaunchFailed)
+fn start_game(game: Game, account_id: &str, cancel: &AtomicBool) -> Result<(), LoginError> {
+    match launch_game(game, account_id, cancel) {
+        Err(LoginError::GameLaunchFailed) if game == Game::Tft => {
+            launch_game(Game::League, account_id, cancel)
+        }
+        result => result,
     }
 }
 
@@ -231,6 +314,10 @@ impl LocalApi {
             .map(PathBuf::from)?
             .join(r"Riot Games\Riot Client\Config\lockfile");
         let contents = std::fs::read_to_string(lockfile).ok()?;
+        Self::from_lockfile(&contents)
+    }
+
+    fn from_lockfile(contents: &str) -> Option<Self> {
         // name:pid:port:password:protocol
         let parts: Vec<&str> = contents.trim().split(':').collect();
         let [_, _, port, password, _] = parts[..] else {
@@ -323,7 +410,22 @@ impl LocalApi {
             serde_json::Value::String(text) => serde_json::from_str(text).ok()?,
             other => other.clone(),
         };
-        info["username"].as_str().map(str::to_owned)
+        info["username"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// Read the game client's own session, not the Riot launcher's session.
+    fn game_username(&self) -> Option<String> {
+        let (status, body) = self.get("/lol-login/v1/session")?;
+        if status != 200 || body["state"] != "SUCCEEDED" {
+            return None;
+        }
+        body["username"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
     }
 
     fn sign_out(&self, cancel: &AtomicBool) -> Result<(), LoginError> {
@@ -359,7 +461,12 @@ const CLIENT_PROCESSES: [&str; 4] = [
 /// The in-match game process (closing it abandons the match).
 const GAME_PROCESS: &str = "league of legends.exe";
 
-fn running_processes() -> HashSet<String> {
+struct Process {
+    name: String,
+    pid: u32,
+}
+
+fn running_processes() -> Vec<Process> {
     let mut command = std::process::Command::new("tasklist");
     command.args(["/FO", "CSV", "/NH"]);
     #[cfg(windows)]
@@ -369,13 +476,42 @@ fn running_processes() -> HashSet<String> {
         command.creation_flags(CREATE_NO_WINDOW);
     }
     let Ok(output) = command.output() else {
-        return HashSet::new();
+        return Vec::new();
     };
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter_map(|line| line.split("\",\"").next())
-        .map(|name| name.trim_matches('"').to_ascii_lowercase())
+        .filter_map(|line| {
+            let mut fields = line.split("\",\"");
+            Some(Process {
+                name: fields.next()?.trim_matches('"').to_ascii_lowercase(),
+                pid: fields.next()?.trim_matches('"').parse().ok()?,
+            })
+        })
         .collect()
+}
+
+fn game_username(processes: &[Process]) -> Option<String> {
+    let mut username: Option<String> = None;
+    for process in processes
+        .iter()
+        .filter(|process| matches!(process.name.as_str(), "leagueclient.exe" | "tftclient.exe"))
+    {
+        let executable = windows::process_path(process.pid)?;
+        let contents = std::fs::read_to_string(executable.parent()?.join("lockfile")).ok()?;
+        // Do not trust a lockfile left by a different process or installation.
+        if contents.split(':').nth(1)?.parse::<u32>().ok()? != process.pid {
+            return None;
+        }
+        let name = LocalApi::from_lockfile(&contents)?.game_username()?;
+        if username
+            .as_ref()
+            .is_some_and(|previous| !previous.eq_ignore_ascii_case(&name))
+        {
+            return None;
+        }
+        username = Some(name);
+    }
+    username
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -384,6 +520,8 @@ pub struct GameStatus {
     pub in_game: bool,
     /// Username signed in to the Riot Client, when the API answers.
     pub signed_in_user: Option<String>,
+    /// Username independently confirmed by every running game client's API.
+    pub game_user: Option<String>,
 }
 
 impl GameStatus {
@@ -392,9 +530,11 @@ impl GameStatus {
     }
 
     pub fn signed_in_as(&self, account_id: &str) -> bool {
-        self.signed_in_user
-            .as_deref()
-            .is_some_and(|name| name.eq_ignore_ascii_case(account_id))
+        let matches = |name: &Option<String>| {
+            name.as_deref()
+                .is_some_and(|name| !name.is_empty() && name.eq_ignore_ascii_case(account_id))
+        };
+        matches(&self.signed_in_user) && (!self.league_running() || matches(&self.game_user))
     }
 }
 
@@ -404,9 +544,12 @@ pub fn status() -> GameStatus {
         .filter(|api| api.session() == Session::SignedIn)
         .and_then(|api| api.username());
     GameStatus {
-        client_open: CLIENT_PROCESSES.iter().any(|name| processes.contains(*name)),
-        in_game: processes.contains(GAME_PROCESS),
+        client_open: processes
+            .iter()
+            .any(|process| CLIENT_PROCESSES.contains(&process.name.as_str())),
+        in_game: processes.iter().any(|process| process.name == GAME_PROCESS),
         signed_in_user,
+        game_user: game_username(&processes),
     }
 }
 
@@ -430,7 +573,9 @@ fn close_league(cancel: &AtomicBool) -> Result<(), LoginError> {
     };
     let closed = || {
         let processes = running_processes();
-        !names.iter().any(|name| processes.contains(*name))
+        !processes
+            .iter()
+            .any(|process| names.contains(&process.name.as_str()))
     };
     close_league_with(cancel, taskkill, closed, || {
         thread::sleep(Duration::from_millis(500));
@@ -494,7 +639,7 @@ pub fn login(
     // Never sign another account in under an open League client or match.
     let current = status();
     check_cancelled(cancel)?;
-    if current.league_running() && !current.signed_in_as(account_id) {
+    if current.league_running() && (close_running || !current.signed_in_as(account_id)) {
         if !close_running {
             return Err(LoginError::LeagueRunning);
         }
@@ -539,7 +684,7 @@ pub fn login(
             (Session::SignedIn, Some(api)) if is_this_account(&api) => {
                 if let Some(game) = game {
                     report(LoginStep::LaunchGame, progress);
-                    start_game(&path, game, cancel)?;
+                    start_game(game, account_id, cancel)?;
                 }
                 progress(LoginStep::Done);
                 return Ok(LoginOutcome::AlreadySignedIn);
@@ -597,14 +742,14 @@ pub fn login(
     let typed = Instant::now();
     while typed.elapsed() < SIGN_IN_TIMEOUT {
         if cancelled() {
-            return Ok(LoginOutcome::Typed);
+            return Err(LoginError::Cancelled);
         }
         thread::sleep(Duration::from_secs(1));
         if let Some(api) = LocalApi::read() {
             if api.session() == Session::SignedIn && is_this_account(&api) {
                 if let Some(game) = game {
                     progress(LoginStep::LaunchGame);
-                    start_game(&path, game, cancel)?;
+                    start_game(game, account_id, cancel)?;
                 }
                 progress(LoginStep::Done);
                 return Ok(LoginOutcome::SignedIn);
@@ -640,6 +785,13 @@ mod windows {
         if pid == 0 {
             return None;
         }
+        process_path(pid)?
+            .file_name()?
+            .to_str()
+            .map(str::to_ascii_lowercase)
+    }
+
+    pub fn process_path(pid: u32) -> Option<std::path::PathBuf> {
         // SAFETY: plain query handle, closed below.
         let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if process.is_null() {
@@ -655,7 +807,7 @@ mod windows {
             return None;
         }
         let path = String::from_utf16_lossy(&buffer[..length as usize]);
-        path.rsplit('\\').next().map(str::to_ascii_lowercase)
+        Some(std::path::PathBuf::from(path))
     }
 
     unsafe extern "system" fn collect(window: HWND, found: LPARAM) -> i32 {
@@ -708,6 +860,9 @@ mod windows {
 
 #[cfg(not(windows))]
 mod windows {
+    pub fn process_path(_: u32) -> Option<std::path::PathBuf> {
+        None
+    }
     pub type HWND = usize;
     pub fn find_client_window() -> Option<HWND> {
         None
@@ -724,6 +879,199 @@ mod windows {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    #[cfg(windows)]
+    fn process_discovery_locates_the_executable_for_a_running_pid() {
+        let processes = running_processes();
+        let current = processes.iter()
+            .find(|process| process.pid == std::process::id()).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        assert_eq!(current.name,
+            executable.file_name().unwrap().to_str().unwrap().to_ascii_lowercase());
+        assert_eq!(windows::process_path(current.pid), Some(executable));
+    }
+
+    #[test]
+    fn riot_identity_does_not_prove_the_open_games_identity() {
+        let mut current = GameStatus {
+            client_open: true,
+            signed_in_user: Some("selected".into()),
+            game_user: Some("previous".into()),
+            ..GameStatus::default()
+        };
+        assert!(!current.signed_in_as("selected"));
+        assert_eq!(
+            launch_confirmed(&current, "selected"),
+            Err(LoginError::AccountMismatch)
+        );
+        current.game_user = None;
+        assert!(!current.signed_in_as("selected"));
+        assert_eq!(launch_confirmed(&current, "selected"), Ok(false));
+        current.game_user = Some("SELECTED".into());
+        assert!(current.signed_in_as("selected"));
+        assert_eq!(launch_confirmed(&current, "selected"), Ok(true));
+        current.signed_in_user = None;
+        assert_eq!(launch_confirmed(&current, "selected"), Ok(false));
+        current.signed_in_user = Some("previous".into());
+        assert_eq!(
+            launch_confirmed(&current, "selected"),
+            Err(LoginError::AccountMismatch)
+        );
+        current.client_open = false;
+        current.in_game = true;
+        current.signed_in_user = Some("selected".into());
+        current.game_user = None;
+        assert!(!current.signed_in_as("selected"));
+    }
+
+    #[test]
+    fn launch_waits_for_the_game_account_and_stops_on_mismatch_or_cancellation() {
+        for (game_user, expected) in [
+            (Some("previous"), Err(LoginError::AccountMismatch)),
+            (None, Err(LoginError::GameLaunchFailed)),
+            (Some("selected"), Ok(())),
+        ] {
+            let cancel = AtomicBool::new(false);
+            let polls = Cell::new(0);
+            let requests = Cell::new(0);
+            let result = launch_game_with(
+                "selected",
+                &cancel,
+                || {
+                    let poll = polls.get();
+                    polls.set(poll + 1);
+                    GameStatus {
+                        client_open: poll > 0,
+                        signed_in_user: Some("selected".into()),
+                        game_user: if poll > 0 {
+                            game_user.map(str::to_owned)
+                        } else {
+                            None
+                        },
+                        ..GameStatus::default()
+                    }
+                },
+                || {
+                    requests.set(requests.get() + 1);
+                    Ok(true)
+                },
+                || {},
+            );
+            assert_eq!(result, expected);
+            assert_eq!(requests.get(), 1);
+            assert!(polls.get() > 1);
+        }
+
+        let cancel = AtomicBool::new(false);
+        let result = launch_game_with(
+            "selected",
+            &cancel,
+            || {
+                cancel.store(true, Ordering::SeqCst);
+                GameStatus {
+                    signed_in_user: Some("selected".into()),
+                    ..GameStatus::default()
+                }
+            },
+            || panic!("must not launch after cancellation"),
+            || {},
+        );
+        assert_eq!(result, Err(LoginError::Cancelled));
+
+        let cancel = AtomicBool::new(false);
+        let result = launch_game_with(
+            "selected",
+            &cancel,
+            || GameStatus {
+                client_open: true,
+                signed_in_user: Some("selected".into()),
+                game_user: Some("previous".into()),
+                ..GameStatus::default()
+            },
+            || panic!("must not launch over another account"),
+            || {},
+        );
+        assert_eq!(result, Err(LoginError::AccountMismatch));
+    }
+
+    #[test]
+    fn game_session_requires_successful_authentication_and_a_nonempty_username() {
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let responses = [
+            (
+                200,
+                r#"{"state":"SUCCEEDED","username":"selected"}"#,
+                Some("selected"),
+            ),
+            (
+                200,
+                r#"{"state":"IN_PROGRESS","username":"selected"}"#,
+                None,
+            ),
+            (200, r#"{"state":"ERROR","username":"selected"}"#, None),
+            (200, r#"{"state":"SUCCEEDED","username":""}"#, None),
+            (200, r#"{"state":"SUCCEEDED"}"#, None),
+            (503, r#"{"state":"SUCCEEDED","username":"selected"}"#, None),
+        ];
+        let server = thread::spawn(move || {
+            for (status, body, _) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with("GET /lol-login/v1/session "));
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                write!(stream, "HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let api = LocalApi {
+            base: format!("http://{address}"),
+            password: "test".into(),
+            client: reqwest::blocking::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        };
+        for (_, _, expected) in responses {
+            assert_eq!(api.game_username().as_deref(), expected);
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn login_diagnostics_distinguish_failure_success_and_cancellation() {
+        let log = logging::capture(|| {
+            LoginStep::LaunchGame.record();
+            record_login_result(&Err(LoginError::AccountMismatch));
+            record_login_result(&Err(LoginError::GameLaunchFailed));
+            record_login_result(&Err(LoginError::SignOutFailed));
+            record_login_result(&Err(LoginError::Cancelled));
+            record_login_result(&Ok(LoginOutcome::AlreadySignedIn));
+        });
+        for entry in [
+            "INFO event=login_progress reason=launch_game",
+            "ERROR event=login_failed reason=account_mismatch",
+            "ERROR event=login_failed reason=game_launch_failed",
+            "ERROR event=login_failed reason=sign_out_failed",
+            "INFO event=login_cancelled reason=cancelled",
+            "INFO event=login_completed reason=already_signed_in",
+        ] {
+            assert!(log.contains(entry));
+        }
+    }
 
     #[test]
     fn cancellation_during_endpoint_discovery_prevents_sign_out() {

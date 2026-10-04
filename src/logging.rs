@@ -40,7 +40,11 @@ pub enum Event {
     RankWorkerPanicked,
     ShortcutInstallFailed,
     ClipboardFailed,
-    AutoTypeFailed,
+    LoginStarted,
+    LoginProgress,
+    LoginCompleted,
+    LoginFailed,
+    LoginCancelled,
     LogFolderOpenFailed,
     Panic,
 }
@@ -69,7 +73,11 @@ impl Event {
             Self::RankWorkerPanicked => "rank_worker_panicked",
             Self::ShortcutInstallFailed => "shortcut_install_failed",
             Self::ClipboardFailed => "clipboard_failed",
-            Self::AutoTypeFailed => "auto_type_failed",
+            Self::LoginStarted => "login_started",
+            Self::LoginProgress => "login_progress",
+            Self::LoginCompleted => "login_completed",
+            Self::LoginFailed => "login_failed",
+            Self::LoginCancelled => "login_cancelled",
             Self::LogFolderOpenFailed => "log_folder_open_failed",
             Self::Panic => "panic",
         }
@@ -79,6 +87,10 @@ impl Event {
         match self {
             Self::SessionStarted
             | Self::SessionEnded
+            | Self::LoginStarted
+            | Self::LoginProgress
+            | Self::LoginCompleted
+            | Self::LoginCancelled
             | Self::RankRefreshStarted
             | Self::RankRefreshCompleted
             | Self::AutoRefreshStarted => "INFO",
@@ -90,6 +102,32 @@ impl Event {
 /// Safe categories, deliberately excluding raw messages and arbitrary codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
+    RiotClient,
+    PreviousWindow,
+    CloseLeague,
+    OpenClient,
+    WaitAuth,
+    SignOut,
+    FindWindow,
+    Focus,
+    Type,
+    Confirm,
+    LaunchGame,
+    Done,
+    SignedIn,
+    Typed,
+    AlreadySignedIn,
+    OtherAccount,
+    ClientMissing,
+    LaunchFailed,
+    SignOutFailed,
+    TypingFailed,
+    Cancelled,
+    LeagueRunning,
+    CloseFailed,
+    GameLaunchFailed,
+    AccountMismatch,
+    WorkerPanicked,
     None,
     PermissionDenied,
     NotFound,
@@ -114,6 +152,32 @@ pub enum Reason {
 impl Reason {
     fn code(self) -> &'static str {
         match self {
+            Self::RiotClient => "riot_client",
+            Self::PreviousWindow => "previous_window",
+            Self::CloseLeague => "close_league",
+            Self::OpenClient => "open_client",
+            Self::WaitAuth => "wait_auth",
+            Self::SignOut => "sign_out",
+            Self::FindWindow => "find_window",
+            Self::Focus => "focus",
+            Self::Type => "type",
+            Self::Confirm => "confirm",
+            Self::LaunchGame => "launch_game",
+            Self::Done => "done",
+            Self::SignedIn => "signed_in",
+            Self::Typed => "typed",
+            Self::AlreadySignedIn => "already_signed_in",
+            Self::OtherAccount => "other_account",
+            Self::ClientMissing => "client_missing",
+            Self::LaunchFailed => "launch_failed",
+            Self::SignOutFailed => "sign_out_failed",
+            Self::TypingFailed => "typing_failed",
+            Self::Cancelled => "cancelled",
+            Self::LeagueRunning => "league_running",
+            Self::CloseFailed => "close_failed",
+            Self::GameLaunchFailed => "game_launch_failed",
+            Self::AccountMismatch => "account_mismatch",
+            Self::WorkerPanicked => "worker_panicked",
             Self::None => "none",
             Self::PermissionDenied => "permission_denied",
             Self::NotFound => "not_found",

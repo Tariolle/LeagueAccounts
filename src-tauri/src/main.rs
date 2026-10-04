@@ -14,7 +14,7 @@ use leagueaccounts::credentials;
 use leagueaccounts::logging::{self, Event, Reason};
 use leagueaccounts::models::{Account, AccountKey, RankInfo};
 use leagueaccounts::rank_fetcher::{RankFetcher, RankProvider};
-use leagueaccounts::riot_client::{self, Game, LoginOutcome, LoginStep};
+use leagueaccounts::riot_client::{self, Game, LoginError, LoginOutcome, LoginStep};
 use leagueaccounts::utils::{app_data_dir, parse_account_line, region_from_display, settings_file, REGION_MAP};
 use leagueaccounts::AccountManager;
 use leagueaccounts::updates::{self, Release};
@@ -409,7 +409,16 @@ async fn login(
     state.login_cancel.store(false, Ordering::SeqCst);
     let shared = Arc::clone(&state);
     let result = tauri::async_runtime::spawn_blocking(move || {
+        logging::record(
+            Event::LoginStarted,
+            if settings.login_method == LoginMethod::Previous {
+                Reason::PreviousWindow
+            } else {
+                Reason::RiotClient
+            },
+        );
         let mut progress = |step: LoginStep| {
+            step.record();
             let _ = app.emit("login-step", step.code());
         };
         if settings.login_method == LoginMethod::Previous {
@@ -417,9 +426,9 @@ async fn login(
             progress(LoginStep::Type);
             return if auto_type_credentials(&account.account_id, &password) {
                 progress(LoginStep::Done);
-                Ok(LoginResult::Typed)
+                Ok(LoginOutcome::Typed)
             } else {
-                Err(fail("autotype_failed"))
+                Err(LoginError::TypingFailed)
             };
         }
         let game = settings.launch_game.then(|| {
@@ -438,20 +447,18 @@ async fn login(
             &mut progress,
             &shared.login_cancel,
         )
-            .map(|outcome| match outcome {
-                LoginOutcome::SignedIn => LoginResult::SignedIn,
-                LoginOutcome::Typed => LoginResult::Typed,
-                LoginOutcome::AlreadySignedIn => LoginResult::AlreadySignedIn,
-                LoginOutcome::OtherAccount => LoginResult::OtherAccount,
-            })
-            .map_err(|error| fail(error.code()))
     })
     .await
-    .unwrap_or_else(|_| Err(fail("autotype_failed")));
-    if result.as_ref().is_err_and(|error| error.code != "login_cancelled") {
-        logging::record(Event::AutoTypeFailed, Reason::Other);
-    }
+    .unwrap_or(Err(LoginError::WorkerPanicked));
+    riot_client::record_login_result(&result);
     result
+        .map(|outcome| match outcome {
+            LoginOutcome::SignedIn => LoginResult::SignedIn,
+            LoginOutcome::Typed => LoginResult::Typed,
+            LoginOutcome::AlreadySignedIn => LoginResult::AlreadySignedIn,
+            LoginOutcome::OtherAccount => LoginResult::OtherAccount,
+        })
+        .map_err(|error| fail(error.code()))
 }
 
 #[derive(Serialize)]
@@ -459,7 +466,7 @@ async fn login(
 struct GameStatusView {
     client_open: bool,
     in_game: bool,
-    /// Whether the Riot Client is signed in with this account.
+    /// Whether Riot and any running game client both confirm this account.
     same_account: bool,
 }
 
