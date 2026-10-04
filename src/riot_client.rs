@@ -9,7 +9,7 @@
 //! so a single "signed out" reading is never enough. The game is launched
 //! only after the API confirms the intended account is signed in.
 
-use crate::autotype::type_credentials;
+use crate::autotype::{type_credentials, wait_for_shortcut_release};
 use crate::logging::{self, Event, Reason};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -665,7 +665,7 @@ pub fn login(
     let started = Instant::now();
     let mut sign_out_sent: Option<Instant> = None;
     let mut signed_out_since: Option<Instant> = None;
-    let mut window_since: Option<Instant> = None;
+    let mut window_since = None;
     let window = loop {
         if cancelled() {
             return Err(LoginError::Cancelled);
@@ -706,7 +706,11 @@ pub fn login(
                 let since = *signed_out_since.get_or_insert_with(Instant::now);
                 match windows::find_client_window() {
                     Some(window) => {
-                        let shown = *window_since.get_or_insert_with(Instant::now);
+                        let (previous, shown) = window_since.get_or_insert((window, Instant::now()));
+                        if *previous != window {
+                            *previous = window;
+                            *shown = Instant::now();
+                        }
                         if since.elapsed() >= SIGNED_OUT_STABLE && shown.elapsed() >= WINDOW_STABLE {
                             break window;
                         }
@@ -720,9 +724,15 @@ pub fn login(
     };
 
     progress(LoginStep::Focus);
-    if !windows::focus(window) {
+    if !wait_for_shortcut_release() {
         return Err(LoginError::TypingFailed);
     }
+    focus_client_with(
+        cancel,
+        || windows::foreground_is(window),
+        || windows::focus(window),
+        || thread::sleep(Duration::from_millis(100)),
+    )?;
     // Let the login form take focus, then confirm nothing changed meanwhile.
     thread::sleep(Duration::from_millis(1200));
     let still_signed_out = LocalApi::read().is_some_and(|api| api.session() == Session::SignedOut);
@@ -733,7 +743,10 @@ pub fn login(
         return Err(LoginError::TypingFailed);
     }
     progress(LoginStep::Type);
-    if !type_credentials(account_id, password) {
+    if !type_credentials(account_id, password, || {
+        !cancelled() && windows::foreground_is(window)
+    }) {
+        check_cancelled(cancel)?;
         return Err(LoginError::TypingFailed);
     }
     progress(LoginStep::Confirm);
@@ -759,16 +772,44 @@ pub fn login(
     Ok(LoginOutcome::Typed)
 }
 
+/// Activation can be asynchronous or temporarily refused by Windows. Observe
+/// the actual foreground window, allowing up to five seconds and requiring
+/// 300 ms of stable focus. Do not keep stealing focus once typing has begun.
+fn focus_client_with(
+    cancel: &AtomicBool,
+    mut focused: impl FnMut() -> bool,
+    mut activate: impl FnMut(),
+    mut wait: impl FnMut(),
+) -> Result<(), LoginError> {
+    let mut stable = 0;
+    for attempt in 0..50 {
+        check_cancelled(cancel)?;
+        if focused() {
+            stable += 1;
+            if stable >= 4 {
+                return Ok(());
+            }
+        } else {
+            stable = 0;
+            if attempt % 5 == 0 {
+                activate();
+            }
+        }
+        wait();
+    }
+    check_cancelled(cancel)?;
+    Err(LoginError::TypingFailed)
+}
+
 #[cfg(windows)]
 mod windows {
-    use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM};
+    use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
     use windows_sys::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
     };
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        keybd_event, KEYEVENTF_KEYUP, VK_MENU,
+    use windows_sys::Win32::UI::HiDpi::{
+        GetDpiForWindow, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
-    use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetForegroundWindow, GetWindowRect, GetWindowTextLengthW,
         GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow,
@@ -822,8 +863,7 @@ mod windows {
         let large = unsafe {
             IsIconic(window) != 0
                 || (GetWindowRect(window, &mut rect) != 0
-                    && rect.right - rect.left >= 600
-                    && rect.bottom - rect.top >= 400)
+                    && login_window_size(rect, GetDpiForWindow(window)))
         };
         if visible && large && process_name(window).is_some_and(|name| CLIENT_UI.contains(&name.as_str())) {
             *found = Some(window);
@@ -834,21 +874,38 @@ mod windows {
 
     pub fn find_client_window() -> Option<HWND> {
         let mut found: Option<HWND> = None;
-        // SAFETY: the callback only writes through the pointer we pass in.
-        unsafe { EnumWindows(Some(collect), &mut found as *mut _ as LPARAM) };
+        // Query physical bounds regardless of the calling worker's inherited
+        // DPI context, then compare in the target window's logical units.
+        // SAFETY: this changes only this thread; restore its context afterwards.
+        unsafe {
+            let previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            if previous.is_null() {
+                return None;
+            }
+            EnumWindows(Some(collect), &mut found as *mut _ as LPARAM);
+            SetThreadDpiAwarenessContext(previous);
+        }
         found
     }
 
-    pub fn focus(window: HWND) -> bool {
-        // SAFETY: window is a live top-level handle. A tap of Alt satisfies
-        // Windows' foreground-lock rules for SetForegroundWindow.
+    pub(super) fn login_window_size(rect: RECT, dpi: u32) -> bool {
+        dpi != 0
+            && (i64::from(rect.right) - i64::from(rect.left)) * 96 >= 600 * i64::from(dpi)
+            && (i64::from(rect.bottom) - i64::from(rect.top)) * 96 >= 400 * i64::from(dpi)
+    }
+
+    pub fn focus(window: HWND) {
+        // An Alt tap may allow activation under foreground-lock rules, but
+        // success is established by polling GetForegroundWindow, not this call.
+        if !crate::autotype::tap_alt() {
+            return;
+        }
+        // SAFETY: these APIs reject stale handles without dereferencing them.
         unsafe {
             if IsIconic(window) != 0 {
                 ShowWindow(window, SW_RESTORE);
             }
-            keybd_event(VK_MENU as u8, 0, 0, 0);
-            keybd_event(VK_MENU as u8, 0, KEYEVENTF_KEYUP, 0);
-            SetForegroundWindow(window) != 0
+            SetForegroundWindow(window);
         }
     }
 
@@ -867,9 +924,7 @@ mod windows {
     pub fn find_client_window() -> Option<HWND> {
         None
     }
-    pub fn focus(_: HWND) -> bool {
-        false
-    }
+    pub fn focus(_: HWND) {}
     pub fn foreground_is(_: HWND) -> bool {
         false
     }
@@ -879,6 +934,128 @@ mod windows {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn focus_waits_for_delayed_activation_and_retries_refused_requests() {
+        let polls = Cell::new(0);
+        let requests = Cell::new(0);
+        let result = focus_client_with(
+            &AtomicBool::new(false),
+            || polls.get() >= 8,
+            || requests.set(requests.get() + 1),
+            || polls.set(polls.get() + 1),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(requests.get(), 2);
+        assert_eq!(polls.get(), 11);
+    }
+
+    #[test]
+    fn focus_must_stabilize_and_gives_up_without_typing() {
+        let polls = Cell::new(0);
+        let result = focus_client_with(
+            &AtomicBool::new(false),
+            // Focus is lost after two successful observations.
+            || matches!(polls.get(), 1 | 2) || polls.get() >= 6,
+            || {},
+            || polls.set(polls.get() + 1),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(polls.get(), 9);
+
+        let requests = Cell::new(0);
+        assert_eq!(
+            focus_client_with(
+                &AtomicBool::new(false),
+                || false,
+                || requests.set(requests.get() + 1),
+                || {},
+            ),
+            Err(LoginError::TypingFailed)
+        );
+        assert_eq!(requests.get(), 10);
+    }
+
+    #[test]
+    fn focus_stops_when_cancelled() {
+        let cancel = AtomicBool::new(true);
+        assert_eq!(
+            focus_client_with(
+                &cancel,
+                || panic!("must not query after cancellation"),
+                || panic!("must not activate after cancellation"),
+                || panic!("must not wait after cancellation"),
+            ),
+            Err(LoginError::Cancelled)
+        );
+        cancel.store(false, Ordering::SeqCst);
+        let requests = Cell::new(0);
+        assert_eq!(
+            focus_client_with(
+                &cancel,
+                || false,
+                || requests.set(requests.get() + 1),
+                || cancel.store(true, Ordering::SeqCst),
+            ),
+            Err(LoginError::Cancelled)
+        );
+        assert_eq!(requests.get(), 1);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn window_size_is_independent_of_monitor_origin_and_scaling() {
+        use windows_sys::Win32::Foundation::RECT;
+        for (left, top) in [(0, 0), (-3840, -2160), (3840, 2160)] {
+            for dpi in [96, 120, 144, 192, 288] {
+                let rect = RECT {
+                    left,
+                    top,
+                    right: left + 600 * dpi as i32 / 96,
+                    bottom: top + 400 * dpi as i32 / 96,
+                };
+                assert!(windows::login_window_size(rect, dpi));
+                assert!(!windows::login_window_size(
+                    RECT {
+                        right: rect.right - 1,
+                        ..rect
+                    },
+                    dpi
+                ));
+                assert!(!windows::login_window_size(
+                    RECT {
+                        bottom: rect.bottom - 1,
+                        ..rect
+                    },
+                    dpi
+                ));
+                assert!(!windows::login_window_size(rect, 0));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn window_discovery_restores_the_callers_dpi_context() {
+        use windows_sys::Win32::UI::HiDpi::{
+            AreDpiAwarenessContextsEqual, GetThreadDpiAwarenessContext, SetThreadDpiAwarenessContext,
+            DPI_AWARENESS_CONTEXT_SYSTEM_AWARE, DPI_AWARENESS_CONTEXT_UNAWARE,
+        };
+        // Read-only window discovery; no focus changes or injected input.
+        unsafe {
+            for context in [
+                DPI_AWARENESS_CONTEXT_UNAWARE,
+                DPI_AWARENESS_CONTEXT_SYSTEM_AWARE,
+            ] {
+                let original = SetThreadDpiAwarenessContext(context);
+                assert!(!original.is_null());
+                let _ = windows::find_client_window();
+                let restored = AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), context);
+                SetThreadDpiAwarenessContext(original);
+                assert_ne!(restored, 0);
+            }
+        }
+    }
 
     #[test]
     #[cfg(windows)]

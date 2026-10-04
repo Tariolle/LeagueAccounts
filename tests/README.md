@@ -25,6 +25,21 @@ that no dummy secrets, input JSON, or user paths reached the files.
 
 ## Interactive Windows checks
 
+Login regression tests in `src/autotype.rs` and `src/riot_client.rs` cover delayed
+activation, refused activation, stable focus, cancellation, and stopping input
+when focus changes or an input step fails. Geometry cases cover monitors left,
+right, above, and below the primary origin at 100%, 125%, 150%, 200%, and 300%
+scaling. A Windows API check verifies that window discovery restores the calling
+thread's DPI context. These checks require no injected keys or real credentials;
+they do not reproduce an actual mixed-DPI desktop or Riot's login form.
+
+For the monitor-specific regression, test both login methods with Riot and
+League Accounts on different monitors, including different scaling settings
+and a monitor to the left of the primary. Repeat with Riot minimized. In the
+previous-window method, focus the dummy form before returning to League
+Accounts. Activation must complete before typing. If focus changes during
+typing, the remaining steps must stop rather than continue in another window.
+
 Use a disposable dummy account and a test window, never real credentials.
 
 1. Select an account, then focus Search, an add-account input, or the description
