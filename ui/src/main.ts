@@ -529,7 +529,6 @@ function showUpdate(release: Release, force = false): void {
   document.querySelector(".update-banner")?.remove();
   const banner = fragment(`
     <div class="update-banner" role="status">
-      <span class="update-icon">${icon("sparkles", 18)}</span>
       <div class="update-body">
         <strong>${esc(t("update.available"))}</strong>
         <span>${esc(t("update.text", { version: release.version }))}</span>

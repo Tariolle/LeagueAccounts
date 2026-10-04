@@ -257,16 +257,6 @@
     transform: translate(-50%, 30px);
   }
 }
-.update-icon {
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  border-radius: 10px;
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 15%, transparent);
-  animation: pulse-glow 2.4s ease-in-out infinite;
-}
 .update-body {
   display: flex;
   flex-direction: column;
