@@ -137,6 +137,7 @@ export function openLoginOverlay(options: {
           if (state === "active") states.set(candidate, "done");
           if (state === "pending") states.set(candidate, "skipped");
         }
+        if (position > index) states.set(candidate, "pending");
       });
       states.set(step, "active");
       render();

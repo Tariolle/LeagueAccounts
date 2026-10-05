@@ -42,6 +42,7 @@ pub enum Event {
     ClipboardFailed,
     LoginStarted,
     LoginProgress,
+    LoginWaiting,
     LoginCompleted,
     LoginFailed,
     LoginCancelled,
@@ -75,6 +76,7 @@ impl Event {
             Self::ClipboardFailed => "clipboard_failed",
             Self::LoginStarted => "login_started",
             Self::LoginProgress => "login_progress",
+            Self::LoginWaiting => "login_waiting",
             Self::LoginCompleted => "login_completed",
             Self::LoginFailed => "login_failed",
             Self::LoginCancelled => "login_cancelled",
@@ -89,6 +91,7 @@ impl Event {
             | Self::SessionEnded
             | Self::LoginStarted
             | Self::LoginProgress
+            | Self::LoginWaiting
             | Self::LoginCompleted
             | Self::LoginCancelled
             | Self::RankRefreshStarted
@@ -107,6 +110,14 @@ pub enum Reason {
     CloseLeague,
     OpenClient,
     WaitAuth,
+    AuthUnavailable,
+    AuthStarting,
+    AuthInteraction,
+    AuthIdentityPending,
+    LoginFormReady,
+    GameIdentityPending,
+    GameProcessPending,
+    LaunchRejected,
     SignOut,
     FindWindow,
     Focus,
@@ -157,6 +168,14 @@ impl Reason {
             Self::CloseLeague => "close_league",
             Self::OpenClient => "open_client",
             Self::WaitAuth => "wait_auth",
+            Self::AuthUnavailable => "auth_unavailable",
+            Self::AuthStarting => "auth_starting",
+            Self::AuthInteraction => "auth_interaction",
+            Self::AuthIdentityPending => "auth_identity_pending",
+            Self::LoginFormReady => "login_form_ready",
+            Self::GameIdentityPending => "game_identity_pending",
+            Self::GameProcessPending => "game_process_pending",
+            Self::LaunchRejected => "launch_rejected",
             Self::SignOut => "sign_out",
             Self::FindWindow => "find_window",
             Self::Focus => "focus",

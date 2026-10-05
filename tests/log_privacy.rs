@@ -52,6 +52,8 @@ fn exercise_logging(directory: &std::path::Path) {
     logging::init().unwrap();
     assert!(logging::is_available());
     logging::record(Event::LoginStarted, Reason::RiotClient);
+    logging::record(Event::LoginWaiting, Reason::AuthStarting);
+    logging::record(Event::LoginWaiting, Reason::GameIdentityPending);
     leagueaccounts::riot_client::LoginStep::LaunchGame.record();
     leagueaccounts::riot_client::record_login_result(&Err(
         leagueaccounts::riot_client::LoginError::AccountMismatch,
@@ -121,6 +123,7 @@ fn exercise_logging(directory: &std::path::Path) {
     for event in [
         "session_started",
         "login_started",
+        "login_waiting",
         "login_progress",
         "login_failed",
         "session_ended",

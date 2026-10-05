@@ -23,6 +23,18 @@ panics containing dummy IDs/passwords (including a sensitive thread name).
 It checks the readable log files for expected diagnostic events and verifies
 that no dummy secrets, input JSON, or user paths reached the files.
 
+Riot login tests simulate cold startup, a signed-out client, a signed-in client,
+and lifecycle sign-out with a loopback HTTP server. The lifecycle API is the
+readiness source; a missing RSO authorization is not treated as a login form.
+Readiness must restart after an authentication interruption, window replacement,
+or client endpoint change. Diagnostic tests verify that repeated waiting states
+are logged once per transition and remain fixed categories without account data.
+
+The endpoint contract is described in the [extracted Riot API documentation](https://github.com/KebsCS/lcu-and-riotclient-api/blob/main/riotclient/data_info.json).
+The signed-out `PendingLoginStrategy` and signed-in `PendingProductContext`
+responses are documented in [these desktop client observations](https://github.com/ArtemChig/LeagueSwitcher/blob/main/docs/RESEARCH.md).
+These fixtures do not replace testing against the installed Riot Client.
+
 ## Interactive Windows checks
 
 Use a disposable dummy account and a test window, never real credentials.

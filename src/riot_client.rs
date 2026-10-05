@@ -2,12 +2,12 @@
 //! state from the local API, type credentials into its login window, and
 //! launch a game once sign-in is confirmed.
 //!
-//! Credentials are only typed after the auth service is ready, has reported
-//! "signed out" continuously for `SIGNED_OUT_STABLE`, and the client's main
-//! window is visible and focused. While the client starts, a session kept by
-//! the background service can briefly look signed out before it is restored,
-//! so a single "signed out" reading is never enough. The game is launched
-//! only after the API confirms the intended account is signed in.
+//! Credentials are only typed after the session lifecycle reports that it is
+//! waiting for a login strategy and the same client window has remained visible
+//! for `WINDOW_STABLE`. Missing authorization during startup is not evidence of
+//! a signed-out session: the client may still be restoring a saved login.
+//! The game is launched only after the API confirms the intended account is
+//! signed in.
 
 use crate::autotype::type_credentials;
 use crate::logging::{self, Event, Reason};
@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(60);
 /// After typing, how long to wait for sign-in (2FA or captcha may need the user).
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(90);
-const SIGNED_OUT_STABLE: Duration = Duration::from_secs(4);
 const WINDOW_STABLE: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(500);
 
@@ -247,6 +246,7 @@ fn launch_game_with(
     mut wait: impl FnMut(),
 ) -> Result<(), LoginError> {
     let mut requested = false;
+    let mut diagnostics = LoginDiagnostics::default();
     for attempt in 0..40 {
         check_cancelled(cancel)?;
         let current = observe();
@@ -257,13 +257,24 @@ fn launch_game_with(
         // Never launch through a restored or newly changed Riot session.
         // An existing game with an unreadable identity must become observable
         // before it can count as success; do not launch another copy over it.
+        let mut reason = if current.league_running() {
+            Reason::GameIdentityPending
+        } else if current.signed_in_as(account_id) {
+            Reason::GameProcessPending
+        } else {
+            Reason::AuthUnavailable
+        };
         if !requested
             && !current.league_running()
             && current.signed_in_as(account_id)
             && attempt % 2 == 0
         {
             requested = request()?;
+            if !requested {
+                reason = Reason::LaunchRejected;
+            }
         }
+        diagnostics.waiting(reason);
         wait();
     }
     check_cancelled(cancel)?;
@@ -298,7 +309,65 @@ fn start_game(game: Game, account_id: &str, cancel: &AtomicBool) -> Result<(), L
 enum Session {
     SignedIn,
     SignedOut,
-    Unknown,
+    Unknown(Reason),
+}
+
+/// The lifecycle endpoint is available before RSO initializes on a cold start.
+/// Only its explicit login-strategy state permits typing; neither HTTP errors
+/// nor an absent RSO authorization prove that the login form is ready.
+fn session_state(response: Option<(u16, serde_json::Value)>) -> Session {
+    let Some((200, body)) = response else {
+        return Session::Unknown(Reason::AuthUnavailable);
+    };
+    if body["puuid"].as_str().is_some_and(|id| !id.is_empty()) {
+        return Session::SignedIn;
+    }
+    match body["loginState"].as_str() {
+        Some("PendingLoginStrategy") => Session::SignedOut,
+        Some(_) if body["actionRequired"] == true => Session::Unknown(Reason::AuthInteraction),
+        Some(_) => Session::Unknown(Reason::AuthStarting),
+        None => Session::Unknown(Reason::AuthUnavailable),
+    }
+}
+
+#[derive(Default)]
+struct LoginDiagnostics(Option<Reason>);
+
+impl LoginDiagnostics {
+    fn waiting(&mut self, reason: Reason) {
+        if self.0 != Some(reason) {
+            logging::record(Event::LoginWaiting, reason);
+            self.0 = Some(reason);
+        }
+    }
+}
+
+/// Restart the stability interval on client restart, window replacement, or
+/// any interruption of the signed-out state. No time spent restoring a session
+/// may count toward the time the login form has been ready.
+#[derive(Default)]
+struct LoginReadiness {
+    since: Option<(String, windows::HWND, Instant)>,
+}
+
+impl LoginReadiness {
+    fn observe(&mut self, target: Option<(&str, windows::HWND)>, now: Instant) -> bool {
+        let Some((endpoint, window)) = target else {
+            self.since = None;
+            return false;
+        };
+        match &self.since {
+            Some((previous_endpoint, previous_window, since))
+                if previous_endpoint == endpoint && *previous_window == window =>
+            {
+                now.duration_since(*since) >= WINDOW_STABLE
+            }
+            _ => {
+                self.since = Some((endpoint.to_owned(), window, now));
+                false
+            }
+        }
+    }
 }
 
 /// The Riot Client's local HTTPS API, described by its lockfile.
@@ -363,25 +432,7 @@ impl LocalApi {
     }
 
     fn session(&self) -> Session {
-        // Until the auth service reports ready, "not authorized" may only
-        // mean the stored session has not been restored yet.
-        let ready = self
-            .get("/rso-auth/configuration/v3/ready-state")
-            .is_some_and(|(status, body)| status == 200 && body["ready"] == true);
-        if !ready {
-            return Session::Unknown;
-        }
-        let Some((authorization, _)) = self.get("/rso-auth/v1/authorization") else {
-            return Session::Unknown;
-        };
-        let session_type = self
-            .get("/rso-auth/v1/session")
-            .and_then(|(_, body)| body["type"].as_str().map(str::to_owned));
-        match (authorization, session_type.as_deref()) {
-            (200, _) | (_, Some("authenticated")) => Session::SignedIn,
-            (404, _) => Session::SignedOut,
-            _ => Session::Unknown,
-        }
+        session_state(self.get("/player-session-lifecycle/v1/session"))
     }
 
     /// Ask the client to launch a product; true when the request is accepted.
@@ -432,14 +483,14 @@ impl LocalApi {
         check_cancelled(cancel)?;
         if !self
             .functions()
-            .is_some_and(|functions| functions.contains("DeleteRsoAuthV1Session"))
+            .is_some_and(|functions| functions.contains("DeletePlayerSessionLifecycleV1Session"))
         {
             return Err(LoginError::SignOutFailed);
         }
         check_cancelled(cancel)?;
         let sent = self
             .client
-            .delete(format!("{}/rso-auth/v1/session", self.base))
+            .delete(format!("{}/player-session-lifecycle/v1/session", self.base))
             .basic_auth("riot", Some(&self.password))
             .send()
             .is_ok_and(|response| response.status().is_success());
@@ -648,7 +699,7 @@ pub fn login(
     }
     progress(LoginStep::OpenClient);
     check_cancelled(cancel)?;
-    if !open_client(&path) {
+    if windows::find_client_window().is_none() && !open_client(&path) {
         return Err(LoginError::LaunchFailed);
     }
     progress(LoginStep::WaitAuth);
@@ -664,9 +715,9 @@ pub fn login(
 
     let started = Instant::now();
     let mut sign_out_sent: Option<Instant> = None;
-    let mut signed_out_since: Option<Instant> = None;
-    let mut window_since: Option<Instant> = None;
-    let window = loop {
+    let mut readiness = LoginReadiness::default();
+    let mut diagnostics = LoginDiagnostics::default();
+    let (window, endpoint) = loop {
         if cancelled() {
             return Err(LoginError::Cancelled);
         }
@@ -675,13 +726,32 @@ pub fn login(
         }
         // The lockfile is rewritten when the client restarts; re-read it.
         let api = LocalApi::read();
-        let session = api.as_ref().map_or(Session::Unknown, LocalApi::session);
+        let session = api.as_ref().map_or(
+            Session::Unknown(Reason::AuthUnavailable),
+            LocalApi::session,
+        );
         check_cancelled(cancel)?;
         if session != Session::SignedOut {
-            signed_out_since = None;
+            readiness.observe(None, Instant::now());
+        }
+        let signed_in_name = if session == Session::SignedIn {
+            api.as_ref().and_then(LocalApi::username)
+        } else {
+            None
+        };
+        check_cancelled(cancel)?;
+        if session == Session::SignedIn && signed_in_name.is_none() {
+            report(LoginStep::WaitAuth, progress);
+            diagnostics.waiting(Reason::AuthIdentityPending);
+            thread::sleep(POLL);
+            continue;
         }
         match (session, api) {
-            (Session::SignedIn, Some(api)) if is_this_account(&api) => {
+            (Session::SignedIn, _)
+                if signed_in_name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(account_id)) =>
+            {
                 if let Some(game) = game {
                     report(LoginStep::LaunchGame, progress);
                     start_game(game, account_id, cancel)?;
@@ -701,20 +771,28 @@ pub fn login(
                 }
                 Some(_) => {}
             },
-            (Session::SignedOut, _) => {
+            (Session::SignedOut, Some(api)) => {
                 report(LoginStep::FindWindow, progress);
-                let since = *signed_out_since.get_or_insert_with(Instant::now);
-                match windows::find_client_window() {
+                let window = windows::find_client_window();
+                let ready = readiness.observe(
+                    window.map(|window| (api.base.as_str(), window)),
+                    Instant::now(),
+                );
+                match window {
                     Some(window) => {
-                        let shown = *window_since.get_or_insert_with(Instant::now);
-                        if since.elapsed() >= SIGNED_OUT_STABLE && shown.elapsed() >= WINDOW_STABLE {
-                            break window;
+                        diagnostics.waiting(Reason::LoginFormReady);
+                        if ready {
+                            break (window, api.base);
                         }
                     }
-                    None => window_since = None,
+                    None => diagnostics.waiting(Reason::FindWindow),
                 }
             }
-            (Session::Unknown, _) => {}
+            (Session::Unknown(reason), _) => {
+                report(LoginStep::WaitAuth, progress);
+                diagnostics.waiting(reason);
+            }
+            (Session::SignedOut, None) => unreachable!("signed-out requires a client API"),
         }
         thread::sleep(POLL);
     };
@@ -725,7 +803,8 @@ pub fn login(
     }
     // Let the login form take focus, then confirm nothing changed meanwhile.
     thread::sleep(Duration::from_millis(1200));
-    let still_signed_out = LocalApi::read().is_some_and(|api| api.session() == Session::SignedOut);
+    let still_signed_out = LocalApi::read()
+        .is_some_and(|api| api.base == endpoint && api.session() == Session::SignedOut);
     if cancelled() {
         return Err(LoginError::Cancelled);
     }
@@ -746,14 +825,21 @@ pub fn login(
         }
         thread::sleep(Duration::from_secs(1));
         if let Some(api) = LocalApi::read() {
-            if api.session() == Session::SignedIn && is_this_account(&api) {
-                if let Some(game) = game {
-                    progress(LoginStep::LaunchGame);
-                    start_game(game, account_id, cancel)?;
+            match api.session() {
+                Session::SignedIn if is_this_account(&api) => {
+                    if let Some(game) = game {
+                        progress(LoginStep::LaunchGame);
+                        start_game(game, account_id, cancel)?;
+                    }
+                    progress(LoginStep::Done);
+                    return Ok(LoginOutcome::SignedIn);
                 }
-                progress(LoginStep::Done);
-                return Ok(LoginOutcome::SignedIn);
+                Session::SignedIn => diagnostics.waiting(Reason::AuthIdentityPending),
+                Session::SignedOut => diagnostics.waiting(Reason::Confirm),
+                Session::Unknown(reason) => diagnostics.waiting(reason),
             }
+        } else {
+            diagnostics.waiting(Reason::AuthUnavailable);
         }
     }
     Ok(LoginOutcome::Typed)
@@ -761,7 +847,8 @@ pub fn login(
 
 #[cfg(windows)]
 mod windows {
-    use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM};
+    pub(super) use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Foundation::{CloseHandle, LPARAM};
     use windows_sys::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
     };
@@ -879,6 +966,150 @@ mod windows {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn lifecycle_never_treats_startup_errors_or_challenges_as_a_login_form() {
+        use serde_json::json;
+
+        for response in [
+            None,
+            Some((404, json!({}))),
+            Some((503, json!({}))),
+            Some((200, json!({}))),
+        ] {
+            assert_eq!(
+                session_state(response),
+                Session::Unknown(Reason::AuthUnavailable)
+            );
+        }
+        for state in [
+            "PendingInitialization",
+            "RestoreAuthorization",
+            "PendingClientConfigData",
+            "FutureState",
+        ] {
+            assert_eq!(
+                session_state(Some((200, json!({"loginState": state, "puuid": ""})))),
+                Session::Unknown(Reason::AuthStarting)
+            );
+        }
+        assert_eq!(
+            session_state(Some((200, json!({
+                "loginState": "PendingAuthentication", "actionRequired": true
+            })))),
+            Session::Unknown(Reason::AuthInteraction)
+        );
+        // An identity always prevents typing, even across a transitional response.
+        assert_eq!(
+            session_state(Some((200, json!({
+                "loginState": "PendingLoginStrategy", "puuid": "signed-in-player"
+            })))),
+            Session::SignedIn
+        );
+    }
+
+    #[test]
+    fn cold_start_and_sign_out_use_the_lifecycle_without_waiting_for_rso_initialization() {
+        use std::io::{BufRead, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let responses = [
+            (
+                r#"{"loginState":"RestoreAuthorization","puuid":""}"#,
+                Session::Unknown(Reason::AuthStarting),
+            ),
+            (
+                r#"{"loginState":"PendingLoginStrategy","puuid":""}"#,
+                Session::SignedOut,
+            ),
+            (
+                r#"{"loginState":"PendingProductContext","puuid":"player"}"#,
+                Session::SignedIn,
+            ),
+            (
+                r#"{"loginState":"PendingLoginStrategy","puuid":""}"#,
+                Session::SignedOut,
+            ),
+        ];
+        let mut exchanges: Vec<_> = responses.iter()
+            .map(|(body, _)| ("GET /player-session-lifecycle/v1/session ", *body))
+            .collect();
+        exchanges.splice(3..3, [
+            (
+                "GET /help ",
+                r#"{"functions":{"DeletePlayerSessionLifecycleV1Session":{}}}"#,
+            ),
+            ("DELETE /player-session-lifecycle/v1/session ", "{}"),
+        ]);
+        let server = thread::spawn(move || {
+            for (request, body) in exchanges {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                // No legacy ready-state, authorization or RSO-session request:
+                // those may remain uninitialized until the first manual login.
+                assert!(line.starts_with(request));
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let api = LocalApi {
+            base: format!("http://{address}"),
+            password: "test".into(),
+            client: reqwest::blocking::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        };
+        for (index, (_, expected)) in responses.into_iter().enumerate() {
+            if index == 3 {
+                assert_eq!(api.sign_out(&AtomicBool::new(false)), Ok(()));
+            }
+            assert_eq!(api.session(), expected);
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn login_readiness_restarts_after_auth_window_or_client_changes() {
+        let mut readiness = LoginReadiness::default();
+        let start = Instant::now();
+        // Opaque test handles are only compared, never passed to Windows.
+        let first = 1usize as windows::HWND;
+        let second = 2usize as windows::HWND;
+        let target = Some(("client-one", first));
+        assert!(!readiness.observe(target, start));
+        assert!(!readiness.observe(target, start + Duration::from_secs(1)));
+        assert!(readiness.observe(target, start + WINDOW_STABLE));
+
+        // Authentication restoration or a missing window resets all readiness.
+        assert!(!readiness.observe(None, start + Duration::from_secs(3)));
+        assert!(!readiness.observe(target, start + Duration::from_secs(4)));
+        assert!(!readiness.observe(target, start + Duration::from_secs(5)));
+        assert!(readiness.observe(target, start + Duration::from_secs(6)));
+
+        // Replacing the splash/login window starts a fresh interval.
+        let replacement = Some(("client-one", second));
+        assert!(!readiness.observe(replacement, start + Duration::from_secs(7)));
+        assert!(readiness.observe(replacement, start + Duration::from_secs(9)));
+
+        // A new API endpoint cannot inherit readiness from the previous client.
+        let restarted = Some(("client-two", second));
+        assert!(!readiness.observe(restarted, start + Duration::from_secs(10)));
+        assert!(readiness.observe(restarted, start + Duration::from_secs(12)));
+    }
 
     #[test]
     #[cfg(windows)]
@@ -1054,6 +1285,21 @@ mod tests {
     #[test]
     fn login_diagnostics_distinguish_failure_success_and_cancellation() {
         let log = logging::capture(|| {
+            let mut diagnostics = LoginDiagnostics::default();
+            for reason in [
+                Reason::AuthUnavailable,
+                Reason::AuthStarting,
+                Reason::AuthInteraction,
+                Reason::AuthIdentityPending,
+                Reason::FindWindow,
+                Reason::LoginFormReady,
+                Reason::GameIdentityPending,
+                Reason::GameProcessPending,
+                Reason::LaunchRejected,
+            ] {
+                diagnostics.waiting(reason);
+                diagnostics.waiting(reason);
+            }
             LoginStep::LaunchGame.record();
             record_login_result(&Err(LoginError::AccountMismatch));
             record_login_result(&Err(LoginError::GameLaunchFailed));
@@ -1062,6 +1308,15 @@ mod tests {
             record_login_result(&Ok(LoginOutcome::AlreadySignedIn));
         });
         for entry in [
+            "INFO event=login_waiting reason=auth_unavailable",
+            "INFO event=login_waiting reason=auth_starting",
+            "INFO event=login_waiting reason=auth_interaction",
+            "INFO event=login_waiting reason=auth_identity_pending",
+            "INFO event=login_waiting reason=find_window",
+            "INFO event=login_waiting reason=login_form_ready",
+            "INFO event=login_waiting reason=game_identity_pending",
+            "INFO event=login_waiting reason=game_process_pending",
+            "INFO event=login_waiting reason=launch_rejected",
             "INFO event=login_progress reason=launch_game",
             "ERROR event=login_failed reason=account_mismatch",
             "ERROR event=login_failed reason=game_launch_failed",
@@ -1069,7 +1324,7 @@ mod tests {
             "INFO event=login_cancelled reason=cancelled",
             "INFO event=login_completed reason=already_signed_in",
         ] {
-            assert!(log.contains(entry));
+            assert_eq!(log.matches(entry).count(), 1, "{entry}");
         }
     }
 
@@ -1099,7 +1354,7 @@ mod tests {
                 }
             }
             server_cancel.store(true, Ordering::SeqCst);
-            let body = r#"{"functions":{"DeleteRsoAuthV1Session":{}}}"#;
+            let body = r#"{"functions":{"DeletePlayerSessionLifecycleV1Session":{}}}"#;
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         });
         let api = LocalApi {
