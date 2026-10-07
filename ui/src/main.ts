@@ -803,11 +803,12 @@ function openAddDrawer(tab: "single" | "multi" = "single"): void {
 
   const textarea = $<HTMLTextAreaElement>("textarea", overlay);
   const counter = $(".multi-count", overlay);
-  textarea.addEventListener("input", () => {
+  const updateMultiCount = () => {
     const lines = textarea.value.split("\n").filter((line) => line.trim());
     const valid = lines.filter((line) => parseAccountLine(line));
     counter.textContent = lines.length ? t("add.multiCount", { valid: valid.length, total: lines.length }) : "";
-  });
+  };
+  textarea.addEventListener("input", updateMultiCount);
 
   const single = $<HTMLFormElement>('[data-panel="single"]', overlay);
   single.addEventListener("submit", async (event) => {
@@ -848,6 +849,8 @@ function openAddDrawer(tab: "single" | "multi" = "single"): void {
   const multi = $<HTMLFormElement>('[data-panel="multi"]', overlay);
   multi.addEventListener("submit", async (event) => {
     event.preventDefault();
+    const button = $<HTMLButtonElement>('button[type="submit"]', multi);
+    if (button.disabled) return;
     const data = new FormData(multi);
     const text = String(data.get("text") ?? "");
     const region = String(data.get("region") ?? "");
@@ -856,18 +859,31 @@ function openAddDrawer(tab: "single" | "multi" = "single"): void {
       return;
     }
     rememberRegion(region);
-    const result = await guard(() => api.multiAdd(text, region), "toast.multiFailed");
-    if (!result) return;
-    state.accounts = await api.listAccounts();
-    render();
-    textarea.value = "";
-    counter.textContent = "";
-    toast(
-      result.added ? "success" : "info",
-      t("toast.multiAdded", { count: result.added }),
-      result.skipped ? t("toast.multiSkipped", { count: result.skipped }) : "",
-    );
-    if (result.added) close();
+    const regionSelect = $<HTMLSelectElement>('[name="region"]', multi);
+    button.disabled = true;
+    textarea.readOnly = true;
+    regionSelect.disabled = true;
+    try {
+      const result = await guard(() => api.multiAdd(text, region), "toast.multiFailed");
+      if (!result) return;
+      const lines = text.split("\n");
+      textarea.value = result.skippedLines.map((index) => lines[index]).join("\n");
+      updateMultiCount();
+      state.accounts = await api.listAccounts();
+      render();
+      const skipped = result.skippedLines.length;
+      toast(
+        result.added ? "success" : "info",
+        t("toast.multiAdded", { count: result.added }),
+        skipped ? t("toast.multiSkipped", { count: skipped }) : "",
+      );
+      if (result.added && !skipped) close();
+      else textarea.focus();
+    } finally {
+      button.disabled = false;
+      textarea.readOnly = false;
+      regionSelect.disabled = false;
+    }
   });
 }
 

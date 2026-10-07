@@ -136,6 +136,11 @@ export interface BatchResult {
   skipped: number;
 }
 
+export interface BulkAddResult {
+  added: number;
+  skippedLines: number[];
+}
+
 export interface NewAccount {
   accountId: string;
   name: string;
@@ -177,7 +182,7 @@ export const api = {
   bootstrap: () => call<Bootstrap>("bootstrap"),
   listAccounts: () => call<AccountView[]>("list_accounts"),
   addAccount: (input: NewAccount) => call<AccountView>("add_account", { input }),
-  multiAdd: (text: string, region: string) => call<BatchResult>("multi_add", { text, region }),
+  multiAdd: (text: string, region: string) => call<BulkAddResult>("multi_add", { text, region }),
   updateAccount: (key: Key, name: string, description: string) =>
     call<AccountView>("update_account", { key, name, description }),
   deleteAccount: (key: Key) => call<void>("delete_account", { key }),

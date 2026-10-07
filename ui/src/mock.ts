@@ -1,6 +1,6 @@
 // Development-only stand-in for the Tauri backend, used when the UI is opened
 // in a plain browser (`npm run dev`). Never bundled into release builds.
-import { api, events, keyId, parseAccountLine, type AccountView, type Key, type NewAccount, type RefreshDone } from "./api";
+import { api, events, keyId, parseAccountLine, type AccountView, type BulkAddResult, type Key, type NewAccount, type RefreshDone } from "./api";
 
 const lol = (tier: string, division: string, lp: string, finished = "Gold II", reached = finished) => ({
   tier,
@@ -117,19 +117,20 @@ export function installMock(): void {
       if (account.name) setTimeout(() => fakeFetch([{ ...account, level: "30", lol: lol("Silver", "II", "45", "Bronze I") }]), 50);
       return account;
     },
-    multiAdd: async (text: string, region: string) => {
+    multiAdd: async (text: string, region: string): Promise<BulkAddResult> => {
       let added = 0;
-      let skipped = 0;
-      for (const line of text.split("\n").filter((line) => line.trim())) {
+      const skippedLines: number[] = [];
+      for (const [index, line] of text.split("\n").entries()) {
+        if (!line.trim()) continue;
         const input = parseAccountLine(line);
         if (!input || accounts.some((account) => account.accountId.toLowerCase() === input.accountId.toLowerCase() && account.region === region.toLowerCase())) {
-          skipped++;
+          skippedLines.push(index);
           continue;
         }
         await api.addAccount({ ...input, region, description: "" });
         added++;
       }
-      return { added, skipped };
+      return { added, skippedLines };
     },
     updateAccount: async (key: Key, name: string, description: string) => {
       const account = find(key)!;

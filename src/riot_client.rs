@@ -17,7 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Allow cold starts and client updates without relaxing login readiness.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// After typing, how long to wait for sign-in (2FA or captcha may need the user).
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(90);
 const WINDOW_STABLE: Duration = Duration::from_secs(2);
