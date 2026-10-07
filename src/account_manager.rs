@@ -27,19 +27,19 @@ trait PasswordStore {
     fn delete(&self, key: &str) -> ManagerResult<()>;
 }
 
-struct NativePasswords;
+struct NativePasswords<'a>(&'a str);
 
-impl PasswordStore for NativePasswords {
+impl PasswordStore for NativePasswords<'_> {
     fn get(&self, key: &str) -> ManagerResult<Option<String>> {
-        credentials::get_password(KEYRING_SERVICE, key)
+        credentials::get_password(self.0, key)
     }
 
     fn set(&self, key: &str, password: &str) -> ManagerResult<()> {
-        credentials::set_password(KEYRING_SERVICE, key, password)
+        credentials::set_password(self.0, key, password)
     }
 
     fn delete(&self, key: &str) -> ManagerResult<()> {
-        credentials::delete_password(KEYRING_SERVICE, key)
+        credentials::delete_password(self.0, key)
     }
 }
 
@@ -135,7 +135,7 @@ impl AccountManager {
     /// Store accepted accounts in one write; publish them in memory only after
     /// the file has been replaced. Skipped indices refer to the input vector.
     pub fn add_accounts(&mut self, accounts: Vec<Account>) -> ManagerResult<AddAccountsResult> {
-        self.add_accounts_with(accounts, &NativePasswords)
+        self.add_accounts_with(accounts, &NativePasswords(KEYRING_SERVICE))
     }
 
     fn add_accounts_with(
@@ -213,7 +213,7 @@ impl AccountManager {
     }
 
     pub fn delete_account(&mut self, account_id: &str, region: &str) -> ManagerResult<()> {
-        self.delete_account_with(account_id, region, &NativePasswords)
+        self.delete_account_with(account_id, region, &NativePasswords(KEYRING_SERVICE))
     }
 
     fn delete_account_with(
@@ -301,7 +301,7 @@ impl AccountManager {
 
     /// Import a JSON array. Returns `(added, skipped)` like the original app.
     pub fn import_accounts(&mut self, json: &str) -> ManagerResult<(usize, usize)> {
-        self.import_accounts_with(json, &NativePasswords)
+        self.import_accounts_with(json, &NativePasswords(KEYRING_SERVICE))
     }
 
     fn import_accounts_with(
@@ -843,6 +843,67 @@ mod tests {
         assert_eq!(result.skipped_indices, [0]);
         assert!(!manager.accounts_file.exists());
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_rollback_does_not_modify_another_accounts_credential() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // Use an isolated service, and clean up its dummy entries even if an
+        // assertion fails. Never access the application's credential targets.
+        struct Cleanup(Vec<keyring::Entry>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for entry in &self.0 {
+                    let _ = entry.delete_credential();
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let service = format!(
+            "LeagueAccounts-test-{}-{}",
+            std::process::id(),
+            directory.path().file_name().unwrap().to_string_lossy()
+        );
+        let entries = Cleanup(vec![
+            keyring::Entry::new_with_target(&service, &service, "euw:a").unwrap(),
+            keyring::Entry::new_with_target(&format!("euw:a@{service}"), &service, "euw:a")
+                .unwrap(),
+            keyring::Entry::new_with_target(&format!("euw:b@{service}"), &service, "euw:b")
+                .unwrap(),
+        ]);
+        let legacy = &entries.0[0];
+        let primary_a = &entries.0[1];
+        let primary_b = &entries.0[2];
+        legacy.set_password("stale-a-password").unwrap();
+        primary_a.set_password("current-a-password").unwrap();
+        primary_b.set_password("current-b-password").unwrap();
+
+        let path = directory.path().join("accounts.json");
+        let mut manager = test_manager(&path);
+        manager.accounts = vec![test_account("a"), test_account("b")];
+        manager.save_accounts().unwrap();
+        let original_accounts = manager.accounts.clone();
+        let original_file = std::fs::read(&path).unwrap();
+        let _locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        let passwords = NativePasswords(&service);
+
+        assert!(manager.delete_account_with("b", "euw", &passwords).is_err());
+        assert_eq!(primary_a.get_password().unwrap(), "current-a-password");
+        assert_eq!(primary_b.get_password().unwrap(), "current-b-password");
+        assert_eq!(legacy.get_password().unwrap(), "stale-a-password");
+        assert_eq!(manager.accounts, original_accounts);
+        assert_eq!(std::fs::read(&path).unwrap(), original_file);
+
+        primary_a.delete_credential().unwrap();
+        assert!(passwords.get("euw:a").unwrap().is_none());
+        assert_eq!(legacy.get_password().unwrap(), "stale-a-password");
     }
 
     #[test]
