@@ -69,6 +69,10 @@ impl AccountManager {
     }
 
     pub fn load_accounts(&mut self) -> ManagerResult<()> {
+        self.load_accounts_with_service(KEYRING_SERVICE)
+    }
+
+    fn load_accounts_with_service(&mut self, service: &str) -> ManagerResult<()> {
         self.accounts.clear();
         if !self.accounts_file.exists() {
             return Ok(());
@@ -83,8 +87,8 @@ impl AccountManager {
             if account.region_display.is_empty() {
                 account.region_display = region_display(&account.region);
             }
-            account.password = credentials::get_password(
-                KEYRING_SERVICE,
+            account.password = credentials::load_password_with_migration(
+                service,
                 &format!("{}:{}", account.region, account.account_id),
             )
             .ok()
@@ -904,6 +908,100 @@ mod tests {
         primary_a.delete_credential().unwrap();
         assert!(passwords.get("euw:a").unwrap().is_none());
         assert_eq!(legacy.get_password().unwrap(), "stale-a-password");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn loading_migrates_legacy_only_passwords_without_changing_other_credentials() {
+        // Isolate every target, including the shared legacy entry, from the
+        // user's credentials and from the native rollback regression above.
+        struct Cleanup(Vec<keyring::Entry>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for entry in &self.0 {
+                    let _ = entry.delete_credential();
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let service = format!(
+            "LeagueAccounts-migration-test-{}-{}",
+            std::process::id(),
+            directory.path().file_name().unwrap().to_string_lossy()
+        );
+        let entries = Cleanup(vec![
+            keyring::Entry::new_with_target(&service, &service, "euw:legacy").unwrap(),
+            keyring::Entry::new_with_target(
+                &format!("euw:legacy@{service}"),
+                &service,
+                "euw:legacy",
+            )
+            .unwrap(),
+            keyring::Entry::new_with_target(
+                &format!("euw:current@{service}"),
+                &service,
+                "euw:current",
+            )
+            .unwrap(),
+            keyring::Entry::new_with_target(
+                &format!("euw:missing@{service}"),
+                &service,
+                "euw:missing",
+            )
+            .unwrap(),
+        ]);
+        let legacy = &entries.0[0];
+        let migrated = &entries.0[1];
+        let current = &entries.0[2];
+        legacy.set_password("legacy-password").unwrap();
+        current.set_password("current-password").unwrap();
+
+        let path = directory.path().join("accounts.json");
+        let mut manager = test_manager(&path);
+        manager.accounts = vec![
+            test_account("missing"),
+            test_account("current"),
+            test_account("legacy"),
+        ];
+        manager.save_accounts().unwrap();
+        let original_file = std::fs::read(&path).unwrap();
+        // Transactional reads must not consult or migrate the shared entry.
+        let passwords = NativePasswords(&service);
+        assert!(passwords.get("euw:legacy").unwrap().is_none());
+
+        manager.load_accounts_with_service(&service).unwrap();
+        assert_eq!(manager.accounts[0].account_id, "missing");
+        assert!(manager.accounts[0].password.is_empty());
+        assert_eq!(manager.accounts[1].password, "current-password");
+        assert_eq!(manager.accounts[2].password, "legacy-password");
+        assert_eq!(migrated.get_password().unwrap(), "legacy-password");
+        assert_eq!(current.get_password().unwrap(), "current-password");
+        assert!(passwords.get("euw:missing").unwrap().is_none());
+        assert_eq!(legacy.get_password().unwrap(), "legacy-password");
+        assert_eq!(std::fs::read(&path).unwrap(), original_file);
+
+        // Repeated startup must not replace a newer primary with stale legacy
+        // data. The loaded password must also remain available for exports.
+        migrated.set_password("updated-password").unwrap();
+        manager
+            .accounts
+            .retain(|account| account.account_id != "missing");
+        manager.save_accounts().unwrap();
+        manager.load_accounts_with_service(&service).unwrap();
+        assert_eq!(manager.accounts[1].password, "updated-password");
+        let exported: serde_json::Value =
+            serde_json::from_str(&manager.export_accounts().unwrap()).unwrap();
+        assert_eq!(exported[1]["password"], "updated-password");
+        assert_eq!(legacy.get_password().unwrap(), "legacy-password");
+        assert_eq!(migrated.get_password().unwrap(), "updated-password");
+
+        // Even an explicitly empty primary is not a missing entry.
+        migrated.set_password("").unwrap();
+        manager.load_accounts_with_service(&service).unwrap();
+        assert!(manager.accounts[1].password.is_empty());
+        assert_eq!(migrated.get_password().unwrap(), "");
+        assert_eq!(legacy.get_password().unwrap(), "legacy-password");
     }
 
     #[test]
