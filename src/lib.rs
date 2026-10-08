@@ -7,6 +7,7 @@
 
 pub mod account_manager;
 pub mod autotype;
+pub mod clipboard;
 pub mod credentials;
 pub mod logging;
 pub mod models;

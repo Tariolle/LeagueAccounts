@@ -77,6 +77,9 @@ username3----password3
 
 Ranks are fetched right after adding. Use **Refresh ranks** (`Ctrl+R`) at any time.
 
+Bulk add keeps skipped lines in the form so you can correct and retry them.
+Accepted accounts are saved together; a failed save leaves the batch unadded.
+
 ### Log in
 
 Press **Log in** on a card (or `Ctrl+Shift+V` with the account selected). League Accounts will:
@@ -135,7 +138,7 @@ The switch at the top changes every rank, sort order and filter between **League
 ## Privacy and security
 
 - **Passwords** are stored in **Windows Credential Manager** (service `LeagueAccounts`). They are never written to the app's data files and never sent to the interface. Copying and login happen in the native backend.
-- **Clipboard:** copied passwords are cleared after 30 seconds, and the clipboard is cleared after every automatic login.
+- **Clipboard:** copied and auto-typed credentials are excluded from Windows clipboard history and cloud sync. Copied passwords are cleared after 30 seconds, and the clipboard is cleared after every automatic login.
 - **Exports** (`Export`) contain passwords in **plain text**. The app warns you before exporting; keep such files private.
 - **Network:** the app only contacts OP.GG (public profile pages, for ranks), the Riot Client's local API on `127.0.0.1` (sign-in state), and the GitHub API (update check). There is no telemetry and no account server.
 - **Local data** is stored in `%APPDATA%\LeagueAccounts\`:

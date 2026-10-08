@@ -35,6 +35,17 @@ The signed-out `PendingLoginStrategy` and signed-in `PendingProductContext`
 responses are documented in [these desktop client observations](https://github.com/ArtemChig/LeagueSwitcher/blob/main/docs/RESEARCH.md).
 These fixtures do not replace testing against the installed Riot Client.
 
+Account storage tests inject credential failures with an in-memory store.
+They cover skipped imports, duplicate batches, save and deletion
+rollback, restoration of overwritten passwords, and temporary-file cleanup.
+On Windows they also verify that a locked account file survives a failed
+replacement intact.
+
+A Windows regression also exercises the native credential adapter with dummy
+entries under a unique test service. It verifies that a failed deletion restores
+the selected account without changing another account's password or a stale
+shared entry. The dummy entries are removed even if an assertion fails.
+
 ## Interactive Windows checks
 
 Use a disposable dummy account and a test window, never real credentials.

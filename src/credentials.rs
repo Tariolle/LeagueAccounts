@@ -1,8 +1,8 @@
 //! Windows Credential Manager access.
 //!
-//! The `keyring` crate selects the native Windows backend on Windows. The
-//! small fallback lookup mirrors the legacy Python implementation, which can
-//! still find credentials created under the service-only target name.
+//! The `keyring` crate selects the native Windows backend on Windows. Normal
+//! reads, writes and rollback use only the requested account's explicit target.
+//! Account loading has a separate, non-destructive legacy migration path.
 
 use crate::logging::{self, Event, Reason};
 use std::error::Error;
@@ -21,20 +21,44 @@ fn get_password_inner(service: &str, username: &str) -> CredentialResult<Option<
     let primary_target = format!("{username}@{service}");
     let primary = keyring::Entry::new_with_target(&primary_target, service, username)?;
     match primary.get_password() {
-        Ok(password) => return Ok(Some(password)),
-        Err(keyring::Error::NoEntry) => {}
-        Err(error) => return Err(Box::new(error)),
+        Ok(password) => Ok(Some(password)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(Box::new(error)),
     }
+}
 
-    // Older versions of the app/keyring could use the service as the target
-    // and put the username in the credential metadata. keyring exposes the
-    // target independently, so try it as a compatibility lookup.
+/// Load an existing account's password, upgrading a matching legacy-only entry.
+///
+/// Call this only while loading saved accounts, never during a transaction or
+/// rollback. A primary credential (even an empty one) is always authoritative.
+/// Leave the legacy entry intact so a failed migration cannot lose the secret.
+pub fn load_password_with_migration(
+    service: &str,
+    username: &str,
+) -> CredentialResult<Option<String>> {
+    if let Some(password) = get_password(service, username)? {
+        return Ok(Some(password));
+    }
+    let password = get_legacy_password(service, username).inspect_err(|_| {
+        logging::record(Event::CredentialReadFailed, Reason::CredentialStore);
+    })?;
+    if let Some(password) = &password {
+        // set_password logs failures. Still use the readable legacy password
+        // for this session; a later load can retry the non-destructive copy.
+        let _ = set_password(service, username, password);
+    }
+    Ok(password)
+}
+
+fn get_legacy_password(service: &str, username: &str) -> CredentialResult<Option<String>> {
     let legacy = keyring::Entry::new_with_target(service, service, username)?;
     let attributes = match legacy.get_attributes() {
         Ok(attributes) => attributes,
         Err(keyring::Error::NoEntry) => return Ok(None),
         Err(error) => return Err(Box::new(error)),
     };
+    // The service-only target is shared: its stored username, not the username
+    // supplied when constructing Entry, determines which account owns it.
     if attributes.get("username").map(String::as_str) != Some(username) {
         return Ok(None);
     }
@@ -52,26 +76,6 @@ pub fn set_password(service: &str, username: &str, password: &str) -> Credential
 }
 
 fn set_password_inner(service: &str, username: &str, password: &str) -> CredentialResult<()> {
-    // Migrate a legacy service-only entry before replacing it with the
-    // account-specific target. This preserves credentials created by the
-    // previous implementation when a second account is added.
-    let legacy = keyring::Entry::new_with_target(service, service, username)?;
-    if let Ok(attributes) = legacy.get_attributes() {
-        if let Some(existing_user) = attributes.get("username") {
-            if existing_user != username {
-                if let Ok(existing_password) = legacy.get_password() {
-                    let migrated_target = format!("{existing_user}@{service}");
-                    if let Ok(migrated) =
-                        keyring::Entry::new_with_target(&migrated_target, service, existing_user)
-                    {
-                        let _ = migrated.set_password(&existing_password).inspect_err(|_| {
-                            logging::record(Event::CredentialWriteFailed, Reason::CredentialStore);
-                        });
-                    }
-                }
-            }
-        }
-    }
     let primary_target = format!("{username}@{service}");
     let entry = keyring::Entry::new_with_target(&primary_target, service, username)?;
     entry.set_password(password)?;

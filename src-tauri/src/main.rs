@@ -94,6 +94,13 @@ struct BatchResult {
     skipped: usize,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BulkAddResult {
+    added: usize,
+    skipped_lines: Vec<usize>,
+}
+
 fn manager(state: &Shared) -> CommandResult<MutexGuard<'_, AccountManager>> {
     state.manager.lock().map_err(|_| fail("storage_locked"))
 }
@@ -180,8 +187,6 @@ fn add_account(app: AppHandle, state: AppState<'_>, input: NewAccount) -> Comman
         }) {
             return Err(fail("duplicate"));
         }
-        credentials::set_password(KEYRING_SERVICE, &format!("{region}:{account_id}"), &password)
-            .map_err(|error| fail_with("password_save", error))?;
         let account = Account {
             account_id,
             name,
@@ -194,10 +199,10 @@ fn add_account(app: AppHandle, state: AppState<'_>, input: NewAccount) -> Comman
             finished_last_season: "N/A".to_owned(),
             ..Account::default()
         };
-        manager
-            .add_account(account.clone())
+        let result = manager
+            .add_accounts(vec![account])
             .map_err(|error| fail_with("save_failed", error))?;
-        account
+        result.added.into_iter().next().ok_or_else(|| fail("password_save"))?
     };
     let view = account_view(&account);
     start_refresh(app, Arc::clone(&state), vec![account], RefreshKind::Partial);
@@ -205,49 +210,41 @@ fn add_account(app: AppHandle, state: AppState<'_>, input: NewAccount) -> Comman
 }
 
 #[tauri::command]
-fn multi_add(app: AppHandle, state: AppState<'_>, text: String, region: String) -> CommandResult<BatchResult> {
+fn multi_add(app: AppHandle, state: AppState<'_>, text: String, region: String) -> CommandResult<BulkAddResult> {
     let region_label = region.trim().to_owned();
     let region = region_from_display(&region_label).ok_or_else(|| fail("invalid_region"))?;
-    let mut added_accounts = Vec::new();
-    let mut skipped = 0;
-    {
-        let mut manager = manager(&state)?;
-        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-            let Some((account_id, name, password)) = parse_account_line(line) else {
-                skipped += 1;
-                continue;
-            };
-            let duplicate = |account: &Account| {
-                account.account_id.eq_ignore_ascii_case(account_id) && account.region == region
-            };
-            if manager.accounts.iter().any(duplicate)
-                || credentials::set_password(KEYRING_SERVICE, &format!("{region}:{account_id}"), password)
-                    .is_err()
-            {
-                skipped += 1;
-                continue;
-            }
-            let account = Account {
-                account_id: account_id.to_owned(),
-                name: name.to_owned(),
-                region: region.to_owned(),
-                region_display: region_label.clone(),
-                password: password.to_owned(),
-                tier: "Unranked".to_owned(),
-                reached_last_season: "N/A".to_owned(),
-                finished_last_season: "N/A".to_owned(),
-                ..Account::default()
-            };
-            if manager.add_account(account.clone()).is_ok() {
-                added_accounts.push(account);
-            } else {
-                skipped += 1;
-            }
+    let mut candidates = Vec::new();
+    let mut source_lines = Vec::new();
+    let mut skipped_lines = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
         }
+        let Some((account_id, name, password)) = parse_account_line(line) else {
+            skipped_lines.push(index);
+            continue;
+        };
+        source_lines.push(index);
+        candidates.push(Account {
+            account_id: account_id.to_owned(),
+            name: name.to_owned(),
+            region: region.to_owned(),
+            region_display: region_label.clone(),
+            password: password.to_owned(),
+            tier: "Unranked".to_owned(),
+            reached_last_season: "N/A".to_owned(),
+            finished_last_season: "N/A".to_owned(),
+            ..Account::default()
+        });
     }
-    let added = added_accounts.len();
-    start_refresh(app, Arc::clone(&state), added_accounts, RefreshKind::Partial);
-    Ok(BatchResult { added, skipped })
+    let result = manager(&state)?
+        .add_accounts(candidates)
+        .map_err(|error| fail_with("save_failed", error))?;
+    skipped_lines.extend(result.skipped_indices.iter().map(|&index| source_lines[index]));
+    skipped_lines.sort_unstable();
+    let added = result.added.len();
+    start_refresh(app, Arc::clone(&state), result.added, RefreshKind::Partial);
+    Ok(BulkAddResult { added, skipped_lines })
 }
 
 #[tauri::command]
@@ -337,7 +334,7 @@ fn update_settings(app: AppHandle, state: AppState<'_>, input: SettingsInput) ->
 
 fn set_clipboard(text: &str) -> CommandResult<()> {
     arboard::Clipboard::new()
-        .and_then(|mut clipboard| clipboard.set_text(text.to_owned()))
+        .and_then(|mut clipboard| leagueaccounts::clipboard::set_private_text(&mut clipboard, text))
         .map_err(|_| {
             logging::record(Event::ClipboardFailed, Reason::Other);
             fail("clipboard")

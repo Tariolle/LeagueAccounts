@@ -1,8 +1,8 @@
 //! Types credentials into the previously focused window (the Riot Client).
 //!
 //! The sequence is: Alt+Tab back to the previous window, paste the account
-//! ID, Tab, paste the password, Enter. The clipboard is cleared afterwards so
-//! the password does not linger in clipboard history.
+//! ID, Tab, paste the password, Enter. Clipboard writes exclude credentials
+//! from Windows history and cloud sync, then clear them after typing.
 
 use std::thread;
 use std::time::Duration;
@@ -55,45 +55,49 @@ pub fn type_credentials(account_id: &str, password: &str) -> bool {
     {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, VK_RETURN, VK_TAB};
 
-        // arboard updates the process clipboard asynchronously on some
-        // Windows versions; let each value become visible before Ctrl+V.
-        if clipboard.set_text(account_id.to_owned()).is_err() {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(60));
-        if !paste_current_clipboard() {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(60));
-        let tab_down = send_key(VK_TAB, 0);
-        let tab_up = send_key(VK_TAB, KEYEVENTF_KEYUP);
-        if !tab_down || !tab_up {
-            return false;
-        }
-        if !password.is_empty() {
-            thread::sleep(Duration::from_millis(60));
-            if clipboard.set_text(password.to_owned()).is_err() {
+        let typed = (|| {
+            // arboard updates the process clipboard asynchronously on some
+            // Windows versions; let each value become visible before Ctrl+V.
+            if crate::clipboard::set_private_text(&mut clipboard, account_id).is_err() {
                 return false;
             }
             thread::sleep(Duration::from_millis(60));
             if !paste_current_clipboard() {
-                let _ = clipboard.clear();
                 return false;
             }
-        }
-        thread::sleep(Duration::from_millis(60));
-        let enter_down = send_key(VK_RETURN, 0);
-        let enter_up = send_key(VK_RETURN, KEYEVENTF_KEYUP);
-        // Let the target read the clipboard before it is wiped.
-        thread::sleep(Duration::from_millis(250));
+            thread::sleep(Duration::from_millis(60));
+            let tab_down = send_key(VK_TAB, 0);
+            let tab_up = send_key(VK_TAB, KEYEVENTF_KEYUP);
+            if !tab_down || !tab_up {
+                return false;
+            }
+            if !password.is_empty() {
+                thread::sleep(Duration::from_millis(60));
+                if crate::clipboard::set_private_text(&mut clipboard, password).is_err() {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(60));
+                if !paste_current_clipboard() {
+                    return false;
+                }
+            }
+            thread::sleep(Duration::from_millis(60));
+            let enter_down = send_key(VK_RETURN, 0);
+            let enter_up = send_key(VK_RETURN, KEYEVENTF_KEYUP);
+            // Let the target read the clipboard before it is wiped.
+            thread::sleep(Duration::from_millis(250));
+            enter_down && enter_up
+        })();
         let _ = clipboard.clear();
-        enter_down && enter_up
+        typed
     }
     #[cfg(not(windows))]
     {
         clipboard
-            .set_text(format!("{account_id}
-{password}"))
+            .set_text(format!(
+                "{account_id}
+{password}"
+            ))
             .is_ok()
     }
 }
