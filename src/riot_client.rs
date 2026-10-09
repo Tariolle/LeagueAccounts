@@ -658,6 +658,7 @@ pub fn login(
     check_cancelled(cancel)?;
     let path = client_path().ok_or(LoginError::ClientMissing)?;
     let current = status();
+    check_cancelled(cancel)?;
     if current.league_running() && (close_running || !current.signed_in_as(account_id)) {
         if !close_running {
             return Err(LoginError::LeagueRunning);
@@ -665,10 +666,10 @@ pub fn login(
         progress(LoginStep::CloseLeague);
         close_league(cancel)?;
     }
+    // Own restoration before the first headless start, including early returns.
+    let mut client = renderer::Renderer::new(&path);
     progress(LoginStep::OpenClient);
-    if LocalApi::read().is_none() {
-        renderer::start_service(&path, true)?;
-    }
+    client.ensure_service(cancel)?;
     progress(LoginStep::WaitAuth);
     let started = Instant::now();
     let mut sign_out_sent: Option<Instant> = None;
@@ -682,6 +683,8 @@ pub fn login(
             match api.session() {
                 Session::SignedIn => match api.username() {
                     Some(name) if name.eq_ignore_ascii_case(account_id) => {
+                        client.restore()?;
+                        check_cancelled(cancel)?;
                         if let Some(game) = game {
                             progress(LoginStep::LaunchGame);
                             start_game(game, account_id, cancel)?;
@@ -708,7 +711,9 @@ pub fn login(
         }
         thread::sleep(POLL);
     }
-    renderer::sign_in(&path, account_id, password, progress, cancel)?;
+    renderer::sign_in(&mut client, account_id, password, progress, cancel)?;
+    client.restore()?;
+    check_cancelled(cancel)?;
     if let Some(game) = game {
         progress(LoginStep::LaunchGame);
         start_game(game, account_id, cancel)?;

@@ -1,14 +1,18 @@
-//! Own one temporary Riot renderer, use its native form, then remove DevTools.
+//! Own the entire Riot login attempt, including startup and renderer cleanup.
+#[path = "riot_process.rs"]
+mod owned_process;
+
 use super::{
-    check_cancelled, running_processes, windows, LocalApi, LoginError, LoginStep, Session,
+    check_cancelled, running_processes, windows, LocalApi, LoginError, LoginStep, Process, Session,
 };
 use crate::logging::{self, Event, Reason};
+use owned_process::OwnedProcess;
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,7 +38,7 @@ fn path_arg(name: &str, path: &Path) -> OsString {
     arg
 }
 
-pub(super) fn start_service(path: &Path, headless: bool) -> Result<(), LoginError> {
+fn start_service(path: &Path, headless: bool) -> Result<(), LoginError> {
     let mut process = command(path);
     if headless {
         process.arg("--headless");
@@ -54,9 +58,9 @@ fn wait(cancel: &AtomicBool, duration: Duration) -> Result<(), LoginError> {
     check_cancelled(cancel)
 }
 
-fn client_processes(root: &Path) -> Result<Vec<u32>, LoginError> {
+fn client_processes(root: &Path) -> Result<Vec<Process>, LoginError> {
     let prefix = format!("{}\\", root.to_string_lossy()).to_ascii_lowercase();
-    let mut ids = Vec::new();
+    let mut processes = Vec::new();
     for process in running_processes().into_iter().filter(|p| {
         matches!(
             p.name.as_str(),
@@ -74,19 +78,19 @@ fn client_processes(root: &Path) -> Result<Vec<u32>, LoginError> {
             .to_ascii_lowercase()
             .starts_with(&prefix)
         {
-            ids.push(process.pid);
+            processes.push(process);
         }
     }
-    Ok(ids)
+    Ok(processes)
 }
 
 fn stop_client(path: &Path, cancel: &AtomicBool) -> Result<(), LoginError> {
     let root = path.parent().ok_or(LoginError::ClientMissing)?;
-    for pid in client_processes(root)? {
+    for process in client_processes(root)? {
         check_cancelled(cancel)?;
         // Exact processes under this Riot installation only; never game processes.
         let _ = command(Path::new("taskkill.exe"))
-            .args(["/F", "/PID", &pid.to_string()])
+            .args(["/F", "/PID", &process.pid.to_string()])
             .status();
     }
     let start = Instant::now();
@@ -189,39 +193,98 @@ impl Cdp {
     }
 }
 
-struct Renderer {
+pub(super) struct Renderer {
     service: PathBuf,
-    child: Option<Child>,
+    child: Option<OwnedProcess>,
     cdp: Option<Cdp>,
     normal: Option<(PathBuf, Vec<OsString>, String)>,
+    restore_needed: bool,
+    // One seam for deterministic lifecycle tests without launching Riot.
+    service_start: fn(&Path, bool) -> Result<(), LoginError>,
 }
 
-impl Drop for Renderer {
-    fn drop(&mut self) {
-        // Cleanup also runs on cancellation, errors, and unwinding.
+impl Renderer {
+    pub(super) fn new(service: &Path) -> Self {
+        Self {
+            service: service.to_owned(),
+            child: None,
+            cdp: None,
+            normal: None,
+            restore_needed: false,
+            service_start: start_service,
+        }
+    }
+
+    pub(super) fn ensure_service(&mut self, cancel: &AtomicBool) -> Result<(), LoginError> {
+        check_cancelled(cancel)?;
+        let root = self.service.parent().ok_or(LoginError::ClientMissing)?;
+        let processes = client_processes(root)?;
+        // A parseable lockfile is discovery data, not evidence of a live
+        // service. Check executable ownership even when the API is starting.
+        self.ensure_service_with(
+            processes.iter().any(|p| p.name == "riotclientservices.exe"),
+            processes.iter().any(|p| p.name == "riot client.exe"),
+            cancel,
+        )
+    }
+
+    fn ensure_service_with(
+        &mut self,
+        service_running: bool,
+        renderer_running: bool,
+        cancel: &AtomicBool,
+    ) -> Result<(), LoginError> {
+        check_cancelled(cancel)?;
+        if !service_running || !renderer_running {
+            // Arm before spawning so errors/cancellation during initial auth
+            // restoration cannot strand a headless client.
+            self.restore_needed = true;
+        }
+        if !service_running {
+            (self.service_start)(&self.service, true)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn restore(&mut self) -> Result<(), LoginError> {
+        if !self.restore_needed {
+            return Ok(());
+        }
         if let Some(cdp) = self.cdp.as_mut() {
             let _ = cdp.socket.send(Message::Text(
                 json!({"id":0,"method":"Browser.close"}).to_string().into(),
             ));
         }
-        if let Some(child) = self.child.as_mut() {
+        if let Some(child) = self.child.as_ref() {
             let start = Instant::now();
-            while child.try_wait().ok().flatten().is_none()
+            while !child.has_exited().unwrap_or(true)
                 && start.elapsed() < Duration::from_secs(3)
             {
                 thread::sleep(Duration::from_millis(100));
             }
-            if child.try_wait().ok().flatten().is_none() && child.kill().is_ok() {
-                let _ = child.wait();
-            }
         }
         self.cdp = None;
+        if let Some(mut child) = self.child.take() {
+            child.close().map_err(|_| LoginError::RendererFailed)?;
+        }
         let restored = self.normal.as_ref().is_some_and(|(path, args, endpoint)| {
             LocalApi::read().is_some_and(|api| {
                 &api.base == endpoint && api.session() != Session::Unknown(Reason::AuthUnavailable)
             }) && command(path).args(args).spawn().is_ok()
         });
-        if !restored && start_service(&self.service, false).is_err() {
+        if !restored {
+            (self.service_start)(&self.service, false)?;
+        }
+        self.restore_needed = false;
+        Ok(())
+    }
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        // Covers the initial WaitAuth loop as well as renderer setup, MFA,
+        // cancellation and unwinding. Successful paths restore before launch.
+        if self.restore().is_err() {
             logging::record(Event::LoginFailed, Reason::RendererFailed);
         }
     }
@@ -238,7 +301,7 @@ pub(super) fn auth_result(value: &str) -> Result<(), LoginError> {
 }
 
 pub(super) fn sign_in(
-    service: &Path,
+    renderer: &mut Renderer,
     username: &str,
     password: &str,
     progress: &mut dyn FnMut(LoginStep),
@@ -247,15 +310,12 @@ pub(super) fn sign_in(
     if password.is_empty() {
         return Err(LoginError::AuthRejected);
     }
-    let mut renderer = Renderer {
-        service: service.to_owned(),
-        child: None,
-        cdp: None,
-        normal: None,
-    };
+    check_cancelled(cancel)?;
+    let service = renderer.service.clone();
+    renderer.restore_needed = true;
     progress(LoginStep::Connect);
-    stop_client(service, cancel)?;
-    start_service(service, true)?;
+    stop_client(&service, cancel)?;
+    (renderer.service_start)(&service, true)?;
     let start = Instant::now();
     let api = loop {
         check_cancelled(cancel)?;
@@ -330,16 +390,14 @@ pub(super) fn sign_in(
         .port();
     drop(listener);
     check_cancelled(cancel)?;
+    let mut debug_args = args;
+    debug_args.extend([
+        OsString::from("--allow-chrome-dev-tools"),
+        OsString::from("--remote-debugging-address=127.0.0.1"),
+        OsString::from(format!("--remote-debugging-port={port}")),
+    ]);
     renderer.child = Some(
-        command(&ux)
-            .args(&args)
-            .args([
-                "--allow-chrome-dev-tools",
-                "--remote-debugging-address=127.0.0.1",
-                &format!("--remote-debugging-port={port}"),
-            ])
-            .spawn()
-            .map_err(|_| LoginError::RendererFailed)?,
+        OwnedProcess::spawn(&ux, &debug_args).map_err(|_| LoginError::RendererFailed)?,
     );
     let http = reqwest::blocking::Client::builder()
         .no_proxy()
@@ -355,8 +413,8 @@ pub(super) fn sign_in(
         }
         if renderer
             .child
-            .as_mut()
-            .is_some_and(|child| child.try_wait().ok().flatten().is_some())
+            .as_ref()
+            .is_some_and(|child| child.has_exited().unwrap_or(true))
         {
             return Err(LoginError::RendererFailed);
         }
@@ -457,6 +515,116 @@ pub(super) fn sign_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static STARTS: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn fake_start(_: &Path, headless: bool) -> Result<(), LoginError> {
+        STARTS.with(|starts| starts.borrow_mut().push(headless));
+        Ok(())
+    }
+
+    fn fixture() -> Renderer {
+        STARTS.with(|starts| starts.borrow_mut().clear());
+        let mut renderer = Renderer::new(Path::new("dummy/RiotClientServices.exe"));
+        renderer.service_start = fake_start;
+        renderer
+    }
+
+    fn starts() -> Vec<bool> {
+        STARTS.with(|starts| starts.borrow().clone())
+    }
+
+    #[test]
+    fn stale_lockfile_does_not_suppress_starting_a_missing_service() {
+        let stale = LocalApi::from_lockfile("riot:999999:12345:dummy:https");
+        assert!(stale.is_some());
+        let mut renderer = fixture();
+        renderer.ensure_service_with(false, false, &AtomicBool::new(false)).unwrap();
+        assert_eq!(starts(), vec![true]);
+        drop(renderer);
+        assert_eq!(starts(), vec![true, false]);
+    }
+
+    #[test]
+    fn restored_account_without_game_launch_gets_a_normal_client_once() {
+        let mut renderer = fixture();
+        renderer.ensure_service_with(false, false, &AtomicBool::new(false)).unwrap();
+        // The already-signed-in path finishes before any debug renderer exists.
+        renderer.restore().unwrap();
+        renderer.restore().unwrap();
+        drop(renderer);
+        assert_eq!(starts(), vec![true, false]);
+    }
+
+    #[test]
+    fn initial_wait_errors_restore_even_before_renderer_setup() {
+        for error in [LoginError::Cancelled, LoginError::Timeout, LoginError::AuthRejected] {
+            let result = (|| -> Result<(), LoginError> {
+                let mut renderer = fixture();
+                renderer.ensure_service_with(false, false, &AtomicBool::new(false))?;
+                Err(error)
+            })();
+            assert_eq!(result, Err(error));
+            assert_eq!(starts(), vec![true, false]);
+        }
+    }
+
+    #[test]
+    fn startup_unwinding_restores_the_normal_client() {
+        let result = std::panic::catch_unwind(|| {
+            let mut renderer = fixture();
+            renderer.ensure_service_with(false, false, &AtomicBool::new(false)).unwrap();
+            panic!("simulated startup failure");
+        });
+        assert!(result.is_err());
+        assert_eq!(starts(), vec![true, false]);
+    }
+
+    #[test]
+    fn existing_normal_client_is_not_restarted() {
+        let mut renderer = fixture();
+        renderer.ensure_service_with(true, true, &AtomicBool::new(false)).unwrap();
+        drop(renderer);
+        assert!(starts().is_empty());
+    }
+
+    #[test]
+    fn existing_headless_service_gets_a_renderer_without_restarting_auth() {
+        let mut renderer = fixture();
+        renderer.ensure_service_with(true, false, &AtomicBool::new(false)).unwrap();
+        drop(renderer);
+        assert_eq!(starts(), vec![false]);
+    }
+
+    #[test]
+    fn cancellation_before_startup_does_not_open_a_client() {
+        let mut renderer = fixture();
+        assert_eq!(
+            renderer.ensure_service_with(false, false, &AtomicBool::new(true)),
+            Err(LoginError::Cancelled),
+        );
+        drop(renderer);
+        assert!(starts().is_empty());
+    }
+
+    #[test]
+    fn failed_headless_spawn_still_attempts_normal_restoration() {
+        fn fail_headless(path: &Path, headless: bool) -> Result<(), LoginError> {
+            fake_start(path, headless)?;
+            if headless { Err(LoginError::LaunchFailed) } else { Ok(()) }
+        }
+        let mut renderer = fixture();
+        renderer.service_start = fail_headless;
+        assert_eq!(
+            renderer.ensure_service_with(false, false, &AtomicBool::new(false)),
+            Err(LoginError::LaunchFailed),
+        );
+        drop(renderer);
+        assert_eq!(starts(), vec![true, false]);
+    }
 
     #[test]
     fn debugger_endpoint_is_restricted_to_allocated_loopback_port() {

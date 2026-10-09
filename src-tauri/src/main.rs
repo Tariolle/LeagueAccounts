@@ -5,6 +5,7 @@
 //! Passwords never cross into the web view. The UI only receives account
 //! metadata; copy/login commands read the password on the Rust side.
 
+mod login_control;
 mod refresh;
 mod views;
 
@@ -18,12 +19,13 @@ use leagueaccounts::riot_client::{self, Game, LoginError, LoginOutcome, LoginSte
 use leagueaccounts::utils::{app_data_dir, parse_account_line, region_from_display, settings_file, REGION_MAP};
 use leagueaccounts::AccountManager;
 use leagueaccounts::updates::{self, Release};
+use login_control::LoginControl;
 use refresh::{
     schedule, spawn_scheduler, spawn_update_checker, start_refresh, LoginMethod, RefreshKind, Schedule, Settings, Shared,
     MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
@@ -231,6 +233,7 @@ fn multi_add(app: AppHandle, state: AppState<'_>, text: String, region: String) 
             region: region.to_owned(),
             region_display: region_label.clone(),
             password: password.to_owned(),
+            description: String::new(),
             tier: "Unranked".to_owned(),
             reached_last_season: "N/A".to_owned(),
             finished_last_season: "N/A".to_owned(),
@@ -397,25 +400,16 @@ async fn login(
     close_running: bool,
 ) -> CommandResult<LoginResult> {
     let account = find_account(&state, key)?;
-    if state
-        .login_running
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return Err(fail("login_busy"));
-    }
+    let guard = state.login.try_start().ok_or_else(|| fail("login_busy"))?;
     let password = password_for(&account);
     let settings = state.settings.lock().map(|s| s.clone()).unwrap_or_default();
-    state.login_cancel.store(false, Ordering::SeqCst);
     let shared = Arc::clone(&state);
     let result = tauri::async_runtime::spawn_blocking(move || {
-        struct LoginGuard(Arc<Shared>);
-        impl Drop for LoginGuard {
-            fn drop(&mut self) {
-                self.0.login_running.store(false, Ordering::SeqCst);
-            }
+        // Acquired before queueing; released only after native renderer cleanup.
+        let _guard = guard;
+        if shared.login.cancel.load(Ordering::SeqCst) {
+            return Err(LoginError::Cancelled);
         }
-        let _guard = LoginGuard(Arc::clone(&shared));
         logging::record(
             Event::LoginStarted,
             if settings.login_method == LoginMethod::Previous {
@@ -451,7 +445,7 @@ async fn login(
             game,
             close_running,
             &mut progress,
-            &shared.login_cancel,
+            &shared.login.cancel,
         )
     })
     .await
@@ -491,7 +485,7 @@ async fn game_status(state: AppState<'_>, key: Key) -> CommandResult<GameStatusV
 
 #[tauri::command]
 fn cancel_login(state: AppState<'_>) {
-    state.login_cancel.store(true, Ordering::SeqCst);
+    state.login.request_cancel();
 }
 
 #[tauri::command]
@@ -642,8 +636,7 @@ fn main() {
         settings_path,
         refresh_running: Mutex::new(false),
         clipboard_generation: AtomicU64::new(0),
-        login_cancel: AtomicBool::new(false),
-        login_running: AtomicBool::new(false),
+        login: Arc::new(LoginControl::default()),
         load_error,
     });
 
@@ -652,6 +645,7 @@ fn main() {
             MacosLauncher::LaunchAgent,
             Some(vec![AUTOSTART_FLAG]),
         ))
+        .plugin(login_control::plugin(Arc::clone(&shared.login)))
         .manage(Arc::clone(&shared))
         .invoke_handler(tauri::generate_handler![
             bootstrap,

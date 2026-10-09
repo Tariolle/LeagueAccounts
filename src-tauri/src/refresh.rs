@@ -1,6 +1,7 @@
 //! Shared state, persisted settings, rank refreshes and the auto-refresh
 //! scheduler.
 
+use crate::login_control::LoginControl;
 use crate::views::{account_view, fail, fail_with, AppError, Key};
 use leagueaccounts::logging::{self, Event, Reason};
 use leagueaccounts::models::{Account, RankInfo};
@@ -9,7 +10,7 @@ use leagueaccounts::AccountManager;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -91,8 +92,7 @@ pub struct Shared {
     pub settings_path: Option<PathBuf>,
     pub refresh_running: Mutex<bool>,
     pub clipboard_generation: AtomicU64,
-    pub login_cancel: AtomicBool,
-    pub login_running: AtomicBool,
+    pub login: Arc<LoginControl>,
     pub load_error: Option<AppError>,
 }
 
