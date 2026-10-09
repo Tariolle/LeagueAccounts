@@ -84,7 +84,7 @@ export function installMock(): void {
     getSettings: async () => settings,
     updateSettings: async (input: object) => Object.assign(settings, input),
     login: async () => {
-      const steps = ["openClient", "waitAuth", "findWindow", "focus", "type", "confirm", "launchGame", "done"];
+      const steps = ["openClient", "waitAuth", "connect", "findWindow", "type", "confirm", "launchGame", "done"];
       for (const step of steps) {
         listeners.step.forEach((handler) => handler(step));
         await wait(step === "waitAuth" || step === "confirm" ? 1400 : 700);

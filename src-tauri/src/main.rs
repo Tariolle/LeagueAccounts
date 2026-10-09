@@ -5,6 +5,7 @@
 //! Passwords never cross into the web view. The UI only receives account
 //! metadata; copy/login commands read the password on the Rust side.
 
+mod login_control;
 mod refresh;
 mod views;
 
@@ -18,12 +19,13 @@ use leagueaccounts::riot_client::{self, Game, LoginError, LoginOutcome, LoginSte
 use leagueaccounts::utils::{app_data_dir, parse_account_line, region_from_display, settings_file, REGION_MAP};
 use leagueaccounts::AccountManager;
 use leagueaccounts::updates::{self, Release};
+use login_control::LoginControl;
 use refresh::{
     schedule, spawn_scheduler, spawn_update_checker, start_refresh, LoginMethod, RefreshKind, Schedule, Settings, Shared,
     MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
@@ -231,6 +233,7 @@ fn multi_add(app: AppHandle, state: AppState<'_>, text: String, region: String) 
             region: region.to_owned(),
             region_display: region_label.clone(),
             password: password.to_owned(),
+            description: String::new(),
             tier: "Unranked".to_owned(),
             reached_last_season: "N/A".to_owned(),
             finished_last_season: "N/A".to_owned(),
@@ -379,33 +382,34 @@ fn copy_password(state: AppState<'_>, key: Key) -> CommandResult<u64> {
 enum LoginResult {
     /// Signed in and confirmed by the Riot Client (game launched if enabled).
     SignedIn,
-    /// Credentials typed; sign-in not confirmed (previous-window mode, or
-    /// the Riot Client still waits for 2FA/captcha).
+    /// Credentials typed in explicit previous-window mode.
     Typed,
     /// This account was already signed in (game launched if enabled).
     AlreadySignedIn,
-    /// Another account is signed in; the UI may offer to switch.
-    OtherAccount,
 }
 
 /// Sign in with the account. With the Riot method the client is opened (and
-/// the game launched when enabled); `switch_account` signs out an existing
-/// session first.
+/// the game launched when enabled). A different signed-in account is signed out
+/// automatically before connecting the selected account.
 #[tauri::command]
 async fn login(
     app: AppHandle,
     state: AppState<'_>,
     key: Key,
     tft: bool,
-    switch_account: bool,
     close_running: bool,
 ) -> CommandResult<LoginResult> {
     let account = find_account(&state, key)?;
+    let guard = state.login.try_start().ok_or_else(|| fail("login_busy"))?;
     let password = password_for(&account);
     let settings = state.settings.lock().map(|s| s.clone()).unwrap_or_default();
-    state.login_cancel.store(false, Ordering::SeqCst);
     let shared = Arc::clone(&state);
     let result = tauri::async_runtime::spawn_blocking(move || {
+        // Acquired before queueing; released only after native renderer cleanup.
+        let _guard = guard;
+        if shared.login.cancel.load(Ordering::SeqCst) {
+            return Err(LoginError::Cancelled);
+        }
         logging::record(
             Event::LoginStarted,
             if settings.login_method == LoginMethod::Previous {
@@ -439,10 +443,9 @@ async fn login(
             &account.account_id,
             &password,
             game,
-            switch_account,
             close_running,
             &mut progress,
-            &shared.login_cancel,
+            &shared.login.cancel,
         )
     })
     .await
@@ -453,7 +456,6 @@ async fn login(
             LoginOutcome::SignedIn => LoginResult::SignedIn,
             LoginOutcome::Typed => LoginResult::Typed,
             LoginOutcome::AlreadySignedIn => LoginResult::AlreadySignedIn,
-            LoginOutcome::OtherAccount => LoginResult::OtherAccount,
         })
         .map_err(|error| fail(error.code()))
 }
@@ -483,7 +485,7 @@ async fn game_status(state: AppState<'_>, key: Key) -> CommandResult<GameStatusV
 
 #[tauri::command]
 fn cancel_login(state: AppState<'_>) {
-    state.login_cancel.store(true, Ordering::SeqCst);
+    state.login.request_cancel();
 }
 
 #[tauri::command]
@@ -634,7 +636,7 @@ fn main() {
         settings_path,
         refresh_running: Mutex::new(false),
         clipboard_generation: AtomicU64::new(0),
-        login_cancel: AtomicBool::new(false),
+        login: Arc::new(LoginControl::default()),
         load_error,
     });
 
@@ -643,6 +645,7 @@ fn main() {
             MacosLauncher::LaunchAgent,
             Some(vec![AUTOSTART_FLAG]),
         ))
+        .plugin(login_control::plugin(Arc::clone(&shared.login)))
         .manage(Arc::clone(&shared))
         .invoke_handler(tauri::generate_handler![
             bootstrap,

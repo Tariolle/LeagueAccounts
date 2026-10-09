@@ -26,9 +26,9 @@ that no dummy secrets, input JSON, or user paths reached the files.
 Riot login tests simulate cold startup, a signed-out client, a signed-in client,
 and lifecycle sign-out with a loopback HTTP server. The lifecycle API is the
 readiness source; a missing RSO authorization is not treated as a login form.
-Readiness must restart after an authentication interruption, window replacement,
-or client endpoint change. Diagnostic tests verify that repeated waiting states
-are logged once per transition and remain fixed categories without account data.
+Diagnostic tests verify that repeated waiting states are logged once per
+transition and remain fixed categories without account data. Renderer tests
+reject nonlocal debugger URLs and unknown authentication results.
 
 The endpoint contract is described in the [extracted Riot API documentation](https://github.com/KebsCS/lcu-and-riotclient-api/blob/main/riotclient/data_info.json).
 The signed-out `PendingLoginStrategy` and signed-in `PendingProductContext`
@@ -67,3 +67,35 @@ Use a disposable dummy account and a test window, never real credentials.
 4. Verify Add New Account, Multi Add, and Friend Elo with an empty account list
    and a long list. Reduce the window height and scroll the main content to the
    controls below the independently scrolling table.
+5. With the Riot login method and a test account, try a cold start, a minimized
+   client, switching accounts, and cancelling during setup or verification.
+   Credentials must be submitted without keystrokes or foreground focus. CAPTCHA
+   and MFA must appear in Riot Client. A rejected login must stop without retries.
+   After success, cancellation, or failure, check that a normal Riot window is
+   restored and its temporary debugger is gone. Verify the selected identity
+   before launching the game. Logs must contain fixed categories only.
+
+## Renderer login
+
+`node scripts/try-riot-renderer-login.mjs <saved-account-id>` is a Windows
+development prototype of the native Rust integration in the app. Close the normal
+Riot Client and any game first. It starts Riot Services with `--headless`, runs
+one Electron renderer, fills the native React form while minimized, and verifies
+the signed-in username through the local API. An already-connected target account
+is left alone. CAPTCHA/MFA, when required, stay in Riot's own UI for a human to
+complete. The prototype does not retry rejected credentials automatically.
+
+The debugger uses an allocated nonzero loopback port. Chromium's special
+`--remote-debugging-port=0` launch sets `navigator.webdriver=true`; that setting
+coincided with rejected authentication in the live experiment. After switching
+to a nonzero port, a live login returned `success` on its first attempt without
+a visible CAPTCHA. The target account remained connected after replacing the
+debug renderer with a normal renderer, and no debugger remained enabled.
+This is one successful end-to-end test, not a guarantee that CAPTCHA will never
+be required. Riot's internal React handlers and module exports can change.
+
+`--verify-fill-only` checks the DOM and React credential state without submitting
+the login form. Diagnostics contain fixed categories and match booleans only;
+credentials and authentication tokens are never printed. The experiment does
+not modify Riot's installed files. The initial direct-auth and separate-browser
+CAPTCHA prototypes were removed after validating the native-renderer approach.

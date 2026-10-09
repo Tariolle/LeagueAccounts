@@ -14,6 +14,8 @@ const LABELS: Record<LoginStep, MessageKey> = {
   openClient: "login.step.openClient",
   waitAuth: "login.step.waitAuth",
   signOut: "login.step.signOut",
+  connect: "login.step.connect",
+  verification: "login.step.verification",
   findWindow: "login.step.findWindow",
   focus: "login.step.focus",
   type: "login.step.type",
@@ -35,7 +37,6 @@ export function openLoginOverlay(options: {
   tier: string;
   viaRiot: boolean;
   closeLeague: boolean;
-  switchAccount: boolean;
   launchGame: boolean;
   onCancel: () => void;
 }): LoginOverlay {
@@ -44,9 +45,9 @@ export function openLoginOverlay(options: {
         ...(options.closeLeague ? (["closeLeague"] as LoginStep[]) : []),
         "openClient",
         "waitAuth",
-        ...(options.switchAccount ? (["signOut"] as LoginStep[]) : []),
+        "signOut",
+        "connect",
         "findWindow",
-        "focus",
         "type",
         "confirm",
         ...(options.launchGame ? (["launchGame"] as LoginStep[]) : []),
@@ -120,6 +121,12 @@ export function openLoginOverlay(options: {
 
   const api: LoginOverlay = {
     step(step) {
+      const message = $(".login-message", overlay);
+      message.hidden = step !== "verification";
+      if (step === "verification") {
+        message.textContent = t("login.step.verification");
+        return;
+      }
       if (step === "done") {
         steps.forEach((candidate) => {
           const state = states.get(candidate);
