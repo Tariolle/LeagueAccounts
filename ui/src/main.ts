@@ -360,7 +360,7 @@ async function login(account: AccountView): Promise<void> {
   }
 }
 
-async function runLogin(account: AccountView, switchAccount = false, closeRunning = false): Promise<void> {
+async function runLogin(account: AccountView, closeRunning = false): Promise<void> {
   const viaRiot = state.settings?.loginMethod !== "previous";
   const key = keyOf(account);
 
@@ -370,7 +370,7 @@ async function runLogin(account: AccountView, switchAccount = false, closeRunnin
     if (!status) return;
     if ((status.clientOpen || status.inGame) && !status.sameAccount) {
       if (!(await confirmCloseLeague(account, status.inGame))) return;
-      return runLogin(account, true, true);
+      return runLogin(account, true);
     }
   }
 
@@ -380,13 +380,12 @@ async function runLogin(account: AccountView, switchAccount = false, closeRunnin
     tier: rankOf(account, state.mode).tier,
     viaRiot,
     closeLeague: closeRunning,
-    switchAccount,
     launchGame: launching,
     onCancel: () => void api.cancelLogin(),
   });
   activeLogin = overlay;
   try {
-    const result = await api.login(key, state.mode === "tft", switchAccount, closeRunning);
+    const result = await api.login(key, state.mode === "tft", closeRunning);
     if (result === "signedIn") {
       overlay.succeed(t("login.success"), launching ? t("toast.launchingGame") : accountLabel(account));
     } else if (result === "alreadySignedIn") {
@@ -394,19 +393,6 @@ async function runLogin(account: AccountView, switchAccount = false, closeRunnin
     } else if (result === "typed") {
       if (viaRiot) overlay.finishInClient();
       else overlay.succeed(t("toast.loggedIn"), accountLabel(account));
-    } else if (result === "otherAccount") {
-      overlay.close();
-      const answer = await modal({
-        title: t("login.switchTitle"),
-        body: `<p class="hint">${esc(t("login.switchText", { name: accountLabel(account) }))}</p>`,
-        actions: [
-          { label: t("common.cancel"), value: "cancel" },
-          { label: t("login.switchConfirm"), value: "switch", kind: "primary" },
-        ],
-      });
-      activeLogin = null;
-      if (answer === "switch") await runLogin(account, true, closeRunning);
-      return;
     }
   } catch (error) {
     if (error instanceof ApiError && error.code === "login_cancelled") {
@@ -415,7 +401,7 @@ async function runLogin(account: AccountView, switchAccount = false, closeRunnin
       // The client was opened between the check and the login: ask again.
       overlay.close();
       activeLogin = null;
-      return runLogin(account, switchAccount, false);
+      return runLogin(account, false);
     } else {
       overlay.fail(describe(error));
     }

@@ -105,6 +105,10 @@ impl Event {
 /// Safe categories, deliberately excluding raw messages and arbitrary codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
+    ConnectRenderer,
+    RendererFailed,
+    AuthRejected,
+    CaptchaRejected,
     RiotClient,
     PreviousWindow,
     CloseLeague,
@@ -128,7 +132,6 @@ pub enum Reason {
     SignedIn,
     Typed,
     AlreadySignedIn,
-    OtherAccount,
     ClientMissing,
     LaunchFailed,
     SignOutFailed,
@@ -163,6 +166,10 @@ pub enum Reason {
 impl Reason {
     fn code(self) -> &'static str {
         match self {
+            Self::ConnectRenderer => "connect_renderer",
+            Self::RendererFailed => "renderer_failed",
+            Self::AuthRejected => "auth_rejected",
+            Self::CaptchaRejected => "captcha_rejected",
             Self::RiotClient => "riot_client",
             Self::PreviousWindow => "previous_window",
             Self::CloseLeague => "close_league",
@@ -186,7 +193,6 @@ impl Reason {
             Self::SignedIn => "signed_in",
             Self::Typed => "typed",
             Self::AlreadySignedIn => "already_signed_in",
-            Self::OtherAccount => "other_account",
             Self::ClientMissing => "client_missing",
             Self::LaunchFailed => "launch_failed",
             Self::SignOutFailed => "sign_out_failed",

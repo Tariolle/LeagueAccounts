@@ -92,6 +92,7 @@ pub struct Shared {
     pub refresh_running: Mutex<bool>,
     pub clipboard_generation: AtomicU64,
     pub login_cancel: AtomicBool,
+    pub login_running: AtomicBool,
     pub load_error: Option<AppError>,
 }
 

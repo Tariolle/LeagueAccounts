@@ -50,6 +50,8 @@ export type LoginStep =
   | "openClient"
   | "waitAuth"
   | "signOut"
+  | "connect"
+  | "verification"
   | "findWindow"
   | "focus"
   | "type"
@@ -77,7 +79,7 @@ export interface UpdateStatus {
   newer: boolean;
 }
 
-export type LoginResult = "signedIn" | "typed" | "alreadySignedIn" | "otherAccount";
+export type LoginResult = "signedIn" | "typed" | "alreadySignedIn";
 
 export interface AccountView {
   accountId: string;
@@ -189,8 +191,8 @@ export const api = {
   refreshRanks: () => call<number>("refresh_ranks"),
   copyAccountId: (key: Key) => call<void>("copy_account_id", { key }),
   copyPassword: (key: Key) => call<number>("copy_password", { key }),
-  login: (key: Key, tft: boolean, switchAccount: boolean, closeRunning: boolean) =>
-    call<LoginResult>("login", { key, tft, switchAccount, closeRunning }),
+  login: (key: Key, tft: boolean, closeRunning: boolean) =>
+    call<LoginResult>("login", { key, tft, closeRunning }),
   cancelLogin: () => call<void>("cancel_login"),
   gameStatus: (key: Key) => call<GameStatus>("game_status", { key }),
   checkUpdate: () => call<UpdateStatus>("check_update"),

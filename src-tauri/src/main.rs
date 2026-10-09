@@ -379,33 +379,43 @@ fn copy_password(state: AppState<'_>, key: Key) -> CommandResult<u64> {
 enum LoginResult {
     /// Signed in and confirmed by the Riot Client (game launched if enabled).
     SignedIn,
-    /// Credentials typed; sign-in not confirmed (previous-window mode, or
-    /// the Riot Client still waits for 2FA/captcha).
+    /// Credentials typed in explicit previous-window mode.
     Typed,
     /// This account was already signed in (game launched if enabled).
     AlreadySignedIn,
-    /// Another account is signed in; the UI may offer to switch.
-    OtherAccount,
 }
 
 /// Sign in with the account. With the Riot method the client is opened (and
-/// the game launched when enabled); `switch_account` signs out an existing
-/// session first.
+/// the game launched when enabled). A different signed-in account is signed out
+/// automatically before connecting the selected account.
 #[tauri::command]
 async fn login(
     app: AppHandle,
     state: AppState<'_>,
     key: Key,
     tft: bool,
-    switch_account: bool,
     close_running: bool,
 ) -> CommandResult<LoginResult> {
     let account = find_account(&state, key)?;
+    if state
+        .login_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err(fail("login_busy"));
+    }
     let password = password_for(&account);
     let settings = state.settings.lock().map(|s| s.clone()).unwrap_or_default();
     state.login_cancel.store(false, Ordering::SeqCst);
     let shared = Arc::clone(&state);
     let result = tauri::async_runtime::spawn_blocking(move || {
+        struct LoginGuard(Arc<Shared>);
+        impl Drop for LoginGuard {
+            fn drop(&mut self) {
+                self.0.login_running.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = LoginGuard(Arc::clone(&shared));
         logging::record(
             Event::LoginStarted,
             if settings.login_method == LoginMethod::Previous {
@@ -439,7 +449,6 @@ async fn login(
             &account.account_id,
             &password,
             game,
-            switch_account,
             close_running,
             &mut progress,
             &shared.login_cancel,
@@ -453,7 +462,6 @@ async fn login(
             LoginOutcome::SignedIn => LoginResult::SignedIn,
             LoginOutcome::Typed => LoginResult::Typed,
             LoginOutcome::AlreadySignedIn => LoginResult::AlreadySignedIn,
-            LoginOutcome::OtherAccount => LoginResult::OtherAccount,
         })
         .map_err(|error| fail(error.code()))
 }
@@ -635,6 +643,7 @@ fn main() {
         refresh_running: Mutex::new(false),
         clipboard_generation: AtomicU64::new(0),
         login_cancel: AtomicBool::new(false),
+        login_running: AtomicBool::new(false),
         load_error,
     });
 
