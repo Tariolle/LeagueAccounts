@@ -98,15 +98,13 @@ pub fn plugin(control: Arc<LoginControl>) -> TauriPlugin<Wry> {
                 label,
                 event: WindowEvent::CloseRequested { api, .. },
                 ..
-            } if label == "main" => {
-                if defer_exit(app, &control, 0) {
-                    api.prevent_close();
-                }
+            } if label == "main" && defer_exit(app, &control, 0) => {
+                api.prevent_close();
             }
-            RunEvent::ExitRequested { api, code, .. } => {
-                if defer_exit(app, &control, code.unwrap_or(0)) {
-                    api.prevent_exit();
-                }
+            RunEvent::ExitRequested { api, code, .. }
+                if defer_exit(app, &control, code.unwrap_or(0)) =>
+            {
+                api.prevent_exit();
             }
             _ => {}
         })
