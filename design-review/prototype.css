@@ -1,0 +1,45 @@
+/* Prototype only: League-native detail pass. Values harvested from the live 16.20 client
+   (lol-uikit content-block headings, hover card, ranked banner, settings dialog). */
+
+/* Headings: client h1–h6 are Beaufort 700, uppercase, .05em, #f0e6d2. */
+.collection-header h1 { font-size: 30px; line-height: 32px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: #f0e6d2; }
+.drawer-head h2, .login-title { font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: #f0e6d2; }
+
+/* Identity, as in the client hover card: Beaufort 18/700 name, dim bold Spiegel tag. */
+.game-name { font-family: Beaufort, serif; font-size: 18px; font-weight: 700; letter-spacing: .025em; color: #f0e6d2; }
+.tag { font-size: 12px; font-weight: 700; letter-spacing: .05em; color: #5b5a56; }
+
+/* Ranked banner typography: tier 20/22 700 .05em uppercase; LP 14/18 700 .075em grey. */
+.rank-name { text-transform: uppercase; letter-spacing: .05em; color: #f0e6d2; }
+.lp { font-family: Beaufort, serif; font-size: 14px; line-height: 18px; font-weight: 700; letter-spacing: .075em; text-transform: uppercase; color: #a09b8c; margin-top: 4px; }
+.accounts.list .rank-name { font-size: 16px; }
+.accounts.list .lp { font-size: 12px; line-height: 16px; }
+
+/* Body copy: Spiegel 12px .025em #a09b8c, values brighter. */
+.history { letter-spacing: .025em; color: #a09b8c; }
+.history b { color: #f0e6d2; }
+.desc { color: #a09b8c; }
+
+/* The client never prints shortcut hints inside inputs. */
+.search kbd { display: none; }
+.search input::placeholder { letter-spacing: .1em; }
+
+/* Secondary flat button: Spiegel 700 #cdbe91 (lol-uikit-flat-button-secondary-content). */
+.btn-ghost { font-weight: 700; color: #cdbe91; }
+
+/* Settings: section titles 14/18 700 .075em #f0e6d2; labels 12px .1em grey; hints 10px 700 gold. */
+.settings-section h3 { font-family: Beaufort, serif; font-size: 14px; line-height: 18px; font-weight: 700; letter-spacing: .075em; text-transform: uppercase; color: #f0e6d2; }
+.toggle-text strong, .field.inline > span, .interval-row > span { font-size: 12px; font-weight: 400; letter-spacing: .1em; color: #a09b8c; }
+.toggle-row:hover .toggle-text strong, .radio-row:hover .toggle-text strong { color: #f0e6d2; }
+.toggle-text span, .settings-section .hint { font-size: 10px; font-weight: 700; letter-spacing: .025em; color: #c89b3c; }
+
+/* Dialog actions docked on the bottom rail, centered, with the button-group wings
+   (lol-uikit-flat-button-group[type=dialog-frame]: bottom -2px, 2px #614a1f ticks). */
+.modal { padding-bottom: 46px; }
+.modal-body { padding-bottom: 12px; }
+.modal-foot { position: absolute; z-index: 3; bottom: -2px; left: 50%; transform: translateX(-50%); display: flex; gap: 2px; padding: 0 4px; border: 0; background: none; }
+.modal-foot::before, .modal-foot::after { content: ''; position: absolute; bottom: 0; height: 10px; border-top: 2px solid transparent; }
+.modal-foot::before { left: 0; border-right: 2px solid #614a1f; }
+.modal-foot::after { right: 0; border-left: 2px solid #614a1f; }
+.modal-foot .btn { min-width: 100px; height: 32px; font-family: Beaufort, serif; font-size: 14px; font-weight: 700; letter-spacing: .075em; text-transform: uppercase; }
+.modal-foot .btn-ghost { border-width: 2px; }
