@@ -120,6 +120,7 @@ export interface AccountView {
   regionDisplay: string;
   description: string;
   level: string;
+  rankedStats?: { wins: number; losses: number; winRate: number } | null;
   hasPassword: boolean;
   lol: LolRank;
   tft: TftRank;

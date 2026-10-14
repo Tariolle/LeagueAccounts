@@ -48,6 +48,7 @@ const en = {
   "view.list": "List view",
 
   "card.lastSeason": "Last season",
+  "card.winRate": "Wins / losses / win rate",
   "card.lastSet": "Last set",
   "card.accountId": "Account ID",
   "card.more": "More actions",
@@ -344,6 +345,7 @@ const tr: Dict = {
   "view.list": "Liste görünümü",
 
   "card.lastSeason": "Geçen sezon",
+  "card.winRate": "Galibiyet / mağlubiyet / kazanma oranı",
   "card.lastSet": "Geçen set",
   "card.accountId": "Hesap ID",
   "card.more": "Diğer işlemler",
@@ -637,6 +639,7 @@ const de: Dict = {
   "view.list": "Listenansicht",
 
   "card.lastSeason": "Letzte Saison",
+  "card.winRate": "Siege / Niederlagen / Siegesrate",
   "card.lastSet": "Letztes Set",
   "card.accountId": "Konto-ID",
   "card.more": "Weitere Aktionen",
@@ -930,6 +933,7 @@ const es: Dict = {
   "view.list": "Vista de lista",
 
   "card.lastSeason": "Temporada pasada",
+  "card.winRate": "Victorias / derrotas / porcentaje de victorias",
   "card.lastSet": "Set anterior",
   "card.accountId": "ID de cuenta",
   "card.more": "Más acciones",
@@ -1223,6 +1227,7 @@ const fr: Dict = {
   "view.list": "Vue liste",
 
   "card.lastSeason": "Saison passée",
+  "card.winRate": "Victoires / défaites / taux de victoire",
   "card.lastSet": "Set précédent",
   "card.accountId": "ID de compte",
   "card.more": "Plus d'actions",
@@ -1516,6 +1521,7 @@ const pt: Dict = {
   "view.list": "Vista de lista",
 
   "card.lastSeason": "Época anterior",
+  "card.winRate": "Vitórias / derrotas / taxa de vitória",
   "card.lastSet": "Conjunto anterior",
   "card.accountId": "ID da conta",
   "card.more": "Mais ações",

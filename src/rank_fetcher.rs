@@ -1,5 +1,7 @@
 use crate::logging::{self, Event, Reason};
-use crate::models::{Account, Freshness, RankFetchError, RankInfo, RankProvenance, TftRank};
+use crate::models::{
+    Account, Freshness, RankFetchError, RankInfo, RankProvenance, RankedStats, TftRank,
+};
 use html_escape::decode_html_entities;
 use regex::Regex;
 use scraper::{Html, Selector};
@@ -353,6 +355,7 @@ impl RankFetcher {
         let soup = Html::parse_document(body);
         let mut rank = self.parse_current_rank_from_opgg(&soup, &decoded_payload);
         rank.level = self.parse_level_from_opgg(&soup, &decoded_payload);
+        rank.ranked_stats = meta_description(&soup).and_then(|text| parse_ranked_stats(&text));
         let explicitly_unranked = meta_description(&soup)
             .is_some_and(|text| text.contains(" / Lv. ") || text.contains(" / Unranked"));
         if rank.tier == "Unranked" && (rank.level.is_empty() || !explicitly_unranked) {
@@ -620,6 +623,7 @@ impl RankFetcher {
             division: rank.division,
             lp: rank.lp,
             level: rank.level,
+            ranked_stats: rank.ranked_stats,
             reached_last_season: if rank.reached_last_season.is_empty() {
                 "Unranked".to_owned()
             } else {
@@ -669,6 +673,32 @@ fn meta_description(soup: &Html) -> Option<String> {
     let selector = Selector::parse(r#"meta[name="description"]"#).ok()?;
     soup.select(&selector)
         .find_map(|element| element.value().attr("content").map(str::to_owned))
+}
+
+fn parse_ranked_stats(description: &str) -> Option<RankedStats> {
+    static STATS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(?P<wins>[\d,]+)\s*Win\s+(?P<losses>[\d,]+)\s*Lose\s+Win rate\s+(?P<rate>\d{1,3})%")
+            .expect("valid OP.GG ranked stats regex")
+    });
+    let captures = STATS.captures(description)?;
+    let wins = captures
+        .name("wins")?
+        .as_str()
+        .replace(',', "")
+        .parse()
+        .ok()?;
+    let losses = captures
+        .name("losses")?
+        .as_str()
+        .replace(',', "")
+        .parse()
+        .ok()?;
+    let rate: u16 = captures.name("rate")?.as_str().parse().ok()?;
+    (rate <= 100).then_some(RankedStats {
+        wins,
+        losses,
+        win_rate: rate as u8,
+    })
 }
 
 fn title_case(value: &str) -> String {

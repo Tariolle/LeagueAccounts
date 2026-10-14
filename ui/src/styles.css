@@ -858,6 +858,18 @@ code {
   font-weight: 600;
   color: var(--muted);
 }
+.history-rank {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+}
+.ranked-stats {
+  margin-left: auto;
+  color: var(--success);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 .rank-block.is-pending > * {
   opacity: 0.35;
   filter: blur(1px);

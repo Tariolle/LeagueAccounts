@@ -143,6 +143,9 @@ function cardInner(account: AccountView, pending: boolean): string {
   const tier = normalizeTier(rank.tier);
   const [gameName, tag] = splitRiotId(accountLabel(account));
   const lp = isRanked(rank) && rank.lp ? `<span class="lp">${esc(rank.lp)} LP</span>` : "";
+  const stats = state.mode === "lol" && account.rankedStats
+    ? `<span class="ranked-stats" data-tooltip="${esc(t("card.winRate"))}">${account.rankedStats.wins}W ${account.rankedStats.losses}L · ${account.rankedStats.winRate}%</span>`
+    : "";
   return `
     <div class="card-top">
       <div class="identity">
@@ -169,7 +172,7 @@ function cardInner(account: AccountView, pending: boolean): string {
       `}
       </div>
     </div>
-    ${account.name && !account.riotIdNotFound ? `<div class="history">${historyLine(account)}${provenanceLine(account)}</div>` : ""}
+    ${account.name && !account.riotIdNotFound ? `<div class="history"><span class="history-rank">${historyLine(account)}</span>${stats}${provenanceLine(account)}</div>` : ""}
     ${account.description ? `<p class="desc" data-tooltip="${esc(account.description)}">${esc(account.description)}</p>` : `<p class="desc desc-empty"></p>`}
     <div class="card-actions">
       <button class="btn btn-play" data-act="login" data-tooltip="${esc(t("card.loginTitle"))}">${icon("login", 15)}${esc(t("card.login"))}</button>
