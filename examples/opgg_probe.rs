@@ -41,6 +41,7 @@ fn main() {
                     "profile":format!("{}:{}",account.region,account.name),
                     "seconds":started.elapsed().as_secs_f64(),
                     "tier":info.tier,"division":info.division,"lp":info.lp,"level":info.level,
+                    "recentGames":info.recent_games,
                     "notFound":info.riot_id_not_found,"provenance":info.provenance,
                     "tft":info.tft,"tftProvenance":info.tft_provenance
                 }));

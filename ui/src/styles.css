@@ -884,14 +884,15 @@ code {
 .recent-games {
   display: flex;
   flex-basis: 100%;
-  gap: 5px;
+  justify-content: center;
+  gap: 4px;
   padding: 2px 0 3px;
 }
 .recent-game {
   display: block;
-  width: 23px;
-  height: 23px;
-  flex: 0 0 23px;
+  width: 27px;
+  height: 27px;
+  flex: 0 0 27px;
   overflow: hidden;
   border: 2px solid transparent;
   border-radius: 4px;

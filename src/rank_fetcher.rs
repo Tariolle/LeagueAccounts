@@ -341,8 +341,72 @@ impl RankFetcher {
                 }
             }
         }
+        if rank.recent_games.is_empty() {
+            rank.recent_games = self
+                .fetch_recent_games_from_opgg(&body, url, region)
+                .unwrap_or_default();
+        }
         rank.provenance = Some(provenance);
         Ok(rank)
+    }
+
+    fn fetch_recent_games_from_opgg(
+        &self,
+        body: &str,
+        url: &str,
+        region: &str,
+    ) -> Result<Vec<RecentGame>, Reason> {
+        let soup = Html::parse_document(body);
+        let puuid = opgg_puuid(&soup).ok_or(Reason::ProfileMissing)?;
+        let mut page = self.request_opgg_games(body, url, region, &puuid, "")?;
+        if page.data.is_empty() {
+            if let Some(cursor) = page
+                .meta
+                .get("last_game_created_at")
+                .and_then(serde_json::Value::as_str)
+            {
+                page = self.request_opgg_games(body, url, region, &puuid, cursor)?;
+            }
+        }
+        Ok(parse_opgg_action_games(&page.data))
+    }
+
+    fn request_opgg_games(
+        &self,
+        body: &str,
+        url: &str,
+        region: &str,
+        puuid: &str,
+        ended_at: &str,
+    ) -> Result<OpggGamesPage, Reason> {
+        let action = self
+            .discover_get_games_action(body)
+            .map_err(|_| Reason::ResponseBody)?;
+        let payload = serde_json::json!([{
+            "locale": "en",
+            "region": region,
+            "puuid": puuid,
+            "gameType": "TOTAL",
+            "endedAt": ended_at,
+            "champion": serde_json::Value::Null,
+        }]);
+        let request = self
+            .client
+            .post(url)
+            .header("Next-Action", &action)
+            .header(reqwest::header::ACCEPT, "text/x-component")
+            .header(reqwest::header::CONTENT_TYPE, "text/plain;charset=UTF-8")
+            .header(reqwest::header::ORIGIN, "https://op.gg")
+            .header(reqwest::header::REFERER, url)
+            .body(payload.to_string());
+        let response = self.request_text(request)?;
+        match parse_opgg_action_page(&response) {
+            Some(page) => Ok(page),
+            None => {
+                self.invalidate_get_games_action(&action);
+                Err(Reason::ResponseBody)
+            }
+        }
     }
 
     /// Parse a fetched document independently of the network and renewal protocol.
@@ -759,6 +823,80 @@ fn parse_recent_games(soup: &Html, body: &str) -> Vec<RecentGame> {
         .collect()
 }
 
+struct OpggGamesPage {
+    data: Vec<serde_json::Value>,
+    meta: serde_json::Value,
+}
+
+fn opgg_puuid(soup: &Html) -> Option<String> {
+    static JSON_LD: LazyLock<Selector> = LazyLock::new(|| {
+        Selector::parse(r#"script[type="application/ld+json"]"#).expect("valid JSON-LD selector")
+    });
+    soup.select(&JSON_LD).find_map(|script| {
+        let document =
+            serde_json::from_str::<serde_json::Value>(&script.text().collect::<String>()).ok()?;
+        find_opgg_puuid(&document)
+    })
+}
+
+fn find_opgg_puuid(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(identifiers) = object
+                .get("identifier")
+                .and_then(serde_json::Value::as_array)
+            {
+                if let Some(puuid) = identifiers.iter().find_map(|identifier| {
+                    (identifier.get("name").and_then(serde_json::Value::as_str) == Some("puuid"))
+                        .then(|| identifier.get("value").and_then(serde_json::Value::as_str))
+                        .flatten()
+                }) {
+                    return Some(puuid.to_owned());
+                }
+            }
+            object.values().find_map(find_opgg_puuid)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(find_opgg_puuid),
+        _ => None,
+    }
+}
+
+fn parse_opgg_action_page(response: &str) -> Option<OpggGamesPage> {
+    response.lines().find_map(|line| {
+        let (_, json) = line.split_once(':')?;
+        let value = serde_json::from_str::<serde_json::Value>(json).ok()?;
+        Some(OpggGamesPage {
+            data: value.get("data")?.as_array()?.to_vec(),
+            meta: value.get("meta")?.clone(),
+        })
+    })
+}
+
+fn parse_opgg_action_games(data: &[serde_json::Value]) -> Vec<RecentGame> {
+    data.iter()
+        .filter_map(|game| {
+            let champion = game.get("champion")?;
+            let name = champion.get("name")?.as_str()?.trim();
+            let won = match game
+                .get("game_result")?
+                .as_str()?
+                .to_ascii_uppercase()
+                .as_str()
+            {
+                "WIN" | "VICTORY" => true,
+                "LOSE" | "DEFEAT" => false,
+                _ => return None,
+            };
+            Some(RecentGame {
+                champion: name.to_owned(),
+                icon_url: champion.get("image_url")?.as_str()?.to_owned(),
+                won,
+            })
+        })
+        .take(10)
+        .collect()
+}
+
 fn recent_games_list(value: &serde_json::Value) -> Option<&[serde_json::Value]> {
     match value {
         serde_json::Value::Object(object) => {
@@ -842,6 +980,41 @@ fn title_case(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_puuid_and_recent_game_records_from_opgg_action_payloads() {
+        let html = r#"<script type="application/ld+json">{"@graph":[{"@type":"Person","identifier":[{"name":"region","value":"ru"},{"name":"puuid","value":"public-puuid"}]}]}</script>"#;
+        let soup = Html::parse_document(html);
+        assert_eq!(opgg_puuid(&soup).as_deref(), Some("public-puuid"));
+
+        let response = concat!(
+            "0:{\"a\":\"$@1\",\"f\":\"\",\"b\":\"test\"}\n",
+            "1:{\"data\":[",
+            "{\"game_result\":\"VICTORY\",\"champion\":{\"name\":\"Zeri\",\"image_url\":\"https://example.test/Zeri.png\"}},",
+            "{\"game_result\":\"DEFEAT\",\"champion\":{\"name\":\"Varus\",\"image_url\":\"https://example.test/Varus.png\"}}",
+            "],\"meta\":{\"first_game_created_at\":null,\"last_game_created_at\":\"2026-09-15T19:45:01+09:00\"}}"
+        );
+        let page = parse_opgg_action_page(response).unwrap();
+        assert_eq!(
+            page.meta["last_game_created_at"].as_str(),
+            Some("2026-09-15T19:45:01+09:00")
+        );
+        assert_eq!(
+            parse_opgg_action_games(&page.data),
+            vec![
+                RecentGame {
+                    champion: "Zeri".into(),
+                    icon_url: "https://example.test/Zeri.png".into(),
+                    won: true,
+                },
+                RecentGame {
+                    champion: "Varus".into(),
+                    icon_url: "https://example.test/Varus.png".into(),
+                    won: false,
+                },
+            ]
+        );
+    }
 
     #[test]
     fn parses_current_rank_and_level() {
