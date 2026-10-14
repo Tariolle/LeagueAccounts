@@ -152,7 +152,7 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .history { font-size: 11px; letter-spacing: .025em; color: #a09b8c; padding-top: 11px; border-top: 1px solid #c8aa6e19; gap: 5px; min-height: 27px; flex-wrap: wrap; }
 .history b { font-weight: 400; color: #f0e6d2; }
 .card:has(.recent-games) .desc-empty { display: none; }
-.card:has(.recent-games) .card-actions { margin-top: 0; }
+.card:has(.recent-games) .card-actions { margin-top: 4px; }
 .rank-provenance { font-size: 10px; line-height: 1.4; color: #a09b8c; margin-top: 4px; overflow-wrap: anywhere; width: 100%; }
 .rank-provenance.has-error { color: #e4bd75; }
 .accounts.list .rank-provenance { max-width: 190px; flex-shrink: 1; }
