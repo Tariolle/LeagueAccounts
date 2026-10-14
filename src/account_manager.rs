@@ -346,6 +346,7 @@ impl AccountManager {
                 lp: item.lp,
                 level: item.level,
                 ranked_stats: item.ranked_stats,
+                recent_games: item.recent_games,
                 reached_last_season: if item.reached_last_season.is_empty() {
                     "N/A".to_owned()
                 } else {
@@ -422,6 +423,7 @@ struct ExportAccount {
     lp: String,
     level: String,
     ranked_stats: Option<crate::models::RankedStats>,
+    recent_games: Vec<crate::models::RecentGame>,
     reached_last_season: String,
     finished_last_season: String,
     tft: TftRank,
@@ -442,6 +444,7 @@ impl From<&Account> for ExportAccount {
             lp: account.lp.clone(),
             level: account.level.clone(),
             ranked_stats: account.ranked_stats.clone(),
+            recent_games: account.recent_games.clone(),
             reached_last_season: account.reached_last_season.clone(),
             finished_last_season: account.finished_last_season.clone(),
             tft: account.tft.clone(),
@@ -475,6 +478,8 @@ struct ImportAccount {
     level: String,
     #[serde(default)]
     ranked_stats: Option<crate::models::RankedStats>,
+    #[serde(default)]
+    recent_games: Vec<crate::models::RecentGame>,
     #[serde(default)]
     reached_last_season: String,
     #[serde(default)]

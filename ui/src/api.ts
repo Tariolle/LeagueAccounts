@@ -121,6 +121,7 @@ export interface AccountView {
   description: string;
   level: string;
   rankedStats?: { wins: number; losses: number; winRate: number } | null;
+  recentGames?: { champion: string; iconUrl: string; won: boolean }[];
   hasPassword: boolean;
   lol: LolRank;
   tft: TftRank;

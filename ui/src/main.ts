@@ -138,6 +138,16 @@ function provenanceLine(account: AccountView): string {
   return `<div class="rank-provenance${error ? " has-error" : ""}" data-tooltip="${esc(detail)}">${esc(label)} · ${esc(data.source)}${error ? ` · ${esc(error)}` : ""}</div>`;
 }
 
+function recentGamesLine(account: AccountView): string {
+  if (state.mode !== "lol" || !account.recentGames?.length) return "";
+  const games = account.recentGames.slice(0, 10).map((game) => {
+    const result = game.won ? t("card.win") : t("card.loss");
+    const label = `${game.champion} · ${result}`;
+    return `<span class="recent-game${game.won ? " is-win" : " is-loss"}" role="img" aria-label="${esc(label)}" data-tooltip="${esc(label)}"><img src="${esc(game.iconUrl)}" alt="" loading="lazy" draggable="false"></span>`;
+  }).join("");
+  return `<div class="recent-games" role="list" aria-label="${esc(t("card.recentGames"))}">${games}</div>`;
+}
+
 function cardInner(account: AccountView, pending: boolean): string {
   const rank = rankOf(account, state.mode);
   const tier = normalizeTier(rank.tier);
@@ -173,7 +183,7 @@ function cardInner(account: AccountView, pending: boolean): string {
       `}
       </div>
     </div>
-    ${account.name && !account.riotIdNotFound ? `<div class="history"><span class="history-rank">${historyLine(account)}</span>${stats}${provenanceLine(account)}</div>` : ""}
+    ${account.name && !account.riotIdNotFound ? `<div class="history"><span class="history-rank">${historyLine(account)}</span>${stats}${provenanceLine(account)}${recentGamesLine(account)}</div>` : ""}
     ${account.description ? `<p class="desc" data-tooltip="${esc(account.description)}">${esc(account.description)}</p>` : `<p class="desc desc-empty"></p>`}
     <div class="card-actions">
       <button class="btn btn-play" data-act="login" data-tooltip="${esc(t("card.loginTitle"))}">${icon("login", 15)}${esc(t("card.login"))}</button>

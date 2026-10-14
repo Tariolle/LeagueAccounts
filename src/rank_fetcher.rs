@@ -1,6 +1,6 @@
 use crate::logging::{self, Event, Reason};
 use crate::models::{
-    Account, Freshness, RankFetchError, RankInfo, RankProvenance, RankedStats, TftRank,
+    Account, Freshness, RankFetchError, RankInfo, RankProvenance, RankedStats, RecentGame, TftRank,
 };
 use html_escape::decode_html_entities;
 use regex::Regex;
@@ -356,6 +356,7 @@ impl RankFetcher {
         let mut rank = self.parse_current_rank_from_opgg(&soup, &decoded_payload);
         rank.level = self.parse_level_from_opgg(&soup, &decoded_payload);
         rank.ranked_stats = meta_description(&soup).and_then(|text| parse_ranked_stats(&text));
+        rank.recent_games = parse_recent_games(&soup, body);
         let explicitly_unranked = meta_description(&soup)
             .is_some_and(|text| text.contains(" / Lv. ") || text.contains(" / Unranked"));
         if rank.tier == "Unranked" && (rank.level.is_empty() || !explicitly_unranked) {
@@ -624,6 +625,7 @@ impl RankFetcher {
             lp: rank.lp,
             level: rank.level,
             ranked_stats: rank.ranked_stats,
+            recent_games: rank.recent_games,
             reached_last_season: if rank.reached_last_season.is_empty() {
                 "Unranked".to_owned()
             } else {
@@ -699,6 +701,126 @@ fn parse_ranked_stats(description: &str) -> Option<RankedStats> {
         losses,
         win_rate: rate as u8,
     })
+}
+
+fn parse_recent_games(soup: &Html, body: &str) -> Vec<RecentGame> {
+    static VERSION: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"meta/images/lol/(?P<version>\d+\.\d+\.\d+)/champion/")
+            .expect("valid OP.GG champion asset version regex")
+    });
+    let Some(version) = VERSION
+        .captures(body)
+        .and_then(|capture| capture.name("version"))
+        .map(|capture| capture.as_str())
+    else {
+        return Vec::new();
+    };
+
+    static JSON_LD: LazyLock<Selector> = LazyLock::new(|| {
+        Selector::parse(r#"script[type="application/ld+json"]"#).expect("valid JSON-LD selector")
+    });
+    let items = soup.select(&JSON_LD).find_map(|script| {
+        let source = script.text().collect::<String>();
+        let document = serde_json::from_str::<serde_json::Value>(&source).ok()?;
+        recent_games_list(&document).map(|items| items.to_vec())
+    });
+    let Some(items) = items else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .take(10)
+        .filter_map(|entry| {
+            let game = entry.get("item")?;
+            let properties = game.get("additionalProperty")?.as_array()?;
+            let property = |name: &str| {
+                properties
+                    .iter()
+                    .find(|property| property.get("name").and_then(serde_json::Value::as_str) == Some(name))
+                    .and_then(|property| property.get("value"))
+                    .and_then(serde_json::Value::as_str)
+            };
+            let champion = property("champion")?.trim();
+            let won = match property("result")?.to_ascii_uppercase().as_str() {
+                "WIN" => true,
+                "LOSE" => false,
+                _ => return None,
+            };
+            let icon_key = champion_asset_key(champion)?;
+            Some(RecentGame {
+                champion: champion.to_owned(),
+                icon_url: format!(
+                    "https://opgg-static.akamaized.net/meta/images/lol/{version}/champion/{icon_key}.png?image=c_crop,h_103,w_103,x_9,y_9/q_auto:good,f_webp,w_80,h_80"
+                ),
+                won,
+            })
+        })
+        .collect()
+}
+
+fn recent_games_list(value: &serde_json::Value) -> Option<&[serde_json::Value]> {
+    match value {
+        serde_json::Value::Object(object) => {
+            let is_recent_games = object
+                .get("@id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id.ends_with("#recent-games"));
+            let is_item_list =
+                object.get("@type").and_then(serde_json::Value::as_str) == Some("ItemList");
+            if is_recent_games && is_item_list {
+                return object
+                    .get("itemListElement")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::as_slice);
+            }
+            object.values().find_map(recent_games_list)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(recent_games_list),
+        _ => None,
+    }
+}
+
+fn champion_asset_key(name: &str) -> Option<String> {
+    let normalized = name.trim().to_ascii_lowercase();
+    let known = match normalized.as_str() {
+        "aurelion sol" => Some("AurelionSol"),
+        "bel'veth" => Some("Belveth"),
+        "cho'gath" => Some("Chogath"),
+        "dr. mundo" => Some("DrMundo"),
+        "jarvan iv" => Some("JarvanIV"),
+        "kai'sa" => Some("Kaisa"),
+        "kha'zix" => Some("Khazix"),
+        "kog'maw" => Some("KogMaw"),
+        "k'sante" => Some("KSante"),
+        "leblanc" => Some("Leblanc"),
+        "lee sin" => Some("LeeSin"),
+        "miss fortune" => Some("MissFortune"),
+        "nunu" | "nunu & willump" => Some("Nunu"),
+        "renata glasc" => Some("Renata"),
+        "rek'sai" => Some("RekSai"),
+        "tahm kench" => Some("TahmKench"),
+        "twisted fate" => Some("TwistedFate"),
+        "vel'koz" => Some("Velkoz"),
+        "wukong" | "monkey king" => Some("MonkeyKing"),
+        "xin zhao" => Some("XinZhao"),
+        _ => None,
+    };
+    if let Some(key) = known {
+        return Some(key.to_owned());
+    }
+
+    let key = name
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().collect::<String>() + chars.as_str()
+            })
+        })
+        .collect::<String>();
+    (!key.is_empty() && key.len() <= 32).then_some(key)
 }
 
 fn title_case(value: &str) -> String {
