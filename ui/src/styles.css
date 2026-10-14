@@ -884,15 +884,20 @@ code {
 .recent-games {
   display: flex;
   flex-basis: 100%;
-  justify-content: center;
+  justify-content: flex-start;
   gap: 4px;
-  padding: 2px 0 3px;
+  min-width: 0;
+  padding: 2px 0 0;
+}
+.recent-games.is-full {
+  justify-content: space-between;
 }
 .recent-game {
   display: block;
   width: 27px;
   height: 27px;
-  flex: 0 0 27px;
+  flex: 0 1 27px;
+  min-width: 0;
   overflow: hidden;
   border: 2px solid transparent;
   border-radius: 4px;

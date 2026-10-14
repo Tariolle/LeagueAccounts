@@ -145,7 +145,8 @@ function recentGamesLine(account: AccountView): string {
     const label = `${game.champion} · ${result}`;
     return `<span class="recent-game${game.won ? " is-win" : " is-loss"}" role="img" aria-label="${esc(label)}" data-tooltip="${esc(label)}"><img src="${esc(game.iconUrl)}" alt="" loading="lazy" draggable="false"></span>`;
   }).join("");
-  return `<div class="recent-games" role="list" aria-label="${esc(t("card.recentGames"))}">${games}</div>`;
+  const full = account.recentGames.length >= 10 ? " is-full" : "";
+  return `<div class="recent-games${full}" role="list" aria-label="${esc(t("card.recentGames"))}">${games}</div>`;
 }
 
 function cardInner(account: AccountView, pending: boolean): string {
