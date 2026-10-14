@@ -865,10 +865,21 @@ code {
 }
 .ranked-stats {
   margin-left: auto;
-  color: var(--success);
   font-size: 11px;
+  font-weight: 700;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+.ranked-stat-win,
+.ranked-stat-rate.is-positive {
+  color: #39ff14;
+}
+.ranked-stat-loss,
+.ranked-stat-rate.is-negative {
+  color: #ff3939;
+}
+.ranked-stat-rate:not(.is-positive, .is-negative) {
+  color: var(--muted);
 }
 .rank-block.is-pending > * {
   opacity: 0.35;

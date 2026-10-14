@@ -143,8 +143,9 @@ function cardInner(account: AccountView, pending: boolean): string {
   const tier = normalizeTier(rank.tier);
   const [gameName, tag] = splitRiotId(accountLabel(account));
   const lp = isRanked(rank) && rank.lp ? `<span class="lp">${esc(rank.lp)} LP</span>` : "";
-  const stats = state.mode === "lol" && account.rankedStats
-    ? `<span class="ranked-stats" data-tooltip="${esc(t("card.winRate"))}">${account.rankedStats.wins}W ${account.rankedStats.losses}L · ${account.rankedStats.winRate}%</span>`
+  const rankedStats = account.rankedStats;
+  const stats = state.mode === "lol" && rankedStats
+    ? `<span class="ranked-stats" data-tooltip="${esc(t("card.winRate"))}"><span class="ranked-stat-win">${rankedStats.wins}W</span> <span class="ranked-stat-loss">${rankedStats.losses}L</span> · <span class="ranked-stat-rate${rankedStats.winRate > 50 ? " is-positive" : rankedStats.winRate < 50 ? " is-negative" : ""}">${rankedStats.winRate}%</span></span>`
     : "";
   return `
     <div class="card-top">
