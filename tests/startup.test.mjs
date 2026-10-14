@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { demoBrowser } from "../scripts/demo-browser.mjs";
 
-test("startup shows only the loading screen until the interface is ready", { timeout: 90000 }, async t => {
+test("startup waits for critical assets but not lazy account images", { timeout: 90000 }, async t => {
   const demo = await demoBrowser();
   try {
     await t.test("cold loads wait for app code, fonts, crests and CSS backgrounds", async () => {
@@ -35,7 +35,18 @@ test("startup shows only the loading screen until the interface is ready", { tim
         })), { ready: false, header: "hidden", accounts: "hidden", loader: "rgb(6, 14, 23)", busy: "true" });
       };
       try {
-        await page.goto(demo.base, { waitUntil: "domcontentloaded" });
+        await page.evaluateOnNewDocument(() => {
+          const decode = HTMLImageElement.prototype.decode;
+          window.__lazyDecodeCalls = 0;
+          HTMLImageElement.prototype.decode = function() {
+            if (this.loading === "lazy") {
+              window.__lazyDecodeCalls++;
+              return new Promise(() => {});
+            }
+            return decode.call(this);
+          };
+        });
+        await page.goto(`${demo.base}?scene=startup-lazy`, { waitUntil: "domcontentloaded" });
         await assertLoading();
         assert.equal(await page.$eval(".brand-icon", el => el.getBoundingClientRect().width), 28);
         // The client's hextech loader (Lottie) plays while the app module is held back.
@@ -49,16 +60,24 @@ test("startup shows only the loading screen until the interface is ready", { tim
         }, { polling: 100, timeout: 2500 });
         await release("module");
         await page.waitForSelector("#accounts > .card");
+        assert.equal(await page.$$eval(".recent-game img[loading=lazy]", imgs => imgs.length), 10);
+        assert.equal(await page.$eval("#accounts > .card:has(.recent-games) .ranked-stats", el => el.textContent.trim()), "47W 33L · 59%");
+        assert.equal(await page.$eval("#accounts > .card:has(.recent-games) .ranked-stat-rate", el => getComputedStyle(el).color), "rgb(50, 208, 88)");
+        assert.equal(await page.$eval("#accounts > .card:has(.recent-games) .recent-game.is-win", el => getComputedStyle(el).borderTopColor), "rgb(50, 208, 88)");
+        assert.equal(await page.$eval("#accounts > .card:has(.recent-games) .recent-game.is-loss", el => getComputedStyle(el).borderTopColor), "rgb(240, 68, 73)");
         await page.waitForFunction(() => document.fonts.status === "loading");
         await assertLoading();
         await release("font");
         await page.evaluate(() => document.fonts.ready.then(() => true));
         await assertLoading();
         await release("crest");
-        await page.waitForFunction(() => [...document.images].every(img => img.complete && img.naturalWidth > 0));
+        await page.waitForFunction(() => [...document.images]
+          .filter(img => img.loading !== "lazy")
+          .every(img => img.complete && img.naturalWidth > 0));
         await assertLoading();
         await release("background");
         await page.waitForSelector("body.ready");
+        assert.equal(await page.evaluate(() => window.__lazyDecodeCalls), 0);
         assert.equal(await page.$("#startup-loader"), null);
         assert.equal(await page.$eval(".titlebar", el => getComputedStyle(el).visibility), "visible");
         assert.equal(await page.$eval(".brand-icon", el => el.getBoundingClientRect().width), 28);

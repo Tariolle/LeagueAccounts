@@ -100,6 +100,14 @@ export function installMock(): void {
       account.tftProvenance = { ...account.rankProvenance, freshness: "unknown", freshUntil: null, sourceUpdatedAt: null, renewalAttempted: false, renewalSucceeded: false, error: null };
     });
   }
+  if (scene === "startup-lazy") {
+    accounts[0].rankedStats = { wins: 47, losses: 33, winRate: 59 };
+    accounts[0].recentGames = Array.from({ length: 10 }, (_, index) => ({
+      champion: `Champion ${index + 1}`,
+      iconUrl: `/startup-lazy-${index}.png`,
+      won: index % 2 === 0,
+    }));
+  }
   const find = (key: Key) => accounts.find((account) => keyId(account) === keyId(key));
   const fakeFetch = (targets: AccountView[], exclusive = false) => {
     listeners.pending.forEach((handler) => handler(targets.map((account) => ({ accountId: account.accountId, region: account.region }))));

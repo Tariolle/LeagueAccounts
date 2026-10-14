@@ -1,6 +1,8 @@
 use crate::credentials;
 use crate::logging::{self, Event, Reason};
-use crate::models::{Account, AccountKey, RankInfo, RankProvenance, TftRank};
+use crate::models::{
+    Account, AccountKey, RankInfo, RankProvenance, RankedStats, RecentGame, TftRank,
+};
 use crate::rank_fetcher::RankProvider;
 use crate::utils::{accounts_file, region_display, sort_accounts};
 use serde::{Deserialize, Serialize};
@@ -345,6 +347,8 @@ impl AccountManager {
                 division: item.division,
                 lp: item.lp,
                 level: item.level,
+                ranked_stats: item.ranked_stats,
+                recent_games: item.recent_games,
                 reached_last_season: if item.reached_last_season.is_empty() {
                     "N/A".to_owned()
                 } else {
@@ -421,6 +425,8 @@ struct ExportAccount {
     division: String,
     lp: String,
     level: String,
+    ranked_stats: Option<RankedStats>,
+    recent_games: Vec<RecentGame>,
     reached_last_season: String,
     finished_last_season: String,
     tft: TftRank,
@@ -442,6 +448,8 @@ impl From<&Account> for ExportAccount {
             division: account.division.clone(),
             lp: account.lp.clone(),
             level: account.level.clone(),
+            ranked_stats: account.ranked_stats.clone(),
+            recent_games: account.recent_games.clone(),
             reached_last_season: account.reached_last_season.clone(),
             finished_last_season: account.finished_last_season.clone(),
             tft: account.tft.clone(),
@@ -476,6 +484,10 @@ struct ImportAccount {
     #[serde(default)]
     level: String,
     #[serde(default)]
+    ranked_stats: Option<RankedStats>,
+    #[serde(default)]
+    recent_games: Vec<RecentGame>,
+    #[serde(default)]
     reached_last_season: String,
     #[serde(default)]
     finished_last_season: String,
@@ -506,6 +518,27 @@ mod tests {
         let imported: ImportAccount = serde_json::from_str(&json).unwrap();
         assert_eq!(imported.rank_provenance, account.rank_provenance);
         assert_eq!(imported.tft_provenance, account.tft_provenance);
+    }
+
+    #[test]
+    fn export_round_trips_ranked_stats_and_recent_games() {
+        let account = Account {
+            ranked_stats: Some(RankedStats {
+                wins: 47,
+                losses: 33,
+                win_rate: 59,
+            }),
+            recent_games: vec![RecentGame {
+                champion: "Zeri".into(),
+                icon_url: "https://example.test/Zeri.png".into(),
+                won: true,
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ExportAccount::from(&account)).unwrap();
+        let imported: ImportAccount = serde_json::from_str(&json).unwrap();
+        assert_eq!(imported.ranked_stats, account.ranked_stats);
+        assert_eq!(imported.recent_games, account.recent_games);
     }
     use std::cell::RefCell;
     use std::collections::HashMap;
