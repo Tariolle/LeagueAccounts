@@ -23,6 +23,7 @@ pub(super) struct RenewalState {
     active: Mutex<usize>,
     available: Condvar,
     actions: Mutex<Option<CachedActions>>,
+    games_action: Mutex<Option<CachedGamesAction>>,
     attempts: Mutex<HashMap<String, Instant>>,
     cooldown: Mutex<Option<Instant>>,
 }
@@ -32,6 +33,13 @@ struct CachedActions {
     /// The asset that supplied both references. Other profile chunks can differ.
     script_url: Option<String>,
     result: Result<Actions, RankFetchError>,
+    at: Instant,
+}
+
+struct CachedGamesAction {
+    build: String,
+    script_url: Option<String>,
+    result: Result<String, RankFetchError>,
     at: Instant,
 }
 
@@ -55,6 +63,17 @@ impl RenewalState {
                     .as_ref()
                     .is_ok_and(|actions| action == actions.renewal || action == actions.status)
             }) {
+                *cache = None;
+            }
+        }
+    }
+
+    fn invalidate_games_action(&self, action: &str) {
+        if let Ok(mut cache) = self.games_action.lock() {
+            if cache
+                .as_ref()
+                .is_some_and(|cached| cached.result.as_deref() == Ok(action))
+            {
                 *cache = None;
             }
         }
@@ -191,6 +210,88 @@ impl Actions {
             renewal: renewal?,
             status: status?,
         })
+    }
+}
+
+impl RankFetcher {
+    pub(super) fn discover_get_games_action(&self, body: &str) -> Result<String, RankFetchError> {
+        let deadline = Instant::now() + RENEWAL_TIMEOUT;
+        self.discover_get_games_action_with(body, deadline, |url, timeout| {
+            self.request_text(self.client.get(url).timeout(timeout))
+                .map_err(super::fetch_error)
+        })
+    }
+
+    fn discover_get_games_action_with(
+        &self,
+        body: &str,
+        deadline: Instant,
+        mut fetch_bundle: impl FnMut(&str, Duration) -> Result<String, RankFetchError>,
+    ) -> Result<String, RankFetchError> {
+        static SCRIPTS: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(
+                r#"<script[^>]+src="(https://c-lol-web\.op\.gg/[^"<>]+/_next/static/chunks/[^"<>]+\.js)""#,
+            )
+            .expect("valid OP.GG scripts regex")
+        });
+        static REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"createServerReference\)\("([a-f0-9]{40,})",.{0,160}?"getGames"\)"#)
+                .expect("valid getGames action reference regex")
+        });
+        let scripts: Vec<String> = SCRIPTS
+            .captures_iter(body)
+            .map(|capture| capture[1].to_owned())
+            .collect();
+        if scripts.is_empty() || scripts.len() > 64 {
+            return Err(RankFetchError::ParsingFailed);
+        }
+        let build = scripts[0]
+            .split("/_next/static/")
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let mut cache = self
+            .renewal
+            .games_action
+            .lock()
+            .map_err(|_| RankFetchError::ProviderUnavailable)?;
+        if let Some(cached) = &*cache {
+            let reusable = if cached.result.is_ok() {
+                cached.at.elapsed() < ACTION_CACHE_MAX_AGE
+                    && cached
+                        .script_url
+                        .as_ref()
+                        .is_some_and(|url| scripts.contains(url))
+            } else {
+                cached.at.elapsed() < FAILED_RETRY_DELAY
+            };
+            if cached.build == build && reusable {
+                return cached.result.clone();
+            }
+        }
+        let mut script_url = None;
+        let result = (|| {
+            for url in scripts.iter().rev() {
+                let timeout = remaining(deadline)?.min(ASSET_TIMEOUT);
+                let bundle = fetch_bundle(url, timeout)?;
+                if let Some(capture) = REFERENCE.captures(&bundle) {
+                    script_url = Some(url.clone());
+                    return Ok(capture[1].to_owned());
+                }
+            }
+            Err(RankFetchError::ParsingFailed)
+        })();
+        *cache = Some(CachedGamesAction {
+            build,
+            script_url,
+            result: result.clone(),
+            at: Instant::now(),
+        });
+        result
+    }
+
+    pub(super) fn invalidate_get_games_action(&self, action: &str) {
+        self.renewal.invalidate_games_action(action);
     }
 }
 
@@ -517,6 +618,30 @@ mod tests {
         format!(
             r#"<meta name="description" content="Fixture / Diamond II {lp} LP"><img src="profile_icons/profileIcon6.jpg"><script src="https://c-lol-web.op.gg/test-build/_next/static/chunks/test.js"></script>{{"puuid":"fixture-own-puuid","initRenewableAt":null,"initUpdatedAt":"{date}"}}"#
         )
+    }
+
+    #[test]
+    fn discovers_and_caches_the_current_match_history_action() {
+        let fetcher = RankFetcher::new();
+        let html = profile(now_ms(), 10);
+        let action = fetcher
+            .discover_get_games_action_with(&html, Instant::now() + RENEWAL_TIMEOUT, |url, _| {
+                assert!(url.ends_with("/chunks/test.js"));
+                Ok(include_str!("../../tests/fixtures/opgg-actions.js").into())
+            })
+            .unwrap();
+        assert_eq!(action, "409a2b9ca50d15e50a4dace93552e3a40113dc2753");
+
+        assert_eq!(
+            fetcher
+                .discover_get_games_action_with(
+                    &html,
+                    Instant::now() + RENEWAL_TIMEOUT,
+                    |_, _| panic!("cached match-history action should be reused"),
+                )
+                .unwrap(),
+            action
+        );
     }
 
     fn finished(at: u64) -> String {

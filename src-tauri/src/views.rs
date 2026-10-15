@@ -1,6 +1,6 @@
 //! Data shapes sent to the web interface. Passwords never appear here.
 
-use leagueaccounts::models::{Account, AccountKey, RankProvenance};
+use leagueaccounts::models::{Account, AccountKey, RankProvenance, RankedStats, RecentGame};
 use serde::{Deserialize, Serialize};
 
 /// A command failure the UI translates: a stable `code` plus an optional
@@ -78,6 +78,8 @@ pub struct AccountView {
     region_display: String,
     description: String,
     level: String,
+    ranked_stats: Option<RankedStats>,
+    recent_games: Vec<RecentGame>,
     has_password: bool,
     lol: LolView,
     tft: TftView,
@@ -94,6 +96,8 @@ pub fn account_view(account: &Account) -> AccountView {
         region_display: account.region_display.clone(),
         description: account.description.clone(),
         level: account.level.clone(),
+        ranked_stats: account.ranked_stats.clone(),
+        recent_games: account.recent_games.clone(),
         has_password: !account.password.is_empty(),
         rank_provenance: account.rank_provenance.clone(),
         tft_provenance: account.tft_provenance.clone(),

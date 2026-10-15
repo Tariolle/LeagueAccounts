@@ -59,8 +59,8 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
       await page.click('.dist-row[data-tier="Diamond"]');
       assert.equal(await count(), 1);
       await page.click("#clear-filters");
-      // Pin a lost click here rather than at the sort below (seen once in CI).
       await page.waitForSelector("#clear-filters", { hidden: true, timeout: 2000 });
+      await page.waitForFunction(() => document.querySelectorAll("#accounts > .card").length === 11);
       assert.equal(await count(), 11);
       await page.select("#sort", "level");
       assert.match(await text("#accounts > .card:first-child"), /Lux Main/);

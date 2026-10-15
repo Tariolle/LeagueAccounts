@@ -24,6 +24,12 @@ pub struct Account {
     pub lp: String,
     #[serde(default)]
     pub level: String,
+    /// Ranked Solo/Duo wins and losses from the OP.GG profile description.
+    #[serde(default)]
+    pub ranked_stats: Option<RankedStats>,
+    /// Recent LoL games in source order, newest first.
+    #[serde(default)]
+    pub recent_games: Vec<RecentGame>,
     #[serde(default = "default_history")]
     pub reached_last_season: String,
     #[serde(default = "default_history")]
@@ -49,6 +55,22 @@ pub struct TftRank {
     pub lp: String,
     #[serde(default = "default_history")]
     pub last_set: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RankedStats {
+    pub wins: u32,
+    pub losses: u32,
+    pub win_rate: u8,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentGame {
+    pub champion: String,
+    pub icon_url: String,
+    pub won: bool,
 }
 
 impl Default for TftRank {
@@ -105,6 +127,8 @@ pub struct RankInfo {
     pub division: String,
     pub lp: String,
     pub level: String,
+    pub ranked_stats: Option<RankedStats>,
+    pub recent_games: Vec<RecentGame>,
     pub reached_last_season: String,
     pub finished_last_season: String,
     /// `None` when the TFT profile could not be fetched.
@@ -195,6 +219,8 @@ impl RankInfo {
             account.division = self.division.clone();
             account.lp = self.lp.clone();
             account.level = self.level.clone();
+            account.ranked_stats = self.ranked_stats.clone();
+            account.recent_games = self.recent_games.clone();
             account.reached_last_season = if self.reached_last_season.is_empty() {
                 "N/A".to_owned()
             } else {
