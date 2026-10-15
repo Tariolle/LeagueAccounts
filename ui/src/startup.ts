@@ -1,7 +1,7 @@
 /** Decode the first screen, including CSS backgrounds and icon masks, offscreen. */
 export async function revealApp(): Promise<void> {
   // Recent-match portraits are lazy-loaded and can number ten per account.
-  // They should not keep the whole window on the loader while below the fold.
+  // Do not keep the whole window on the loader while offscreen portraits load.
   const images = [...document.images]
     .filter(image => image.loading !== "lazy")
     .map(image => image.decode().catch(() => {}));

@@ -9,7 +9,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 mod renewal;
-use renewal::{freshness, now_ms, ProfileUpdate, RenewalError, RenewalState, MAX_AGE};
+use renewal::{MAX_AGE, ProfileUpdate, RenewalError, RenewalState, freshness, now_ms};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RefreshMode {
@@ -995,6 +995,8 @@ mod tests {
           ]}</script>
         "##;
         let rank = RankFetcher::new().parse_profile(html).unwrap();
+        let soup = Html::parse_document(html);
+        assert_eq!(opgg_puuid(&soup).as_deref(), Some("fixture-puuid"));
         assert_eq!(
             rank.ranked_stats,
             Some(RankedStats {
@@ -1021,7 +1023,8 @@ mod tests {
             "0:{\"a\":\"$@1\",\"f\":\"\",\"b\":\"fixture\"}\n",
             "1:{\"data\":[",
             "{\"game_result\":\"VICTORY\",\"champion\":{\"name\":\"Zeri\",\"image_url\":\"https://example.test/Zeri.png\"}},",
-            "{\"game_result\":\"UNKNOWN\",\"champion\":{\"name\":\"Varus\",\"image_url\":\"https://example.test/Varus.png\"}}",
+            "{\"game_result\":\"DEFEAT\",\"champion\":{\"name\":\"Varus\",\"image_url\":\"https://example.test/Varus.png\"}},",
+            "{\"game_result\":\"UNKNOWN\",\"champion\":{\"name\":\"Sona\",\"image_url\":\"https://example.test/Sona.png\"}}",
             "],\"meta\":{\"last_game_created_at\":\"2026-09-15T19:45:01+09:00\"}}"
         );
         let page = parse_opgg_action_page(response).unwrap();
@@ -1031,11 +1034,18 @@ mod tests {
         );
         assert_eq!(
             parse_opgg_action_games(&page.data),
-            vec![RecentGame {
-                champion: "Zeri".into(),
-                icon_url: "https://example.test/Zeri.png".into(),
-                won: true,
-            }]
+            vec![
+                RecentGame {
+                    champion: "Zeri".into(),
+                    icon_url: "https://example.test/Zeri.png".into(),
+                    won: true,
+                },
+                RecentGame {
+                    champion: "Varus".into(),
+                    icon_url: "https://example.test/Varus.png".into(),
+                    won: false,
+                },
+            ]
         );
     }
 

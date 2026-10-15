@@ -89,6 +89,13 @@ export function installMock(): void {
     else setUpdate({ phase: "upToDate", release: { ...release, version: "3.0.3" } });
   }, scene === "restart" ? 1500 : 300);
   let accounts = structuredClone(sample);
+  if (scene === "startup-lazy") {
+    accounts[0].recentGames = Array.from({ length: 10 }, (_, index) => ({
+      champion: `Champion ${index + 1}`,
+      iconUrl: `/startup-lazy-${index}.png`,
+      won: index % 2 === 0,
+    }));
+  }
   if (scene === "freshness") {
     const errors: NonNullable<AccountView["rankProvenance"]>["error"][] = [null, "rate_limited", "forbidden", "parsing_failed", "timeout", "provider_unavailable", "renewal_failed"];
     accounts.forEach((account, index) => {

@@ -3,7 +3,7 @@
 use super::{RankFetcher, RefreshMode};
 use crate::models::{Freshness, RankFetchError};
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -620,6 +620,30 @@ mod tests {
         )
     }
 
+    #[test]
+    fn discovers_and_caches_the_current_match_history_action() {
+        let fetcher = RankFetcher::new();
+        let html = profile(now_ms(), 10);
+        let action = fetcher
+            .discover_get_games_action_with(&html, Instant::now() + RENEWAL_TIMEOUT, |url, _| {
+                assert!(url.ends_with("/chunks/test.js"));
+                Ok(include_str!("../../tests/fixtures/opgg-actions.js").into())
+            })
+            .unwrap();
+        assert_eq!(action, "409a2b9ca50d15e50a4dace93552e3a40113dc2753");
+
+        assert_eq!(
+            fetcher
+                .discover_get_games_action_with(
+                    &html,
+                    Instant::now() + RENEWAL_TIMEOUT,
+                    |_, _| panic!("cached match-history action should be reused"),
+                )
+                .unwrap(),
+            action
+        );
+    }
+
     fn finished(at: u64) -> String {
         let date = time::OffsetDateTime::from_unix_timestamp((at / 1000) as i64)
             .unwrap()
@@ -675,30 +699,6 @@ mod tests {
     }
 
     #[test]
-    fn discovers_and_caches_the_current_match_history_action() {
-        let fetcher = RankFetcher::default();
-        let body = profile(now_ms(), 10);
-        let deadline = Instant::now() + RENEWAL_TIMEOUT;
-        let action = fetcher
-            .discover_get_games_action_with(&body, deadline, |url, _| {
-                assert!(url.ends_with("/chunks/test.js"));
-                Ok(include_str!("../../tests/fixtures/opgg-actions.js").into())
-            })
-            .unwrap();
-        assert_eq!(action, "409a2b9ca50d15e50a4dace93552e3a40113dc2753");
-        assert_eq!(
-            fetcher
-                .discover_get_games_action_with(
-                    &body,
-                    Instant::now() + RENEWAL_TIMEOUT,
-                    |_, _| panic!("cached match history action should be reused"),
-                )
-                .unwrap(),
-            action
-        );
-    }
-
-    #[test]
     fn discovery_expires_successes_and_keeps_failure_backoff_bounded() {
         let fetcher = RankFetcher::default();
         let body = profile(now_ms(), 10);
@@ -730,9 +730,11 @@ mod tests {
         );
         fetcher.renewal.actions.lock().unwrap().as_mut().unwrap().at =
             Instant::now() - FAILED_RETRY_DELAY;
-        assert!(fetcher
-            .discover_actions_with(&body, deadline, |_, _| Ok(rotated_bundle()))
-            .is_ok());
+        assert!(
+            fetcher
+                .discover_actions_with(&body, deadline, |_, _| Ok(rotated_bundle()))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1013,9 +1015,11 @@ mod tests {
             Err(RankFetchError::Timeout)
         ));
         drop(first);
-        assert!(state
-            .acquire(Instant::now() + Duration::from_millis(10))
-            .is_ok());
+        assert!(
+            state
+                .acquire(Instant::now() + Duration::from_millis(10))
+                .is_ok()
+        );
         drop(second);
         state.set_cooldown(Some(60));
         assert!(state.rate_limited());
