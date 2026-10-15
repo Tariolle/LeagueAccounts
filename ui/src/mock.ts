@@ -69,7 +69,7 @@ const setUpdate = (change: Partial<UpdateStatus>) => {
   listeners.status.forEach((handler) => handler(update));
 };
 /** About six seconds of simulated download, then installed. */
-function simulateInstall(launch: boolean): void {
+function simulateInstall(launch: boolean, intervalMs = 200): void {
   const total = 14_680_064;
   setUpdate({ phase: "downloading", release, received: 0, total, launch });
   const timer = setInterval(() => {
@@ -78,13 +78,14 @@ function simulateInstall(launch: boolean): void {
     if (received < total) return;
     clearInterval(timer);
     setUpdate({ phase: "ready" });
-  }, 200);
+  }, intervalMs);
 }
 
 export function installMock(): void {
   const scene = new URLSearchParams(location.search).get("scene");
   setTimeout(() => {
     if (scene === "updating") simulateInstall(true);
+    else if (scene === "updating-slow") simulateInstall(true, 600);
     else if (scene === "restart") setUpdate({ phase: "ready", release, launch: false });
     else setUpdate({ phase: "upToDate", release: { ...release, version: "3.0.3" } });
   }, scene === "restart" ? 1500 : 300);
