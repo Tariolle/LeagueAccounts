@@ -895,7 +895,9 @@ code {
 .recent-game {
   display: block;
   width: 27px;
-  height: 27px;
+  height: auto;
+  aspect-ratio: 1;
+  align-self: flex-start;
   flex: 0 1 27px;
   min-width: 0;
   overflow: hidden;

@@ -22,6 +22,44 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
     assert.equal(await page.$eval(selector, el => el.scrollWidth <= el.clientWidth + 1), true, `${selector} overflows horizontally`);
   }
   try {
+    await t.test("ranked overlays fit full and short histories in both account layouts", async () => {
+      await open("ranked-cards");
+      assert.equal(await page.$$eval(".recent-game img", imgs => imgs.every(img => img.complete && img.naturalWidth > 0)), true);
+      const rates = await page.$$eval(".ranked-stat-rate", els => Object.fromEntries(els.map(el => [el.textContent, el.className])));
+      assert.match(rates["49%"], /is-negative/);
+      assert.doesNotMatch(rates["50%"], /is-positive|is-negative/);
+      assert.match(rates["51%"], /is-positive/);
+      for (const width of [980, 1360, 1800]) {
+        await page.setViewport({ width, height: 860 });
+        for (const view of ["grid", "list"]) {
+          await page.click(`[data-view="${view}"]`);
+          await noHorizontalOverflow("#accounts");
+          const layouts = await page.$$eval(".recent-games", rows => rows.map(row => {
+            const r = row.getBoundingClientRect();
+            const icons = [...row.children].map(icon => icon.getBoundingClientRect());
+            const actions = row.closest(".card").querySelector(".card-actions").getBoundingClientRect();
+            return { visible: r.width > 0, count: icons.length, square: icons.every(i => Math.abs(i.width - i.height) < 1),
+              left: icons[0].left - r.left, right: r.right - icons.at(-1).right,
+              gap: actions.top - r.bottom, overlapsActions: r.right > actions.left,
+              overflow: row.scrollWidth > row.clientWidth + 1 };
+          }));
+          assert.deepEqual(layouts.map(row => row.count), [10, 2, 10]);
+          for (const row of layouts.filter(row => row.visible)) {
+            assert.equal(row.overflow, false, `${view} ${width}: history overflow`);
+            assert.equal(row.square, true, `${view} ${width}: distorted portraits`);
+            assert.ok(Math.abs(row.left) <= 1, `${view} ${width}: short histories start at the left`);
+            if (row.count === 10) assert.ok(Math.abs(row.right) <= 1, `${view} ${width}: full histories fill the row`);
+            if (view === "grid") assert.ok(row.gap >= 3 && row.gap <= 8, `button gap: ${row.gap}`);
+            else assert.equal(row.overlapsActions, false, `${view} ${width}: portraits overlap actions`);
+          }
+        }
+      }
+      await page.click('.mode-btn[data-mode="tft"]');
+      assert.equal(await page.$(".recent-games"), null);
+      assert.equal(await page.$(".ranked-stats"), null);
+      await page.click('.mode-btn[data-mode="lol"]');
+      assert.equal(await page.$$eval(".recent-game", icons => icons.length), 22);
+    });
     await t.test("browser dev data covers every rank in both games and resets edits", async () => {
       await open();
       assert.equal(await page.$eval("#dev-tools", el => el.hidden), false);

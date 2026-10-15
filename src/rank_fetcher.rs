@@ -8,8 +8,10 @@ use scraper::{Html, Selector};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+mod games;
 mod renewal;
-use renewal::{MAX_AGE, ProfileUpdate, RenewalError, RenewalState, freshness, now_ms};
+use games::GamesState;
+use renewal::{freshness, now_ms, ProfileUpdate, RenewalError, RenewalState, MAX_AGE};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RefreshMode {
@@ -32,6 +34,7 @@ pub trait RankProvider: Send + Sync {
 pub struct RankFetcher {
     client: reqwest::blocking::Client,
     renewal: Arc<RenewalState>,
+    games: Arc<GamesState>,
 }
 
 impl Default for RankFetcher {
@@ -56,6 +59,7 @@ impl RankFetcher {
         Self {
             client,
             renewal: Arc::default(),
+            games: Arc::default(),
         }
     }
 
@@ -337,7 +341,7 @@ impl RankFetcher {
         if rank
             .recent_games
             .as_ref()
-            .is_none_or(|games| games.is_empty())
+            .is_none_or(|games| games.len() < 10)
         {
             match self.fetch_recent_games_from_opgg(&body, url, region) {
                 Ok(games) => rank.recent_games = Some(games),
@@ -351,65 +355,6 @@ impl RankFetcher {
         }
         rank.provenance = Some(provenance);
         Ok(rank)
-    }
-
-    fn fetch_recent_games_from_opgg(
-        &self,
-        body: &str,
-        url: &str,
-        region: &str,
-    ) -> Result<Vec<RecentGame>, Reason> {
-        let soup = Html::parse_document(body);
-        let puuid = opgg_puuid(&soup).ok_or(Reason::ProfileMissing)?;
-        let mut page = self.request_opgg_games(body, url, region, &puuid, "")?;
-        if page.data.is_empty() {
-            if let Some(cursor) = page
-                .meta
-                .get("last_game_created_at")
-                .and_then(serde_json::Value::as_str)
-            {
-                page = self.request_opgg_games(body, url, region, &puuid, cursor)?;
-            }
-        }
-        Ok(parse_opgg_action_games(&page.data))
-    }
-
-    fn request_opgg_games(
-        &self,
-        body: &str,
-        url: &str,
-        region: &str,
-        puuid: &str,
-        ended_at: &str,
-    ) -> Result<OpggGamesPage, Reason> {
-        let action = self
-            .discover_get_games_action(body)
-            .map_err(|_| Reason::ResponseBody)?;
-        let payload = serde_json::json!([{
-            "locale": "en",
-            "region": region,
-            "puuid": puuid,
-            "gameType": "TOTAL",
-            "endedAt": ended_at,
-            "champion": serde_json::Value::Null,
-        }]);
-        let request = self
-            .client
-            .post(url)
-            .header("Next-Action", &action)
-            .header(reqwest::header::ACCEPT, "text/x-component")
-            .header(reqwest::header::CONTENT_TYPE, "text/plain;charset=UTF-8")
-            .header(reqwest::header::ORIGIN, "https://op.gg")
-            .header(reqwest::header::REFERER, url)
-            .body(payload.to_string());
-        let response = self.request_text(request)?;
-        match parse_opgg_action_page(&response) {
-            Some(page) => Ok(page),
-            None => {
-                self.invalidate_get_games_action(&action);
-                Err(Reason::ResponseBody)
-            }
-        }
     }
 
     /// Parse a fetched document independently of the network and renewal protocol.
@@ -761,10 +706,14 @@ fn meta_description(soup: &Html) -> Option<String> {
 
 fn parse_ranked_stats(description: &str) -> Option<RankedStats> {
     static STATS: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\b(?P<wins>[\d,]+)\s*Win\s+(?P<losses>[\d,]+)\s*Lose\s+Win rate\s+(?P<rate>\d{1,3})%")
+        Regex::new(r"(?i)^(?P<wins>[\d,]+)\s*Win\s+(?P<losses>[\d,]+)\s*Lose\s+Win rate\s+(?P<rate>\d{1,3})%$")
             .expect("valid OP.GG ranked stats regex")
     });
-    let captures = STATS.captures(description)?;
+    // Champion summaries also contain Win/Lose text, preceded by a name.
+    // Only a complete, standalone account-record segment is authoritative.
+    let captures = description
+        .split('/')
+        .find_map(|part| STATS.captures(part.trim()))?;
     let wins = captures
         .name("wins")?
         .as_str()
@@ -982,6 +931,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ranked_record_does_not_use_a_champions_record() {
+        let description = "Player#RU / Lv. 83 / Zeri - 8Win 3Lose Win rate 73%";
+        assert_eq!(parse_ranked_stats(description), None);
+        assert_eq!(
+            parse_ranked_stats("Player#RU / Diamond II 75 LP / 47Win 33Lose Win rate 59% / Zeri - 8Win 3Lose Win rate 73%"),
+            Some(RankedStats { wins: 47, losses: 33, win_rate: 59 })
+        );
+    }
+
+    #[test]
     fn parses_ranked_stats_and_recent_games_from_opgg_json_ld() {
         let html = r##"
           <meta name="description" content="Player#RU / Diamond II 75 LP / 47Win 33Lose Win rate 59%">
@@ -1131,6 +1090,7 @@ mod tests {
         });
         let fetcher = RankFetcher {
             renewal: Arc::default(),
+            games: Arc::default(),
             client: reqwest::blocking::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(5))
@@ -1141,6 +1101,7 @@ mod tests {
             let fetcher = RankFetcher {
                 client: fetcher.client.clone(),
                 renewal: Arc::default(),
+                games: Arc::default(),
             };
             assert_eq!(
                 fetcher
@@ -1186,6 +1147,7 @@ mod tests {
         });
         let fetcher = RankFetcher {
             renewal: Arc::default(),
+            games: Arc::default(),
             client: reqwest::blocking::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(5))
@@ -1198,6 +1160,7 @@ mod tests {
                 let fetcher = RankFetcher {
                     client: fetcher.client.clone(),
                     renewal: Arc::default(),
+                    games: Arc::default(),
                 };
                 let info = fetcher.fetch_rank_from_url(&url, "kr", RefreshMode::Manual);
                 assert_eq!(info.tier, "Error");
