@@ -109,11 +109,22 @@
 .mode-pill, .tab-pill { display: none; }
 .mode-btn { position: relative; }
 .mode-btn[aria-selected='true'] { background: linear-gradient(0deg, #cdbe9126, transparent 55%); }
-.mode-btn[aria-selected='true']::before { content: ''; position: absolute; height: 15px; width: 30px; top: -1px; left: calc(50% - 15px); background: url('/league/controls/nav-pointer.png') center top / contain no-repeat; }
+.mode-btn[aria-selected='true']::before { content: ''; position: absolute; height: 15px; width: 30px; top: 0; left: calc(50% - 15px); background: url('/league/controls/nav-pointer.png') center top / contain no-repeat; }
+/* The gold rail the pointer hangs from; the pointer's dark core notches it. */
+.titlebar::before { content: ''; position: absolute; z-index: 0; inset: 0 0 auto; height: 2px; background: #785a28; pointer-events: none; }
 .mode-btn::after { content: ''; position: absolute; height: 24px; bottom: 0; left: 0; right: 0; background: url('/league/controls/nav-highlight.png') center bottom / 100% 100% no-repeat; opacity: 0; pointer-events: none; }
 .mode-btn[aria-selected='true']::after { opacity: .65; }
 .mode-btn:is(:hover, :focus-visible) { color: #f0e6d2; background: linear-gradient(0deg, #cdbe914d, transparent 65%); }
 .mode-btn:is(:hover, :focus-visible)::after { opacity: 1; }
+/* riotclient-app-controls (rcp-fe-lol-navigation): 18px masks 15px apart, pinned to the
+   top-right corner. The buttons pad the hit area around the client's glyph. */
+.window-controls { align-self: start; height: auto; padding: 4px 6px 0 0; }
+.win-btn { width: 33px; height: 30px; background: none; color: #a09b8c; }
+.win-btn::before { content: ''; display: block; width: 18px; height: 18px; margin: auto; background: currentColor; mask: var(--icon) center / contain no-repeat; }
+.win-hide { --icon: url('/league/icons/control-hide.png'); }
+.win-close { --icon: url('/league/icons/control-close.png'); }
+.win-btn:is(:hover, :focus-visible), .win-close:hover { background: none; color: #f0e6d2; }
+.win-btn:active { color: #5b5a56; }
 .tabs { padding: 0; border: 0; border-bottom: 1px solid #463714; border-radius: 0; background: none; }
 .tabs button { font-family: Beaufort, serif; text-transform: uppercase; letter-spacing: .075em; border-radius: 0; position: relative; }
 .tabs button[aria-selected='true'] { color: #f0e6d2; background: linear-gradient(0deg, #cdbe9126, transparent); }

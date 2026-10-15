@@ -166,6 +166,8 @@ pub struct RankProvenance {
     pub fetched_at: Option<u64>,
     pub source_updated_at: Option<u64>,
     pub freshness: Freshness,
+    /// Unix milliseconds after which a fresh source turns stale.
+    pub fresh_until: Option<u64>,
     pub renewal_attempted: bool,
     pub renewal_succeeded: bool,
     pub error: Option<RankFetchError>,
@@ -201,6 +203,9 @@ impl RankInfo {
     }
 
     pub fn apply_to(&self, account: &mut Account) {
+        // Accounts saved before provenance existed have a level from a past fetch.
+        let fetched_before = account.rank_provenance.is_some() || !account.level.is_empty();
+        let tft_fetched_before = fetched_before || account.tft_provenance.is_some();
         if let Some(not_found) = self.riot_id_not_found {
             account.riot_id_not_found = not_found;
         }
@@ -226,15 +231,13 @@ impl RankInfo {
             } else {
                 self.finished_last_season.clone()
             };
-        } else if account.rank_provenance.is_none()
-            && (account.tier.is_empty() || account.tier == "Unranked")
-        {
+        } else if !fetched_before && (account.tier.is_empty() || account.tier == "Unranked") {
             // No successful fetch yet: show Error rather than an invented standing.
             account.tier = "Error".to_owned();
         }
         if let Some(tft) = &self.tft {
             account.tft = tft.clone();
-        } else if account.tft_provenance.is_none() && account.tft.tier == "Unranked" {
+        } else if !tft_fetched_before && account.tft.tier == "Unranked" {
             account.tft = TftRank::error();
         }
         if self.tier == "Error" && self.provenance.is_none() {

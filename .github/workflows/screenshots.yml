@@ -1,0 +1,61 @@
+name: Screenshots
+
+# Regenerates the README's screenshots and demo GIF from the released UI (with
+# synthetic accounts) and opens a pull request with them. Runs on release tags
+# rather than every push so the repository only gains new images once per
+# release; merge the pull request if the captures look right, or close it.
+#
+# Needs "Allow GitHub Actions to create and approve pull requests" in the
+# repository's Settings → Actions → General. Pull requests opened with the
+# workflow token don't trigger other workflows; that's fine for image-only changes.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: screenshots
+  cancel-in-progress: true
+
+jobs:
+  capture:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install ffmpeg
+        run: choco install ffmpeg --no-progress -y
+      - name: Install frontend dependencies
+        run: npm ci
+      # Chrome is preinstalled on GitHub's Windows runners, at the path the script expects.
+      - name: Capture screenshots
+        shell: bash
+        run: |
+          export PATH="/c/ProgramData/chocolatey/bin:$PATH"
+          npm run screenshots
+      - name: Open a pull request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git add -A docs/screenshots
+          if git diff --cached --quiet; then
+            echo "Screenshots are unchanged."
+            exit 0
+          fi
+          branch="screenshots/${GITHUB_REF_NAME//\//-}-$GITHUB_RUN_ID"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -m "docs: refresh screenshots for $GITHUB_REF_NAME"
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "docs: refresh screenshots for $GITHUB_REF_NAME" \
+            --body "Captured by the [Screenshots workflow]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) with \`npm run screenshots\` (synthetic accounts). Check the demo GIF and stills, then merge or close."

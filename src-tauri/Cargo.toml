@@ -1,6 +1,6 @@
 [package]
 name = "leagueaccounts-app"
-version = "3.1.0"
+version = "3.2.0"
 edition = "2021"
 description = "League of Legends account manager for Windows"
 license = "MIT"
@@ -21,3 +21,5 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tauri = { version = "2", features = [] }
 tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }

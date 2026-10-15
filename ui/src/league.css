@@ -41,9 +41,6 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .mode-btn img { width: 23px; height: 23px; object-fit: contain; opacity: .5; transition: opacity .2s; }
 .mode-btn[aria-selected='true'] { color: #f0e6d2; background: linear-gradient(0deg, #c8aa6e12, transparent 75%); }
 .mode-btn[aria-selected='true'] img { opacity: 1; }
-.win-btn { width: 36px; }
-.window-controls { align-items: center; }
-.win-btn { height: 36px; }
 .shell { grid-template-columns: 228px minmax(0,1fr); }
 .sidebar { background: #071119db; backdrop-filter: none; padding: 25px 17px 16px; gap: 25px; border-right: 1px solid #29302e; scrollbar-gutter: stable; }
 .sidebar > * { flex-shrink: 0; }
@@ -301,7 +298,6 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
   .titlebar { grid-template-columns: 58px 1fr auto; padding-left: 17px; }
   .mode-btn { font-size: 11px; padding: 0 11px; }
   .mode-btn img { width: 20px; height: 20px; }
-  .win-btn { width: 27px; }
   .main { padding-left: 18px; padding-right: 18px; }
   .search { flex-basis: 190px; }
   .accounts.grid { grid-template-columns: repeat(auto-fill,minmax(260px,1fr)); }

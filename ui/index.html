@@ -27,9 +27,10 @@
         <button role="tab" data-mode="lol" class="mode-btn"><img src="/league/icons/lol.png" alt="" width="23" height="23" /><span data-i18n="mode.lol"></span></button>
         <button role="tab" data-mode="tft" class="mode-btn"><img src="/league/icons/tft.svg" alt="" width="23" height="23" /><span data-i18n="mode.tft"></span></button>
       </div>
+      <!-- The client's riotclient-app-controls: hide and close only. Double-clicking the
+           title bar still maximizes. -->
       <div class="window-controls">
-        <button class="win-btn" data-win="minimize" data-i18n-title="win.minimize" data-i18n-aria="win.minimize"></button>
-        <button class="win-btn" data-win="maximize" data-i18n-title="win.maximize" data-i18n-aria="win.maximize"></button>
+        <button class="win-btn win-hide" data-win="minimize" data-i18n-title="win.minimize" data-i18n-aria="win.minimize"></button>
         <button class="win-btn win-close" data-win="close" data-i18n-title="win.close" data-i18n-aria="win.close"></button>
       </div>
     </header>

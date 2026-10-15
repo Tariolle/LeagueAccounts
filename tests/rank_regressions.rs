@@ -84,9 +84,47 @@ fn explicit_unranked_description_ignores_other_players_and_history_ranks() {
     assert!(RankFetcher::new()
         .parse_profile("<html>Just a moment...</html>")
         .is_err());
-    assert!(RankFetcher::new()
-        .parse_profile("<img src='profile_icons/profileIcon6.jpg'>")
-        .is_err());
+}
+
+#[test]
+fn unranked_profile_survives_description_wording_changes() {
+    // The profile icon is the guard against challenge pages; an unfamiliar
+    // description must not turn a real unranked profile into an error.
+    let body = r#"<meta name="description" content="Player#EUW - Level 83"><img src="profile_icons/profileIcon6.jpg">"#;
+    let info = RankFetcher::new().parse_profile(body).unwrap();
+    assert_eq!(info.tier, "Unranked");
+}
+
+#[test]
+fn tft_profile_without_history_is_unranked_not_error() {
+    let fetcher = RankFetcher::new();
+    for payload in ["profile_icons/profileIcon6.jpg", r#"{"entry":null}"#] {
+        let tft = fetcher.parse_tft_from_opgg(payload);
+        assert_eq!(tft.tier, "Unranked", "{payload}");
+        assert_eq!(tft.last_set, "Unranked", "{payload}");
+    }
+}
+
+#[test]
+fn failure_keeps_legacy_unranked_standings_saved_without_provenance() {
+    use leagueaccounts::models::{Account, RankInfo, TftRank};
+    let mut legacy = Account {
+        tier: "Unranked".into(),
+        level: "83".into(),
+        tft: TftRank::default(),
+        ..Default::default()
+    };
+    RankInfo::error().apply_to(&mut legacy);
+    assert_eq!(legacy.tier, "Unranked");
+    assert_eq!(legacy.tft.tier, "Unranked");
+
+    let mut never_fetched = Account {
+        tier: "Unranked".into(),
+        ..Default::default()
+    };
+    RankInfo::error().apply_to(&mut never_fetched);
+    assert_eq!(never_fetched.tier, "Error");
+    assert_eq!(never_fetched.tft.tier, "Error");
 }
 
 #[test]

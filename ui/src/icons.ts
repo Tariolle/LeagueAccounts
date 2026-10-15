@@ -6,7 +6,6 @@ import {
   Keyboard,
   LayoutGrid,
   List,
-  Square,
   type IconNode,
 } from "lucide";
 
@@ -18,7 +17,6 @@ const ICONS: Record<string, IconNode> = {
   keyboard: Keyboard,
   "layout-grid": LayoutGrid,
   list: List,
-  square: Square,
 };
 
 const attrs = (values: Record<string, string | number | undefined>): string =>
@@ -36,7 +34,7 @@ const CLIENT_ICONS: Record<string, string> = {
   login: "icon_next.png", minus: "icon_remove.png", more: "ellipses.svg",
   pencil: "icon_edit.png", plus: "icon_plus.png", "refresh-cw": "refresh.png",
   search: "search.png", trash: "icon_delete.png", users: "profile.svg",
-  x: "control-close.png", "window-hide": "control-hide.png",
+  x: "control-close.png",
 };
 
 /** League's own icon artwork, with OS/utility fallbacks where no client equivalent exists. */

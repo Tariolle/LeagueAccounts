@@ -114,9 +114,10 @@ flows to verify that the lifecycle/endpoint/identity safeguards are retained.
    client, switching accounts, and cancelling during setup or verification.
    Credentials must be submitted without keystrokes or foreground focus. CAPTCHA
    and MFA must appear in Riot Client. A rejected login must stop without retries.
-   After success, cancellation, or failure, check that a normal Riot window is
-   restored and its temporary debugger is gone. Verify the selected identity
-   before launching the game. Logs must contain fixed categories only.
+   After cancellation, failure, or success without game launch, check that a
+   normal Riot window is restored; when the game launches, Riot's window must
+   stay closed. In every case the temporary debugger must be gone. Verify the
+   selected identity before launching the game. Logs must contain fixed categories only.
 
 ## Renderer login
 

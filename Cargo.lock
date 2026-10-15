@@ -2198,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "leagueaccounts"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "arboard",
  "html-escape",
@@ -2218,7 +2218,7 @@ dependencies = [
 
 [[package]]
 name = "leagueaccounts-app"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "arboard",
  "leagueaccounts",
@@ -2228,6 +2228,8 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
+ "tauri-plugin-single-instance",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4368,6 +4370,22 @@ dependencies = [
  "tauri",
  "tauri-plugin",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "tauri-plugin-single-instance"
+version = "2.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c142ed88deee222bd2d979269d35c73b6c1c0f6ebd5b79b4ff80066fcad6af1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "windows-sys 0.61.2",
+ "zbus",
 ]
 
 [[package]]

@@ -248,10 +248,9 @@ impl Renderer {
         Ok(())
     }
 
-    pub(super) fn restore(&mut self) -> Result<(), LoginError> {
-        if !self.restore_needed {
-            return Ok(());
-        }
+    /// End the temporary debug renderer without opening a normal window yet.
+    /// A later `restore` (or drop) still opens one unless `replaced_by_game`.
+    pub(super) fn close_debugger(&mut self) -> Result<(), LoginError> {
         if let Some(cdp) = self.cdp.as_mut() {
             let _ = cdp.socket.send(Message::Text(
                 json!({"id":0,"method":"Browser.close"}).to_string().into(),
@@ -269,6 +268,20 @@ impl Renderer {
         if let Some(mut child) = self.child.take() {
             child.close().map_err(|_| LoginError::RendererFailed)?;
         }
+        Ok(())
+    }
+
+    /// The launched game took over from the Riot window: reopening it would
+    /// look like the Riot Client restarting for no reason.
+    pub(super) fn replaced_by_game(&mut self) {
+        self.restore_needed = false;
+    }
+
+    pub(super) fn restore(&mut self) -> Result<(), LoginError> {
+        if !self.restore_needed {
+            return Ok(());
+        }
+        self.close_debugger()?;
         let restored = self.normal.as_ref().is_some_and(|(path, args, endpoint)| {
             LocalApi::read().is_some_and(|api| {
                 &api.base == endpoint && api.session() != Session::Unknown(Reason::AuthUnavailable)
@@ -284,8 +297,8 @@ impl Renderer {
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        // Covers renderer setup, MFA, cancellation and unwinding.
-        // Successful paths restore before launch.
+        // Covers renderer setup, MFA, cancellation, unwinding and failed game
+        // launches. Successful paths restore first or are replaced by the game.
         if self.restore().is_err() {
             logging::record(Event::LoginFailed, Reason::RendererFailed);
         }
@@ -591,6 +604,27 @@ mod tests {
         // The already-signed-in path finishes before any debug renderer exists.
         renderer.restore().unwrap();
         renderer.restore().unwrap();
+        drop(renderer);
+        assert_eq!(starts(), vec![false]);
+    }
+
+    #[test]
+    fn launched_game_replaces_the_window_without_reopening_riot() {
+        let mut renderer = fixture();
+        // State after sign_in: the headless service runs a temporary renderer.
+        renderer.restore_needed = true;
+        renderer.close_debugger().unwrap();
+        renderer.replaced_by_game();
+        drop(renderer);
+        assert!(starts().is_empty());
+    }
+
+    #[test]
+    fn failed_game_launch_reopens_the_normal_client_once() {
+        let mut renderer = fixture();
+        renderer.restore_needed = true;
+        renderer.close_debugger().unwrap();
+        // The launch errors before `replaced_by_game`; the drop restores.
         drop(renderer);
         assert_eq!(starts(), vec![false]);
     }

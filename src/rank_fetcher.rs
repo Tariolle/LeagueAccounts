@@ -9,7 +9,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 mod renewal;
-use renewal::{freshness, now_ms, ProfileUpdate, RenewalState};
+use renewal::{freshness, now_ms, ProfileUpdate, RenewalError, RenewalState, MAX_AGE};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RefreshMode {
@@ -80,6 +80,7 @@ impl RankFetcher {
                     next.fetched_at = previous.fetched_at;
                     next.source_updated_at = previous.source_updated_at;
                     next.freshness = Freshness::Stale;
+                    next.fresh_until = None;
                 }
             }
         }
@@ -118,9 +119,7 @@ impl RankFetcher {
         self.fetch_page(url)
             .and_then(|body| {
                 let decoded_payload = decode_html_entities(&body).replace("\\\"", "\"");
-                if !decoded_payload.contains("profile_icons/profileIcon")
-                    || !decoded_payload.contains("\"entry\"")
-                {
+                if !decoded_payload.contains("profile_icons/profileIcon") {
                     return Err(Reason::ProfileMissing);
                 }
                 self.parse_tft_profile(&decoded_payload)
@@ -146,12 +145,14 @@ impl RankFetcher {
         let mut current: Option<serde_json::Value> = None;
         let mut current_set = None;
         let mut last_set: Option<serde_json::Value> = None;
+        let mut malformed = false;
         for found in ENTRY.find_iter(decoded_payload) {
             let Some(Ok(value)) =
                 serde_json::Deserializer::from_str(&decoded_payload[found.end()..])
                     .into_iter::<serde_json::Value>()
                     .next()
             else {
+                malformed = true;
                 continue;
             };
             if !value.is_object() {
@@ -185,7 +186,9 @@ impl RankFetcher {
             }
         }
 
-        if current.is_none() {
+        // No entry (or `"entry":null`) is a player without TFT history: Unranked.
+        // Only a truncated or unreadable entry is a parsing failure.
+        if current.is_none() && malformed {
             return Err(Reason::ProfileMissing);
         }
         let mut rank = TftRank::default();
@@ -258,10 +261,8 @@ impl RankFetcher {
         self.request_text(self.client.get(url))
     }
 
+    /// Any 429 starts the renewal cooldown; it never blocks plain profile reads.
     fn request_text(&self, request: reqwest::blocking::RequestBuilder) -> Result<String, Reason> {
-        if self.renewal.rate_limited() {
-            return Err(Reason::HttpRateLimited);
-        }
         let response = request
             .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
             .send()
@@ -293,50 +294,41 @@ impl RankFetcher {
         region: &str,
         mode: RefreshMode,
     ) -> Result<RankInfo, Reason> {
-        let mut body = self.fetch_page(url)?;
-        let mut rank = self.parse_profile(&body)?;
-        let decoded = decode_html_entities(&body).replace("\\\"", "\"");
-        let profile = ProfileUpdate::parse(&decoded);
-        let mut provenance = RankProvenance {
-            source: "OP.GG".into(),
-            fetched_at: Some(now_ms()),
-            source_updated_at: profile.as_ref().and_then(|p| p.updated_at),
-            freshness: freshness(profile.as_ref().and_then(|p| p.updated_at), mode, now_ms()),
-            ..Default::default()
-        };
+        let body = self.fetch_page(url)?;
+        let (mut rank, profile) = self.parse_document(&body)?;
+        let mut provenance = sourced_provenance(profile.as_ref().and_then(|p| p.updated_at));
         if let Some(profile) = profile.filter(|p| p.should_renew(mode, now_ms())) {
-            provenance.renewal_attempted = true;
             match self.renew_profile(url, region, &body, &profile) {
                 Ok(finished_at) => {
-                    match self.fetch_page(url).and_then(|next| {
-                        let rank = self.parse_profile(&next)?;
-                        body = next;
-                        Ok(rank)
-                    }) {
-                        Ok(next) => {
+                    provenance.renewal_attempted = true;
+                    match self
+                        .fetch_page(url)
+                        .and_then(|next| self.parse_document(&next))
+                    {
+                        Ok((next, profile)) => {
                             rank = next;
-                            let decoded = decode_html_entities(&body).replace("\\\"", "\"");
-                            provenance.fetched_at = Some(now_ms());
-                            provenance.source_updated_at =
-                                ProfileUpdate::parse(&decoded).and_then(|p| p.updated_at);
-                            provenance.freshness =
-                                freshness(provenance.source_updated_at, mode, now_ms());
+                            provenance = sourced_provenance(profile.and_then(|p| p.updated_at));
+                            provenance.renewal_attempted = true;
                             provenance.renewal_succeeded = provenance.freshness == Freshness::Fresh
                                 && provenance
                                     .source_updated_at
                                     .is_some_and(|at| at >= finished_at);
                             if !provenance.renewal_succeeded {
                                 provenance.freshness = Freshness::Stale;
+                                provenance.fresh_until = None;
                                 provenance.error = Some(RankFetchError::RenewalFailed);
                             }
                         }
                         Err(reason) => {
                             provenance.error = Some(fetch_error(reason));
                             provenance.freshness = Freshness::Stale;
+                            provenance.fresh_until = None;
                         }
                     }
                 }
-                Err(error) => {
+                Err(RenewalError::NotSent(error)) => provenance.error = Some(error),
+                Err(RenewalError::Failed(error)) => {
+                    provenance.renewal_attempted = true;
                     provenance.error = Some(error);
                 }
             }
@@ -411,6 +403,11 @@ impl RankFetcher {
 
     /// Parse a fetched document independently of the network and renewal protocol.
     pub fn parse_profile(&self, body: &str) -> Result<RankInfo, Reason> {
+        self.parse_document(body).map(|(rank, _)| rank)
+    }
+
+    /// Decode once, then read both the standing and OP.GG's update metadata.
+    fn parse_document(&self, body: &str) -> Result<(RankInfo, Option<ProfileUpdate>), Reason> {
         let decoded_payload = decode_html_entities(&body).replace("\\\"", "\"");
         if !decoded_payload.contains("profile_icons/profileIcon") {
             return Err(Reason::ProfileMissing);
@@ -421,16 +418,11 @@ impl RankFetcher {
         rank.level = self.parse_level_from_opgg(&soup, &decoded_payload);
         rank.ranked_stats = meta_description(&soup).and_then(|text| parse_ranked_stats(&text));
         rank.recent_games = parse_recent_games(&soup, body);
-        let explicitly_unranked = meta_description(&soup)
-            .is_some_and(|text| text.contains(" / Lv. ") || text.contains(" / Unranked"));
-        if rank.tier == "Unranked" && (rank.level.is_empty() || !explicitly_unranked) {
-            return Err(Reason::ProfileMissing);
-        }
         let (reached, finished) = self.parse_last_season_from_opgg(&decoded_payload);
         rank.reached_last_season = reached;
         rank.finished_last_season = finished;
         rank.riot_id_not_found = Some(false);
-        Ok(rank)
+        Ok((rank, ProfileUpdate::parse(&decoded_payload)))
     }
 
     pub fn parse_current_rank_from_opgg(&self, soup: &Html, decoded_payload: &str) -> RankInfo {
@@ -724,6 +716,21 @@ fn fetch_error(reason: Reason) -> RankFetchError {
         Reason::Timeout => RankFetchError::Timeout,
         Reason::ProfileMissing | Reason::ResponseBody => RankFetchError::ParsingFailed,
         _ => RankFetchError::ProviderUnavailable,
+    }
+}
+
+fn sourced_provenance(source_updated_at: Option<u64>) -> RankProvenance {
+    let now = now_ms();
+    let freshness = freshness(source_updated_at, now);
+    RankProvenance {
+        source: "OP.GG".into(),
+        fetched_at: Some(now),
+        source_updated_at,
+        freshness,
+        fresh_until: source_updated_at
+            .filter(|_| freshness == Freshness::Fresh)
+            .map(|at| at + MAX_AGE.as_millis() as u64),
+        ..Default::default()
     }
 }
 

@@ -245,6 +245,9 @@ function enhance(select: HTMLSelectElement): void {
   list.addEventListener("click", (event) => {
     const item = (event.target as HTMLElement).closest<HTMLElement>(".framed-dropdown-option");
     if (!item || !enabled(Number(item.dataset.index))) return;
+    // choose() re-renders the options, detaching the clicked one: the frame's label
+    // handler would no longer see it inside the dropdown and reopen it.
+    event.stopPropagation();
     choose(Number(item.dataset.index));
     close();
     current.focus();

@@ -619,6 +619,24 @@ fn open_logs_folder() -> CommandResult<()> {
         })
 }
 
+/// Windows 11 rounds undecorated windows that keep a shadow; the League client's
+/// frame is square, so opt out of DWM corner rounding. Earlier Windows ignore it.
+fn square_corners(window: &tauri::WebviewWindow) {
+    use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND};
+    let Ok(hwnd) = window.hwnd() else { return };
+    let preference = DWMWCP_DONOTROUND;
+    // SAFETY: `hwnd` is this process's live window and the attribute value is a
+    // DWM_WINDOW_CORNER_PREFERENCE that outlives the call.
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd.0,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            (&preference as *const i32).cast(),
+            size_of::<i32>() as u32,
+        );
+    }
+}
+
 fn main() {
     logging::install_panic_hook();
     // A logging failure must not prevent users from opening their accounts.
@@ -660,6 +678,19 @@ fn main() {
     });
 
     let result = tauri::Builder::default()
+        // Must come first. A second launch (shortcut, Start menu, autostart while the
+        // app is already open) exits and brings this window back instead of opening
+        // another one. An update restart starts only after the old version has exited.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if args.iter().any(|arg| arg == AUTOSTART_FLAG) {
+                return;
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             Some(vec![AUTOSTART_FLAG]),
@@ -694,6 +725,7 @@ fn main() {
         ])
         .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
+                square_corners(&window);
                 let _ = window.show();
                 if start_minimized {
                     let _ = window.minimize();
@@ -705,11 +737,17 @@ fn main() {
             updater::spawn(app.handle().clone(), Arc::clone(&shared));
             Ok(())
         })
-        .run(tauri::generate_context!());
-    if result.is_err() {
+        .build(tauri::generate_context!());
+    let Ok(app) = result else {
         logging::record(Event::AppRunFailed, Reason::Other);
         // Do not return the raw error to Rust's stderr termination handler.
         std::process::exit(1);
-    }
-    logging::record(Event::SessionEnded, Reason::None);
+    };
+    // The event loop ends the process itself, so code after `run` never executes:
+    // the last event is the only place to mark the end of the session.
+    app.run(|_app, event| {
+        if let tauri::RunEvent::Exit = event {
+            logging::record(Event::SessionEnded, Reason::None);
+        }
+    });
 }

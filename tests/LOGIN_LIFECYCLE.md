@@ -22,6 +22,8 @@ they do not read saved credentials, contact Riot, or terminate installed games.
 - `src/riot_renderer.rs` checks stale-lockfile startup, restoration when the
   selected account was already connected and no game is launched, early errors,
   cancellation, unwinding, failed startup, and existing normal/headless clients.
+  A launched game replaces the temporary renderer without reopening Riot's
+  window; a failed or cancelled launch reopens it once.
   The service-launch trace verifies that a normal window is opened before the
   initial authentication wait, including when only a headless service exists.
   Process ownership compares Windows path components: forward slashes in Riot's
@@ -62,13 +64,16 @@ expressions, or renderer command lines while inspecting these cases.
    active. The Windows job must remove that renderer and its descendants even
    though Rust cleanup cannot run. A normal replacement window is guaranteed
    only by orderly cleanup, not by a forced process termination.
-6. Verify that successful login and account switching still restore a normal
-   renderer without DevTools before game launch, and that identity verification
-   and the warning before closing another account's game still apply.
+6. Verify that the temporary renderer and its debugger are gone before game
+   launch, that no Riot window reopens while the game starts, and that a failed
+   or cancelled launch reopens a normal renderer without DevTools. Identity
+   verification and the warning before closing another account's game must
+   still apply.
 7. With forward slashes in `RiotClientInstalls.json`, sign in from both a stopped
    client and an already-open Riot window. Repeat with game launch enabled and
-   disabled. Exactly one normal Riot Client window must remain after login;
-   the old client and temporary renderer must both have exited.
+   disabled. With game launch disabled, exactly one normal Riot Client window
+   must remain after login; with it enabled, only the game client opens. The old
+   client and temporary renderer must both have exited.
 
 The automated dummy-process tests are not a substitute for these installed-client
 checks: Riot's native renderer and authentication UI are undocumented interfaces.

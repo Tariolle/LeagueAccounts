@@ -238,6 +238,12 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
       await page.keyboard.press("Enter");
       assert.equal(await page.$eval("#friend-tier", el => el.value), "Diamond");
       assert.notEqual(await page.$eval("#friend-division + .framed-dropdown", el => getComputedStyle(el).display), "none");
+      // A clicked option closes the flyout; the frame's label handler must not reopen it.
+      await page.click("#friend-tier + .framed-dropdown .framed-dropdown-current");
+      const gold = await page.$$eval("#friend-tier option", options => options.findIndex(option => option.value === "Gold"));
+      await page.click(`#friend-tier + .framed-dropdown .framed-dropdown-option[data-index="${gold}"]`);
+      assert.equal(await page.$eval("#friend-tier", el => el.value), "Gold");
+      assert.equal((await flyout("#friend-tier")).open, false);
       await page.click('[data-action="settings"]');
       await page.waitForSelector(".modal .framed-dropdown-current");
       await page.click(".modal .framed-dropdown-current");

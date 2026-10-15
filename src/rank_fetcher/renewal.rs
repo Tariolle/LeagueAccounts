@@ -8,9 +8,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const MANUAL_MAX_AGE: Duration = Duration::from_secs(120);
-pub const AUTO_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+/// Single freshness threshold for Manual and Auto; the UI ages it via `fresh_until`.
+pub const MAX_AGE: Duration = Duration::from_secs(15 * 60);
 pub const RENEWAL_TIMEOUT: Duration = Duration::from_secs(20);
+/// Waiting for a permit has its own budget so it never eats the renewal's.
+const PERMIT_WAIT: Duration = Duration::from_secs(40);
 pub const MAX_CONCURRENT_RENEWALS: usize = 2;
 const FAILED_RETRY_DELAY: Duration = Duration::from_secs(60);
 const ACTION_CACHE_MAX_AGE: Duration = Duration::from_secs(15 * 60);
@@ -166,24 +168,15 @@ impl ProfileUpdate {
         })
     }
 
-    pub fn freshness(&self, mode: RefreshMode, now: u64) -> Freshness {
-        freshness(self.updated_at, mode, now)
-    }
-
     pub fn should_renew(&self, mode: RefreshMode, now: u64) -> bool {
         self.renewable_at.is_none_or(|at| at <= now)
-            && (mode == RefreshMode::Force || self.freshness(mode, now) != Freshness::Fresh)
+            && (mode == RefreshMode::Force || freshness(self.updated_at, now) != Freshness::Fresh)
     }
 }
 
-pub(super) fn freshness(updated: Option<u64>, mode: RefreshMode, now: u64) -> Freshness {
-    let max_age = if mode == RefreshMode::Auto {
-        AUTO_MAX_AGE
-    } else {
-        MANUAL_MAX_AGE
-    };
+pub(super) fn freshness(updated: Option<u64>, now: u64) -> Freshness {
     match updated {
-        Some(at) if at <= now + 30_000 && now.saturating_sub(at) <= max_age.as_millis() as u64 => {
+        Some(at) if at <= now + 30_000 && now.saturating_sub(at) <= MAX_AGE.as_millis() as u64 => {
             Freshness::Fresh
         }
         Some(_) => Freshness::Stale,
@@ -334,6 +327,13 @@ fn parse_response(body: &str) -> Result<RenewalResponse, RankFetchError> {
     Err(RankFetchError::ParsingFailed)
 }
 
+/// Pre-flight failures mean no renewal request reached OP.GG.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RenewalError {
+    NotSent(RankFetchError),
+    Failed(RankFetchError),
+}
+
 fn remaining(deadline: Instant) -> Result<Duration, RankFetchError> {
     deadline
         .checked_duration_since(Instant::now())
@@ -439,9 +439,13 @@ impl RankFetcher {
             // A missing action or an unrecognized Flight result can indicate
             // rotated references. Refresh discovery on the next allowed attempt;
             // never replay a POST after an ambiguous timeout/server failure.
-            Err(RankFetchError::ProfileNotFound | RankFetchError::ParsingFailed) => {
+            Err(RankFetchError::ProfileNotFound) => {
                 self.renewal.invalidate_action(action);
+                // The profile page itself was just parsed; a 404 here is the
+                // action contract, not a missing profile.
+                return Err(RankFetchError::RenewalFailed);
             }
+            Err(RankFetchError::ParsingFailed) => self.renewal.invalidate_action(action),
             _ => {}
         }
         result
@@ -453,25 +457,42 @@ impl RankFetcher {
         region: &str,
         body: &str,
         profile: &ProfileUpdate,
-    ) -> Result<u64, RankFetchError> {
+    ) -> Result<u64, RenewalError> {
+        let _permit = self
+            .renewal
+            .acquire(Instant::now() + PERMIT_WAIT)
+            .map_err(RenewalError::NotSent)?;
         let deadline = Instant::now() + RENEWAL_TIMEOUT;
-        let _permit = self.renewal.acquire(deadline)?;
         if self.renewal.rate_limited() {
-            return Err(RankFetchError::RateLimited);
+            return Err(RenewalError::NotSent(RankFetchError::RateLimited));
         }
         {
             let mut attempts = self
                 .renewal
                 .attempts
                 .lock()
-                .map_err(|_| RankFetchError::ProviderUnavailable)?;
+                .map_err(|_| RenewalError::NotSent(RankFetchError::ProviderUnavailable))?;
             attempts.retain(|_, at| at.elapsed() < FAILED_RETRY_DELAY);
             if attempts.contains_key(url) {
-                return Err(RankFetchError::RenewalFailed);
+                return Err(RenewalError::NotSent(RankFetchError::RenewalFailed));
             }
             attempts.insert(url.to_owned(), Instant::now());
         }
-        let actions = self.discover_actions(body, deadline)?;
+        let actions = self
+            .discover_actions(body, deadline)
+            .map_err(RenewalError::NotSent)?;
+        self.poll_renewal(url, region, profile, &actions, deadline)
+            .map_err(RenewalError::Failed)
+    }
+
+    fn poll_renewal(
+        &self,
+        url: &str,
+        region: &str,
+        profile: &ProfileUpdate,
+        actions: &Actions,
+        deadline: Instant,
+    ) -> Result<u64, RankFetchError> {
         let mut status = self.call_update(
             url,
             &actions.renewal,
@@ -815,6 +836,12 @@ mod tests {
                 "1:{\"status\":\"RENEWAL_FINISH\"}",
                 RankFetchError::ParsingFailed,
             ),
+            // A rotated action reference is not a missing profile.
+            (
+                404,
+                "Failed to find Server Action",
+                RankFetchError::RenewalFailed,
+            ),
         ] {
             let (fetcher, url, thread) = server(vec![
                 ("GET", 200, profile(now_ms() - 3_600_000, 10)),
@@ -831,6 +858,25 @@ mod tests {
                 assert!(fetcher.renewal.rate_limited());
             }
         }
+    }
+
+    #[test]
+    fn renewal_cooldown_never_blocks_profile_reads_and_skips_are_not_attempts() {
+        let (fetcher, url, thread) = server(vec![
+            ("GET", 200, profile(now_ms() - 3_600_000, 10)),
+            ("GET", 200, profile(now_ms(), 25)),
+        ]);
+        fetcher.renewal.set_cooldown(Some(60));
+        let stale = fetcher.fetch_rank_from_url(&url, "kr", RefreshMode::Manual);
+        let fresh = fetcher.fetch_rank_from_url(&url, "kr", RefreshMode::Manual);
+        thread.join().unwrap();
+        assert_eq!((stale.lp.as_str(), fresh.lp.as_str()), ("10", "25"));
+        let provenance = stale.provenance.unwrap();
+        assert_eq!(provenance.error, Some(RankFetchError::RateLimited));
+        assert!(!provenance.renewal_attempted);
+        let provenance = fresh.provenance.unwrap();
+        assert_eq!(provenance.error, None);
+        assert!(provenance.fresh_until.is_some());
     }
 
     #[test]
@@ -859,18 +905,16 @@ mod tests {
         let profile = ProfileUpdate::parse(payload).unwrap();
         assert_eq!(profile.puuid, "full-correct-id");
         let now = profile.updated_at.unwrap() + 180_000;
-        assert!(profile.should_renew(RefreshMode::Manual, now));
+        // Manual and Auto share one threshold; only Force renews a fresh profile.
+        assert!(!profile.should_renew(RefreshMode::Manual, now));
         assert!(!profile.should_renew(RefreshMode::Auto, now));
         assert!(profile.should_renew(RefreshMode::Force, now));
+        let old = profile.updated_at.unwrap() + MAX_AGE.as_millis() as u64 + 1_000;
+        assert!(profile.should_renew(RefreshMode::Manual, old));
+        assert!(profile.should_renew(RefreshMode::Auto, old));
         assert!(!profile.should_renew(RefreshMode::Force, now - 120_000));
-        assert_eq!(
-            freshness(None, RefreshMode::Manual, now),
-            Freshness::Unknown
-        );
-        assert_eq!(
-            freshness(Some(now + 60_000), RefreshMode::Manual, now),
-            Freshness::Stale
-        );
+        assert_eq!(freshness(None, now), Freshness::Unknown);
+        assert_eq!(freshness(Some(now + 60_000), now), Freshness::Stale);
     }
 
     #[test]

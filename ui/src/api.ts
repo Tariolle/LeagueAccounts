@@ -105,6 +105,8 @@ export interface RankProvenance {
   fetchedAt: number | null;
   sourceUpdatedAt: number | null;
   freshness: "fresh" | "stale" | "unknown";
+  /** Set by the backend from its single age threshold. */
+  freshUntil: number | null;
   renewalAttempted: boolean;
   renewalSucceeded: boolean;
   error: "profile_not_found" | "rate_limited" | "provider_unavailable" | "parsing_failed" | "forbidden" | "timeout" | "renewal_failed" | null;

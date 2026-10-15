@@ -4,7 +4,7 @@ import "./login.css";
 import "./league.css";
 import "./client-controls.css";
 
-import { ApiError, accountLabel, api, events, keyId, keyOf, parseAccountLine, type AccountView, type Key, type Schedule, type Settings } from "./api";
+import { ApiError, accountLabel, api, events, keyId, keyOf, parseAccountLine, type AccountView, type Key, type RankProvenance, type Schedule, type Settings } from "./api";
 import { openLoginOverlay, type LoginOverlay } from "./login";
 import { LANGUAGES, applyStatic, errorText, lang, localizeRank, setLang, t, tierName, type Lang, type MessageKey } from "./i18n";
 import { $, closeMenu, contextMenu, esc, fragment, leave, modal, reducedMotion, toast } from "./dom";
@@ -120,16 +120,24 @@ function historyLine(account: AccountView): string {
   return `<span>${t("card.lastSeason")}</span><b>${esc(localizeRank(reached))}</b>`;
 }
 
+function provenanceOf(account: AccountView): RankProvenance | null | undefined {
+  return state.mode === "tft" ? account.tftProvenance : account.rankProvenance;
+}
+
+// A saved "fresh" state must age while the application is open or closed.
+function isFresh(data: RankProvenance | null | undefined): boolean {
+  return data?.freshness === "fresh" && data.freshUntil != null && Date.now() < data.freshUntil;
+}
+
 function cardSignature(account: AccountView, pending: boolean): string {
-  return JSON.stringify([account, state.mode, pending, lang()]);
+  return JSON.stringify([account, state.mode, pending, lang(), isFresh(provenanceOf(account))]);
 }
 
 function provenanceLine(account: AccountView): string {
-  const data = state.mode === "tft" ? account.tftProvenance : account.rankProvenance;
+  const data = provenanceOf(account);
   if (!data || !account.name || account.riotIdNotFound) return "";
   const at = data.sourceUpdatedAt;
-  // A saved "fresh" state must age while the application is closed, too.
-  const fresh = data.freshness === "fresh" && at != null && Date.now() - at <= 15 * 60_000;
+  const fresh = isFresh(data);
   const error = data.error ? t(`freshness.${data.error}`) : "";
   const label = fresh && !error
     ? t("freshness.updated", { time: new Date(at!).toLocaleTimeString(lang(), { hour: "2-digit", minute: "2-digit" }) })
@@ -902,7 +910,7 @@ function showShortcuts(): void {
     ["Ctrl + F", t("sc.search")],
     ["Ctrl + N", t("sc.add")],
     ["Ctrl + R / F5", t("sc.refresh")],
-    ["Ctrl + Shift + R / Shift + F5", `${t("sc.refresh")} (force)`],
+    ["Ctrl + Shift + R / Shift + F5", t("sc.forceRefresh")],
     ["Ctrl + 1 / 2", t("sc.mode")],
     ["Ctrl + ,", t("sc.settings")],
     [t("sc.dblclick"), t("sc.dblclickText")],
@@ -1174,15 +1182,12 @@ function onKeyDown(event: KeyboardEvent): void {
 async function wireWindow(): Promise<void> {
   const { getCurrentWindow } = await import("@tauri-apps/api/window");
   const appWindow = getCurrentWindow();
-  const buttons: Record<string, [string, () => Promise<void>]> = {
-    minimize: ["window-hide", () => appWindow.minimize()],
-    maximize: ["square", () => appWindow.toggleMaximize()],
-    close: ["x", () => appWindow.close()],
+  const actions: Record<string, () => Promise<void>> = {
+    minimize: () => appWindow.minimize(),
+    close: () => appWindow.close(),
   };
   document.querySelectorAll<HTMLButtonElement>("[data-win]").forEach((button) => {
-    const [name, run] = buttons[button.dataset.win ?? ""];
-    button.innerHTML = icon(name, name === "square" ? 12 : 15);
-    button.addEventListener("click", () => void run());
+    button.addEventListener("click", () => void actions[button.dataset.win ?? ""]());
   });
 }
 
@@ -1231,10 +1236,6 @@ const uiBusy = (): boolean =>
 
 /** Dev-only: `?scene=` opens a screen with demo data (used for README screenshots). */
 function runDemoScene(): void {
-  document.querySelectorAll<HTMLButtonElement>("[data-win]").forEach((button) => {
-    const names: Record<string, string> = { minimize: "window-hide", maximize: "square", close: "x" };
-    button.innerHTML = icon(names[button.dataset.win ?? ""], button.dataset.win === "maximize" ? 12 : 15);
-  });
   const scene = new URLSearchParams(location.search).get("scene");
   const byName = (part: string) => state.accounts.find((account) => account.name.includes(part))!;
   const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -1286,6 +1287,8 @@ async function start(): Promise<void> {
   await Promise.all([wireEvents(), wireUpdates({ busy: uiBusy }), IN_TAURI ? wireWindow() : Promise.resolve()]);
   renderSchedule();
   setInterval(renderSchedule, 1000);
+  // Cards only rebuild when their signature changes, e.g. "Updated" turning stale.
+  setInterval(renderAccounts, 30_000);
   // An update found at launch shows the update screen instead of the app.
   if (!(await launchUpdate(revealApp))) await revealApp();
   if (!IN_TAURI && import.meta.env.DEV) runDemoScene();

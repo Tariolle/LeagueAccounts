@@ -21,9 +21,9 @@ const sample: AccountView[] = [
   ["goldenboy", "Golden Boy#KR1", "KR", "256", "Lee Sin OTP", lol("Gold", "III", "76", "Gold I", "Platinum IV"), tft("Emerald", "II", "5", "Platinum II")],
   ["gm_lux", "Lux Main#EUW", "EUW", "520", "", lol("Grandmaster", "", "512", "Master 210LP"), tft("Diamond", "IV", "0", "Emerald I")],
   ["bronzie", "Bronze Spirit#TR1", "TR", "61", "", lol("Bronze", "I", "99", "Iron I"), tft("Bronze", "IV", "17")],
-  ["dev_master", "Arcane Scholar#DEV", "EUNE", "380", "Master preview", lol("Master", "", "210", "Diamond I"), tft("Challenger", "", "1040", "Grandmaster")],
-  ["dev_platinum", "Tidal Wave#DEV", "BR", "143", "Platinum preview", lol("Platinum", "II", "48", "Gold I"), tft("Grandmaster", "", "520", "Master")],
-  ["dev_iron", "First Recall#DEV", "KR", "30", "Iron preview", lol("Iron", "IV", "7", "Unranked"), tft("Silver", "II", "36", "Bronze I")],
+  ["scholarly", "Arcane Scholar#EUNE", "EUNE", "380", "TFT main", lol("Master", "", "210", "Diamond I"), tft("Challenger", "", "1040", "Grandmaster")],
+  ["tidalwave", "Tidal Wave#BR1", "BR", "143", "duo with Leo", lol("Platinum", "II", "48", "Gold I"), tft("Grandmaster", "", "520", "Master")],
+  ["firstrecall", "First Recall#KR1", "KR", "30", "fresh account", lol("Iron", "IV", "7", "Unranked"), tft("Silver", "II", "36", "Bronze I")],
 ].map(([accountId, name, regionDisplay, level, description, lolRank, tftRank]) => ({
   accountId: accountId as string,
   name: name as string,
@@ -101,10 +101,10 @@ export function installMock(): void {
     accounts.forEach((account, index) => {
       account.rankProvenance = {
         source: "OP.GG", fetchedAt: Date.now(), sourceUpdatedAt: Date.now() - (index ? 3_600_000 : 0),
-        freshness: index ? "stale" : "fresh", renewalAttempted: Boolean(index), renewalSucceeded: !index,
+        freshness: index ? "stale" : "fresh", freshUntil: index ? null : Date.now() + 15 * 60_000, renewalAttempted: Boolean(index), renewalSucceeded: !index,
         error: errors[index % errors.length],
       };
-      account.tftProvenance = { ...account.rankProvenance, freshness: "unknown", sourceUpdatedAt: null, renewalAttempted: false, renewalSucceeded: false, error: null };
+      account.tftProvenance = { ...account.rankProvenance, freshness: "unknown", freshUntil: null, sourceUpdatedAt: null, renewalAttempted: false, renewalSucceeded: false, error: null };
     });
   }
   const find = (key: Key) => accounts.find((account) => keyId(account) === keyId(key));

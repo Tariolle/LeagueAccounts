@@ -1,6 +1,6 @@
 use crate::credentials;
 use crate::logging::{self, Event, Reason};
-use crate::models::{Account, AccountKey, RankInfo, TftRank};
+use crate::models::{Account, AccountKey, RankInfo, RankProvenance, TftRank};
 use crate::rank_fetcher::RankProvider;
 use crate::utils::{accounts_file, region_display, sort_accounts};
 use serde::{Deserialize, Serialize};
@@ -358,7 +358,8 @@ impl AccountManager {
                     item.finished_last_season
                 },
                 tft: item.tft,
-                ..Account::default()
+                rank_provenance: item.rank_provenance,
+                tft_provenance: item.tft_provenance,
             };
             accounts.push(account);
         }
@@ -427,6 +428,8 @@ struct ExportAccount {
     reached_last_season: String,
     finished_last_season: String,
     tft: TftRank,
+    rank_provenance: Option<RankProvenance>,
+    tft_provenance: Option<RankProvenance>,
 }
 
 impl From<&Account> for ExportAccount {
@@ -448,6 +451,8 @@ impl From<&Account> for ExportAccount {
             reached_last_season: account.reached_last_season.clone(),
             finished_last_season: account.finished_last_season.clone(),
             tft: account.tft.clone(),
+            rank_provenance: account.rank_provenance.clone(),
+            tft_provenance: account.tft_provenance.clone(),
         }
     }
 }
@@ -486,11 +491,32 @@ struct ImportAccount {
     finished_last_season: String,
     #[serde(default)]
     tft: TftRank,
+    #[serde(default)]
+    rank_provenance: Option<RankProvenance>,
+    #[serde(default)]
+    tft_provenance: Option<RankProvenance>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_round_trips_rank_provenance() {
+        let account = Account {
+            rank_provenance: Some(RankProvenance {
+                source: "OP.GG".into(),
+                source_updated_at: Some(42),
+                ..Default::default()
+            }),
+            tft_provenance: Some(RankProvenance::default()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ExportAccount::from(&account)).unwrap();
+        let imported: ImportAccount = serde_json::from_str(&json).unwrap();
+        assert_eq!(imported.rank_provenance, account.rank_provenance);
+        assert_eq!(imported.tft_provenance, account.tft_provenance);
+    }
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -730,11 +730,17 @@ pub fn login(
         thread::sleep(POLL);
     }
     renderer::sign_in(&mut client, account_id, password, progress, cancel)?;
-    client.restore()?;
-    check_cancelled(cancel)?;
     if let Some(game) = game {
+        // The game replaces the Riot window, so do not reopen it in between.
+        // If the launch fails or is cancelled, dropping `client` reopens it.
+        client.close_debugger()?;
+        check_cancelled(cancel)?;
         progress(LoginStep::LaunchGame);
         start_game(game, account_id, cancel)?;
+        client.replaced_by_game();
+    } else {
+        client.restore()?;
+        check_cancelled(cancel)?;
     }
     progress(LoginStep::Done);
     Ok(LoginOutcome::SignedIn)
