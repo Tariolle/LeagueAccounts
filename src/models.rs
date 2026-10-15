@@ -128,7 +128,8 @@ pub struct RankInfo {
     pub lp: String,
     pub level: String,
     pub ranked_stats: Option<RankedStats>,
-    pub recent_games: Vec<RecentGame>,
+    /// None means history could not be read; Some(empty) is a successful empty result.
+    pub recent_games: Option<Vec<RecentGame>>,
     pub reached_last_season: String,
     pub finished_last_season: String,
     /// `None` when the TFT profile could not be fetched.
@@ -219,8 +220,12 @@ impl RankInfo {
             account.division = self.division.clone();
             account.lp = self.lp.clone();
             account.level = self.level.clone();
+            // A successful profile without a ranked record (for example, an
+            // unranked account after a season reset) must clear stale stats.
             account.ranked_stats = self.ranked_stats.clone();
-            account.recent_games = self.recent_games.clone();
+            if let Some(games) = &self.recent_games {
+                account.recent_games = games.clone();
+            }
             account.reached_last_season = if self.reached_last_season.is_empty() {
                 "N/A".to_owned()
             } else {
@@ -258,5 +263,54 @@ impl RankInfo {
         } else {
             account.tft_provenance = self.tft_provenance.clone();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn successful_profile_without_history_clears_stats_but_keeps_recent_games() {
+        let saved = Account {
+            ranked_stats: Some(RankedStats {
+                wins: 47,
+                losses: 33,
+                win_rate: 59,
+            }),
+            recent_games: vec![RecentGame {
+                champion: "Zeri".into(),
+                icon_url: "https://example.test/Zeri.png".into(),
+                won: true,
+            }],
+            ..Default::default()
+        };
+        let mut account = saved.clone();
+        RankInfo {
+            tier: "Diamond".into(),
+            ..Default::default()
+        }
+        .apply_to(&mut account);
+        assert_eq!(account.ranked_stats, None);
+        assert_eq!(account.recent_games, saved.recent_games);
+    }
+
+    #[test]
+    fn failed_profile_refresh_keeps_saved_ranked_stats() {
+        let saved_stats = RankedStats {
+            wins: 47,
+            losses: 33,
+            win_rate: 59,
+        };
+        let mut account = Account {
+            ranked_stats: Some(saved_stats.clone()),
+            tier: "Diamond".into(),
+            ..Default::default()
+        };
+
+        RankInfo::error().apply_to(&mut account);
+
+        assert_eq!(account.ranked_stats, Some(saved_stats));
+        assert_eq!(account.tier, "Diamond");
     }
 }

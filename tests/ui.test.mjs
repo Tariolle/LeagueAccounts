@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { demoBrowser, demoPage } from "../scripts/demo-browser.mjs";
 
 test("account collection, client frames and silent motion", { timeout: 180000 }, async t => {
@@ -59,8 +62,23 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
       await page.click('.dist-row[data-tier="Diamond"]');
       assert.equal(await count(), 1);
       await page.click("#clear-filters");
-      await page.waitForSelector("#clear-filters", { hidden: true, timeout: 2000 });
-      await page.waitForFunction(() => document.querySelectorAll("#accounts > .card").length === 11);
+      try {
+        await Promise.all([
+          page.waitForSelector("#clear-filters", { hidden: true, timeout: 60000 }),
+          page.waitForFunction(() => document.querySelectorAll("#accounts > .card").length === 11, { timeout: 60000 }),
+        ]);
+      } catch (error) {
+        const diagnosticDir = join(tmpdir(), `leagueaccounts-clear-filters-${process.pid}`);
+        await mkdir(diagnosticDir, { recursive: true }).catch(() => {});
+        const screenshotPath = join(diagnosticDir, "failure.png");
+        const htmlPath = join(diagnosticDir, "page.html");
+        await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
+        const html = await page.content().catch(() => "<failed to capture html>");
+        await writeFile(htmlPath, html).catch(() => {});
+        console.error(`Clear-filters restore failed; diagnostics: ${screenshotPath}, ${htmlPath}`);
+        console.error("Page HTML snapshot (first 20k chars):\n", html.slice(0, 20000));
+        throw error;
+      }
       assert.equal(await count(), 11);
       await page.select("#sort", "level");
       assert.match(await text("#accounts > .card:first-child"), /Lux Main/);

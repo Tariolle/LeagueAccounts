@@ -9,7 +9,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 mod renewal;
-use renewal::{freshness, now_ms, ProfileUpdate, RenewalError, RenewalState, MAX_AGE};
+use renewal::{MAX_AGE, ProfileUpdate, RenewalError, RenewalState, freshness, now_ms};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RefreshMode {
@@ -294,17 +294,18 @@ impl RankFetcher {
         region: &str,
         mode: RefreshMode,
     ) -> Result<RankInfo, Reason> {
-        let body = self.fetch_page(url)?;
+        let mut body = self.fetch_page(url)?;
         let (mut rank, profile) = self.parse_document(&body)?;
         let mut provenance = sourced_provenance(profile.as_ref().and_then(|p| p.updated_at));
         if let Some(profile) = profile.filter(|p| p.should_renew(mode, now_ms())) {
             match self.renew_profile(url, region, &body, &profile) {
                 Ok(finished_at) => {
                     provenance.renewal_attempted = true;
-                    match self
-                        .fetch_page(url)
-                        .and_then(|next| self.parse_document(&next))
-                    {
+                    match self.fetch_page(url).and_then(|next| {
+                        let parsed = self.parse_document(&next)?;
+                        body = next;
+                        Ok(parsed)
+                    }) {
                         Ok((next, profile)) => {
                             rank = next;
                             provenance = sourced_provenance(profile.and_then(|p| p.updated_at));
@@ -333,10 +334,20 @@ impl RankFetcher {
                 }
             }
         }
-        if rank.recent_games.is_empty() {
-            rank.recent_games = self
-                .fetch_recent_games_from_opgg(&body, url, region)
-                .unwrap_or_default();
+        if rank
+            .recent_games
+            .as_ref()
+            .is_none_or(|games| games.is_empty())
+        {
+            match self.fetch_recent_games_from_opgg(&body, url, region) {
+                Ok(games) => rank.recent_games = Some(games),
+                Err(_) if rank.recent_games.as_ref().is_some_and(Vec::is_empty) => {
+                    // The profile may omit the server-action contract while still
+                    // emitting an empty JSON-LD list; keep cached account history.
+                    rank.recent_games = None;
+                }
+                Err(_) => {}
+            }
         }
         rank.provenance = Some(provenance);
         Ok(rank)
@@ -774,19 +785,15 @@ fn parse_ranked_stats(description: &str) -> Option<RankedStats> {
     })
 }
 
-fn parse_recent_games(soup: &Html, body: &str) -> Vec<RecentGame> {
+fn parse_recent_games(soup: &Html, body: &str) -> Option<Vec<RecentGame>> {
     static VERSION: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"meta/images/lol/(?P<version>\d+\.\d+\.\d+)/champion/")
             .expect("valid OP.GG champion asset version regex")
     });
-    let Some(version) = VERSION
+    let version = VERSION
         .captures(body)
         .and_then(|capture| capture.name("version"))
-        .map(|capture| capture.as_str())
-    else {
-        return Vec::new();
-    };
-
+        .map(|capture| capture.as_str())?;
     static JSON_LD: LazyLock<Selector> = LazyLock::new(|| {
         Selector::parse(r#"script[type="application/ld+json"]"#).expect("valid JSON-LD selector")
     });
@@ -794,40 +801,90 @@ fn parse_recent_games(soup: &Html, body: &str) -> Vec<RecentGame> {
         let source = script.text().collect::<String>();
         let document = serde_json::from_str::<serde_json::Value>(&source).ok()?;
         recent_games_list(&document).map(|items| items.to_vec())
-    });
-    let Some(items) = items else {
-        return Vec::new();
-    };
+    })?;
+    Some(items.iter().take(10).filter_map(|entry| {
+        let game = entry.get("item")?;
+        let properties = game.get("additionalProperty")?.as_array()?;
+        let property = |name: &str| properties.iter()
+            .find(|property| property.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            .and_then(|property| property.get("value"))
+            .and_then(serde_json::Value::as_str);
+        let champion = property("champion")?.trim();
+        let won = match property("result")?.to_ascii_uppercase().as_str() {
+            "WIN" => true,
+            "LOSE" => false,
+            _ => return None,
+        };
+        let icon_key = champion_asset_key(champion)?;
+        Some(RecentGame {
+            champion: champion.to_owned(),
+            icon_url: format!("https://opgg-static.akamaized.net/meta/images/lol/{version}/champion/{icon_key}.png?image=c_crop,h_103,w_103,x_9,y_9/q_auto:good,f_webp,w_80,h_80"),
+            won,
+        })
+    }).collect())
+}
 
-    items
-        .iter()
-        .take(10)
-        .filter_map(|entry| {
-            let game = entry.get("item")?;
-            let properties = game.get("additionalProperty")?.as_array()?;
-            let property = |name: &str| {
-                properties
-                    .iter()
-                    .find(|property| property.get("name").and_then(serde_json::Value::as_str) == Some(name))
-                    .and_then(|property| property.get("value"))
-                    .and_then(serde_json::Value::as_str)
-            };
-            let champion = property("champion")?.trim();
-            let won = match property("result")?.to_ascii_uppercase().as_str() {
-                "WIN" => true,
-                "LOSE" => false,
-                _ => return None,
-            };
-            let icon_key = champion_asset_key(champion)?;
-            Some(RecentGame {
-                champion: champion.to_owned(),
-                icon_url: format!(
-                    "https://opgg-static.akamaized.net/meta/images/lol/{version}/champion/{icon_key}.png?image=c_crop,h_103,w_103,x_9,y_9/q_auto:good,f_webp,w_80,h_80"
-                ),
-                won,
+fn recent_games_list(value: &serde_json::Value) -> Option<&[serde_json::Value]> {
+    match value {
+        serde_json::Value::Object(object) => {
+            let is_recent_games = object
+                .get("@id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id.ends_with("#recent-games"));
+            let is_item_list =
+                object.get("@type").and_then(serde_json::Value::as_str) == Some("ItemList");
+            if is_recent_games && is_item_list {
+                return object
+                    .get("itemListElement")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::as_slice);
+            }
+            object.values().find_map(recent_games_list)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(recent_games_list),
+        _ => None,
+    }
+}
+
+fn champion_asset_key(name: &str) -> Option<String> {
+    let normalized = name.trim().to_ascii_lowercase();
+    let known = match normalized.as_str() {
+        "aurelion sol" => Some("AurelionSol"),
+        "bel'veth" => Some("Belveth"),
+        "cho'gath" => Some("Chogath"),
+        "dr. mundo" => Some("DrMundo"),
+        "jarvan iv" => Some("JarvanIV"),
+        "kai'sa" => Some("Kaisa"),
+        "kha'zix" => Some("Khazix"),
+        "kog'maw" => Some("KogMaw"),
+        "k'sante" => Some("KSante"),
+        "leblanc" => Some("Leblanc"),
+        "lee sin" => Some("LeeSin"),
+        "miss fortune" => Some("MissFortune"),
+        "nunu" | "nunu & willump" => Some("Nunu"),
+        "renata glasc" => Some("Renata"),
+        "rek'sai" => Some("RekSai"),
+        "tahm kench" => Some("TahmKench"),
+        "twisted fate" => Some("TwistedFate"),
+        "vel'koz" => Some("Velkoz"),
+        "wukong" | "monkey king" => Some("MonkeyKing"),
+        "xin zhao" => Some("XinZhao"),
+        _ => None,
+    };
+    if let Some(key) = known {
+        return Some(key.to_owned());
+    }
+    let key = name
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().collect::<String>() + chars.as_str()
             })
         })
-        .collect()
+        .collect::<String>();
+    (!key.is_empty() && key.len() <= 32).then_some(key)
 }
 
 struct OpggGamesPage {
@@ -904,70 +961,6 @@ fn parse_opgg_action_games(data: &[serde_json::Value]) -> Vec<RecentGame> {
         .collect()
 }
 
-fn recent_games_list(value: &serde_json::Value) -> Option<&[serde_json::Value]> {
-    match value {
-        serde_json::Value::Object(object) => {
-            let is_recent_games = object
-                .get("@id")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|id| id.ends_with("#recent-games"));
-            let is_item_list =
-                object.get("@type").and_then(serde_json::Value::as_str) == Some("ItemList");
-            if is_recent_games && is_item_list {
-                return object
-                    .get("itemListElement")
-                    .and_then(serde_json::Value::as_array)
-                    .map(Vec::as_slice);
-            }
-            object.values().find_map(recent_games_list)
-        }
-        serde_json::Value::Array(values) => values.iter().find_map(recent_games_list),
-        _ => None,
-    }
-}
-
-fn champion_asset_key(name: &str) -> Option<String> {
-    let normalized = name.trim().to_ascii_lowercase();
-    let known = match normalized.as_str() {
-        "aurelion sol" => Some("AurelionSol"),
-        "bel'veth" => Some("Belveth"),
-        "cho'gath" => Some("Chogath"),
-        "dr. mundo" => Some("DrMundo"),
-        "jarvan iv" => Some("JarvanIV"),
-        "kai'sa" => Some("Kaisa"),
-        "kha'zix" => Some("Khazix"),
-        "kog'maw" => Some("KogMaw"),
-        "k'sante" => Some("KSante"),
-        "leblanc" => Some("Leblanc"),
-        "lee sin" => Some("LeeSin"),
-        "miss fortune" => Some("MissFortune"),
-        "nunu" | "nunu & willump" => Some("Nunu"),
-        "renata glasc" => Some("Renata"),
-        "rek'sai" => Some("RekSai"),
-        "tahm kench" => Some("TahmKench"),
-        "twisted fate" => Some("TwistedFate"),
-        "vel'koz" => Some("Velkoz"),
-        "wukong" | "monkey king" => Some("MonkeyKing"),
-        "xin zhao" => Some("XinZhao"),
-        _ => None,
-    };
-    if let Some(key) = known {
-        return Some(key.to_owned());
-    }
-
-    let key = name
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            chars.next().map_or_else(String::new, |first| {
-                first.to_uppercase().collect::<String>() + chars.as_str()
-            })
-        })
-        .collect::<String>();
-    (!key.is_empty() && key.len() <= 32).then_some(key)
-}
-
 fn title_case(value: &str) -> String {
     value
         .split_whitespace()
@@ -989,17 +982,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_puuid_and_recent_game_records_from_opgg_action_payloads() {
-        let html = r#"<script type="application/ld+json">{"@graph":[{"@type":"Person","identifier":[{"name":"region","value":"ru"},{"name":"puuid","value":"public-puuid"}]}]}</script>"#;
+    fn parses_ranked_stats_and_recent_games_from_opgg_json_ld() {
+        let html = r##"
+          <meta name="description" content="Player#RU / Diamond II 75 LP / 47Win 33Lose Win rate 59%">
+          <img src="https://opgg-static.akamaized.net/meta/images/profile_icons/profileIcon6.jpg">
+          <img src="https://opgg-static.akamaized.net/meta/images/lol/16.20.1/champion/Zeri.png">
+          <script type="application/ld+json">{"@graph":[
+            {"@id":"#recent-games","@type":"ItemList","itemListElement":[
+              {"item":{"additionalProperty":[{"name":"champion","value":"Zeri"},{"name":"result","value":"WIN"}]}}
+            ]},
+            {"@type":"Person","identifier":[{"name":"puuid","value":"fixture-puuid"}]}
+          ]}</script>
+        "##;
+        let rank = RankFetcher::new().parse_profile(html).unwrap();
         let soup = Html::parse_document(html);
-        assert_eq!(opgg_puuid(&soup).as_deref(), Some("public-puuid"));
+        assert_eq!(opgg_puuid(&soup).as_deref(), Some("fixture-puuid"));
+        assert_eq!(
+            rank.ranked_stats,
+            Some(RankedStats {
+                wins: 47,
+                losses: 33,
+                win_rate: 59
+            })
+        );
+        assert_eq!(rank.recent_games.unwrap(), vec![RecentGame {
+            champion: "Zeri".into(),
+            icon_url: "https://opgg-static.akamaized.net/meta/images/lol/16.20.1/champion/Zeri.png?image=c_crop,h_103,w_103,x_9,y_9/q_auto:good,f_webp,w_80,h_80".into(),
+            won: true,
+        }]);
+        assert_eq!(parse_ranked_stats("Player / Diamond II"), None);
+        assert_eq!(
+            parse_ranked_stats("Player / 1Win 1Lose Win rate 101%"),
+            None
+        );
+    }
 
+    #[test]
+    fn parses_opgg_match_action_rows_without_accepting_unknown_results() {
         let response = concat!(
-            "0:{\"a\":\"$@1\",\"f\":\"\",\"b\":\"test\"}\n",
+            "0:{\"a\":\"$@1\",\"f\":\"\",\"b\":\"fixture\"}\n",
             "1:{\"data\":[",
             "{\"game_result\":\"VICTORY\",\"champion\":{\"name\":\"Zeri\",\"image_url\":\"https://example.test/Zeri.png\"}},",
-            "{\"game_result\":\"DEFEAT\",\"champion\":{\"name\":\"Varus\",\"image_url\":\"https://example.test/Varus.png\"}}",
-            "],\"meta\":{\"first_game_created_at\":null,\"last_game_created_at\":\"2026-09-15T19:45:01+09:00\"}}"
+            "{\"game_result\":\"DEFEAT\",\"champion\":{\"name\":\"Varus\",\"image_url\":\"https://example.test/Varus.png\"}},",
+            "{\"game_result\":\"UNKNOWN\",\"champion\":{\"name\":\"Sona\",\"image_url\":\"https://example.test/Sona.png\"}}",
+            "],\"meta\":{\"last_game_created_at\":\"2026-09-15T19:45:01+09:00\"}}"
         );
         let page = parse_opgg_action_page(response).unwrap();
         assert_eq!(

@@ -3,7 +3,7 @@
 use super::{RankFetcher, RefreshMode};
 use crate::models::{Freshness, RankFetchError};
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -730,9 +730,11 @@ mod tests {
         );
         fetcher.renewal.actions.lock().unwrap().as_mut().unwrap().at =
             Instant::now() - FAILED_RETRY_DELAY;
-        assert!(fetcher
-            .discover_actions_with(&body, deadline, |_, _| Ok(rotated_bundle()))
-            .is_ok());
+        assert!(
+            fetcher
+                .discover_actions_with(&body, deadline, |_, _| Ok(rotated_bundle()))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1013,9 +1015,11 @@ mod tests {
             Err(RankFetchError::Timeout)
         ));
         drop(first);
-        assert!(state
-            .acquire(Instant::now() + Duration::from_millis(10))
-            .is_ok());
+        assert!(
+            state
+                .acquire(Instant::now() + Duration::from_millis(10))
+                .is_ok()
+        );
         drop(second);
         state.set_cooldown(Some(60));
         assert!(state.rate_limited());

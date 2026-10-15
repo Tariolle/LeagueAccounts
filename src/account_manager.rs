@@ -1,6 +1,8 @@
 use crate::credentials;
 use crate::logging::{self, Event, Reason};
-use crate::models::{Account, AccountKey, RankInfo, RankProvenance, TftRank};
+use crate::models::{
+    Account, AccountKey, RankInfo, RankProvenance, RankedStats, RecentGame, TftRank,
+};
 use crate::rank_fetcher::RankProvider;
 use crate::utils::{accounts_file, region_display, sort_accounts};
 use serde::{Deserialize, Serialize};
@@ -423,8 +425,8 @@ struct ExportAccount {
     division: String,
     lp: String,
     level: String,
-    ranked_stats: Option<crate::models::RankedStats>,
-    recent_games: Vec<crate::models::RecentGame>,
+    ranked_stats: Option<RankedStats>,
+    recent_games: Vec<RecentGame>,
     reached_last_season: String,
     finished_last_season: String,
     tft: TftRank,
@@ -482,9 +484,9 @@ struct ImportAccount {
     #[serde(default)]
     level: String,
     #[serde(default)]
-    ranked_stats: Option<crate::models::RankedStats>,
+    ranked_stats: Option<RankedStats>,
     #[serde(default)]
-    recent_games: Vec<crate::models::RecentGame>,
+    recent_games: Vec<RecentGame>,
     #[serde(default)]
     reached_last_season: String,
     #[serde(default)]
@@ -516,6 +518,27 @@ mod tests {
         let imported: ImportAccount = serde_json::from_str(&json).unwrap();
         assert_eq!(imported.rank_provenance, account.rank_provenance);
         assert_eq!(imported.tft_provenance, account.tft_provenance);
+    }
+
+    #[test]
+    fn export_round_trips_ranked_stats_and_recent_games() {
+        let account = Account {
+            ranked_stats: Some(RankedStats {
+                wins: 47,
+                losses: 33,
+                win_rate: 59,
+            }),
+            recent_games: vec![RecentGame {
+                champion: "Zeri".into(),
+                icon_url: "https://example.test/Zeri.png".into(),
+                won: true,
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ExportAccount::from(&account)).unwrap();
+        let imported: ImportAccount = serde_json::from_str(&json).unwrap();
+        assert_eq!(imported.ranked_stats, account.ranked_stats);
+        assert_eq!(imported.recent_games, account.recent_games);
     }
     use std::cell::RefCell;
     use std::collections::HashMap;

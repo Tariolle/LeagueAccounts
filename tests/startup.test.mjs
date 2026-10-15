@@ -61,6 +61,10 @@ test("startup waits for critical assets but not lazy account images", { timeout:
         await release("module");
         await page.waitForSelector("#accounts > .card");
         assert.equal(await page.$$eval(".recent-game img[loading=lazy]", imgs => imgs.length), 10);
+        assert.equal(await page.$eval("#accounts > .card:has(.recent-games) .ranked-stats", el => el.textContent.trim()), "47W 33L · 59%");
+        assert.equal(await page.$eval("#accounts > .card:has(.recent-games) .ranked-stat-rate", el => getComputedStyle(el).color), "rgb(50, 208, 88)");
+        assert.equal(await page.$eval("#accounts > .card:has(.recent-games) .recent-game.is-win", el => getComputedStyle(el).borderTopColor), "rgb(50, 208, 88)");
+        assert.equal(await page.$eval("#accounts > .card:has(.recent-games) .recent-game.is-loss", el => getComputedStyle(el).borderTopColor), "rgb(240, 68, 73)");
         await page.waitForFunction(() => document.fonts.status === "loading");
         await assertLoading();
         await release("font");
