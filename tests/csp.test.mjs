@@ -17,6 +17,14 @@ const TYPES = {
   ".png": "image/png", ".jpg": "image/jpeg", ".svg": "image/svg+xml", ".otf": "font/otf",
 };
 
+test("the packaged CSP allows OP.GG champion portraits", () => {
+  const imgSources = config.app.security.csp.split(";")
+    .map(part => part.trim().split(/\s+/))
+    .find(([directive]) => directive === "img-src")
+    ?.slice(1) ?? [];
+  assert.ok(imgSources.includes("https://opgg-static.akamaized.net"));
+});
+
 /** Mirror tauri-utils `inject_nonce_token` and tauri's `replace_csp_nonce` for one page. */
 function asTauriServesIt(html) {
   const nonces = { "style-src": [], "script-src": [] };

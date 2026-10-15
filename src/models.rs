@@ -220,9 +220,9 @@ impl RankInfo {
             account.division = self.division.clone();
             account.lp = self.lp.clone();
             account.level = self.level.clone();
-            if let Some(stats) = &self.ranked_stats {
-                account.ranked_stats = Some(stats.clone());
-            }
+            // A successful profile without a ranked record (for example, an
+            // unranked account after a season reset) must clear stale stats.
+            account.ranked_stats = self.ranked_stats.clone();
             if let Some(games) = &self.recent_games {
                 account.recent_games = games.clone();
             }
@@ -271,7 +271,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_match_history_does_not_clear_saved_card_data() {
+    fn successful_profile_without_history_clears_stats_but_keeps_recent_games() {
         let saved = Account {
             ranked_stats: Some(RankedStats {
                 wins: 47,
@@ -291,7 +291,26 @@ mod tests {
             ..Default::default()
         }
         .apply_to(&mut account);
-        assert_eq!(account.ranked_stats, saved.ranked_stats);
+        assert_eq!(account.ranked_stats, None);
         assert_eq!(account.recent_games, saved.recent_games);
+    }
+
+    #[test]
+    fn failed_profile_refresh_keeps_saved_ranked_stats() {
+        let saved_stats = RankedStats {
+            wins: 47,
+            losses: 33,
+            win_rate: 59,
+        };
+        let mut account = Account {
+            ranked_stats: Some(saved_stats.clone()),
+            tier: "Diamond".into(),
+            ..Default::default()
+        };
+
+        RankInfo::error().apply_to(&mut account);
+
+        assert_eq!(account.ranked_stats, Some(saved_stats));
+        assert_eq!(account.tier, "Diamond");
     }
 }
