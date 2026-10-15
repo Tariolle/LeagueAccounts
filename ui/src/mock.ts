@@ -69,7 +69,7 @@ const setUpdate = (change: Partial<UpdateStatus>) => {
   listeners.status.forEach((handler) => handler(update));
 };
 /** About six seconds of simulated download, then installed. */
-function simulateInstall(launch: boolean, intervalMs = 200): void {
+function simulateInstall(launch: boolean): void {
   const total = 14_680_064;
   setUpdate({ phase: "downloading", release, received: 0, total, launch });
   const timer = setInterval(() => {
@@ -78,15 +78,17 @@ function simulateInstall(launch: boolean, intervalMs = 200): void {
     if (received < total) return;
     clearInterval(timer);
     setUpdate({ phase: "ready" });
-  }, intervalMs);
+  }, 200);
 }
 
 export function installMock(): void {
   const scene = new URLSearchParams(location.search).get("scene");
-  setTimeout(() => {
-    if (scene === "updating") simulateInstall(true);
-    else if (scene === "updating-slow") simulateInstall(true, 600);
-    else if (scene === "restart") setUpdate({ phase: "ready", release, launch: false });
+  // This scene represents an update already found at launch. Seed that state
+  // before bootstrap: a cold Vite load may consume the launch-check hold before
+  // a delayed mock timer fires. Real backend state is also read at bootstrap.
+  if (scene === "updating") simulateInstall(true);
+  else setTimeout(() => {
+    if (scene === "restart") setUpdate({ phase: "ready", release, launch: false });
     else setUpdate({ phase: "upToDate", release: { ...release, version: "3.0.3" } });
   }, scene === "restart" ? 1500 : 300);
   let accounts = structuredClone(sample);
