@@ -293,6 +293,16 @@ impl Renderer {
         self.restore_needed = false;
         Ok(())
     }
+
+    /// Bring the normal Riot window forward for a step that needs the player.
+    pub(super) fn show(&mut self) -> Result<(), LoginError> {
+        if self.restore_needed {
+            return self.restore();
+        }
+        // An already signed-in client has no temporary renderer to replace;
+        // starting the service again opens or raises its normal window.
+        (self.service_start)(&self.service, false)
+    }
 }
 
 impl Drop for Renderer {
@@ -604,6 +614,26 @@ mod tests {
         // The already-signed-in path finishes before any debug renderer exists.
         renderer.restore().unwrap();
         renderer.restore().unwrap();
+        drop(renderer);
+        assert_eq!(starts(), vec![false]);
+    }
+
+    #[test]
+    fn a_step_that_needs_the_player_shows_the_normal_client_once() {
+        // Already signed in: the existing client is brought forward.
+        let mut renderer = fixture();
+        renderer.ensure_service_with(true, true, &AtomicBool::new(false)).unwrap();
+        renderer.show().unwrap();
+        drop(renderer);
+        assert_eq!(starts(), vec![false]);
+
+        // After sign_in: the temporary renderer is replaced by a normal one,
+        // which the game launch then leaves alone.
+        let mut renderer = fixture();
+        renderer.restore_needed = true;
+        renderer.show().unwrap();
+        renderer.close_debugger().unwrap();
+        renderer.replaced_by_game();
         drop(renderer);
         assert_eq!(starts(), vec![false]);
     }
