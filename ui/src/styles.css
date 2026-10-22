@@ -872,11 +872,11 @@ code {
 }
 .ranked-stat-win,
 .ranked-stat-rate.is-positive {
-  color: #6eb58a;
+  color: #3fb950;
 }
 .ranked-stat-loss,
 .ranked-stat-rate.is-negative {
-  color: #cb6f76;
+  color: #f85149;
 }
 .ranked-stat-rate:not(.is-positive, .is-negative) {
   color: var(--muted);
@@ -905,8 +905,8 @@ code {
   border-radius: 4px;
   background: var(--panel-solid);
 }
-.recent-game.is-win { border-color: #6eb58a; }
-.recent-game.is-loss { border-color: #cb6f76; }
+.recent-game.is-win { border-color: #3fb950; }
+.recent-game.is-loss { border-color: #f85149; }
 .recent-game img {
   display: block;
   width: 100%;
