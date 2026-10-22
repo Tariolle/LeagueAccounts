@@ -4,7 +4,7 @@ import "./login.css";
 import "./league.css";
 import "./client-controls.css";
 
-import { ApiError, accountLabel, api, events, keyId, keyOf, parseAccountLine, type AccountView, type Key, type RankProvenance, type Schedule, type Settings } from "./api";
+import { ApiError, accountLabel, api, events, keyId, keyOf, parseAccountLine, type AccountView, type Ban, type Key, type Schedule, type Settings } from "./api";
 import { openLoginOverlay, type LoginOverlay } from "./login";
 import { LANGUAGES, applyStatic, errorText, lang, localizeRank, setLang, t, tierName, type Lang, type MessageKey } from "./i18n";
 import { $, closeMenu, contextMenu, esc, fragment, leave, modal, reducedMotion, toast } from "./dom";
@@ -120,30 +120,34 @@ function historyLine(account: AccountView): string {
   return `<span>${t("card.lastSeason")}</span><b>${esc(localizeRank(reached))}</b>`;
 }
 
-function provenanceOf(account: AccountView): RankProvenance | null | undefined {
-  return state.mode === "tft" ? account.tftProvenance : account.rankProvenance;
-}
-
-// A saved "fresh" state must age while the application is open or closed.
-function isFresh(data: RankProvenance | null | undefined): boolean {
-  return data?.freshness === "fresh" && data.freshUntil != null && Date.now() < data.freshUntil;
-}
-
 function cardSignature(account: AccountView, pending: boolean): string {
-  return JSON.stringify([account, state.mode, pending, lang(), isFresh(provenanceOf(account))]);
+  return JSON.stringify([account, state.mode, pending, lang(), banChip(account)]);
 }
 
-function provenanceLine(account: AccountView): string {
-  const data = provenanceOf(account);
-  if (!data || !account.name || account.riotIdNotFound) return "";
-  const at = data.sourceUpdatedAt;
-  const fresh = isFresh(data);
-  const error = data.error ? t(`freshness.${data.error}`) : "";
-  const label = fresh && !error
-    ? t("freshness.updated", { time: new Date(at!).toLocaleTimeString(lang(), { hour: "2-digit", minute: "2-digit" }) })
-    : t(data.freshness === "unknown" && !error ? "freshness.unknown" : "freshness.stale");
-  const detail = [at != null ? new Date(at).toLocaleString(lang()) : t("freshness.unknown"), error].filter(Boolean).join(" · ");
-  return `<div class="rank-provenance${error ? " has-error" : ""}" data-tooltip="${esc(detail)}">${esc(label)} · ${esc(data.source)}${error ? ` · ${esc(error)}` : ""}</div>`;
+/** The suspension still in force; a timed one disappears once it ends. */
+function activeBan(account: AccountView): Ban | null {
+  const ban = account.ban;
+  return ban && (ban.until == null || ban.until > Date.now()) ? ban : null;
+}
+
+function banRemaining(until: number): string {
+  const minutes = Math.max(1, Math.ceil((until - Date.now()) / 60_000));
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor((minutes % 1440) / 60);
+  if (days) return t("ban.days", { d: days, h: hours });
+  if (hours) return t("ban.hours", { h: hours, m: minutes % 60 });
+  return t("ban.minutes", { m: minutes });
+}
+
+const banEnd = (until: number): string =>
+  new Date(until).toLocaleString(lang(), { dateStyle: "medium", timeStyle: "short" });
+
+function banChip(account: AccountView): string {
+  const ban = activeBan(account);
+  if (!ban) return "";
+  const label = ban.until == null ? t("ban.permanent") : t("ban.chip", { time: banRemaining(ban.until) });
+  const detail = ban.until == null ? t("ban.permanent") : t("ban.until", { date: banEnd(ban.until) });
+  return `<span class="chip chip-ban" data-tooltip="${esc(detail)}">${icon("alert", 11)}${esc(label)}</span>`;
 }
 
 function recentGamesLine(account: AccountView): string {
@@ -175,6 +179,7 @@ function cardInner(account: AccountView, pending: boolean): string {
         <div class="meta">
           <span class="chip chip-region">${esc(account.regionDisplay)}</span>
           ${account.level ? `<span class="chip chip-level">${esc(t("card.level"))} <b>${esc(account.level)}</b></span>` : ""}
+          ${banChip(account)}
           <span class="acc-id" data-tooltip="${esc(t("card.accountId"))}">${icon("users", 12)}${esc(account.accountId)}</span>
         </div>
       </div>
@@ -192,7 +197,7 @@ function cardInner(account: AccountView, pending: boolean): string {
       `}
       </div>
     </div>
-    ${account.name && !account.riotIdNotFound ? `<div class="history"><span class="history-rank">${historyLine(account)}</span>${stats}${provenanceLine(account)}${recentGamesLine(account)}</div>` : ""}
+    ${account.name && !account.riotIdNotFound ? `<div class="history"><span class="history-rank">${historyLine(account)}</span>${stats}${recentGamesLine(account)}</div>` : ""}
     ${account.description ? `<p class="desc" data-tooltip="${esc(account.description)}">${esc(account.description)}</p>` : `<p class="desc desc-empty"></p>`}
     <div class="card-actions">
       <button class="btn btn-play" data-act="login" data-tooltip="${esc(t("card.loginTitle"))}">${icon("login", 15)}${esc(t("card.login"))}</button>
@@ -210,6 +215,7 @@ function updateCard(element: HTMLElement, account: AccountView): void {
   element.style.setProperty("--tier-light", colors.light);
   element.style.setProperty("--tier-dark", colors.dark);
   element.classList.toggle("selected", state.selected === id);
+  element.classList.toggle("banned", activeBan(account) !== null);
   element.classList.toggle("apex", APEX.has(normalizeTier(rankOf(account, state.mode).tier)));
   if (element.dataset.signature === signature) return;
   const wasPending = element.dataset.pending === "1";
@@ -382,18 +388,39 @@ async function confirmCloseLeague(account: AccountView, inGame: boolean): Promis
   return answer === "close";
 }
 
+/** Ask before signing in to an account Riot reported as banned. */
+async function confirmBannedLogin(account: AccountView, ban: Ban): Promise<boolean> {
+  const name = accountLabel(account);
+  const text = ban.until == null
+    ? t("ban.permanentText", { name })
+    : t("ban.text", { name, date: banEnd(ban.until), time: banRemaining(ban.until) });
+  const answer = await modal({
+    title: t("ban.title"),
+    body: `<div class="warning danger">${icon("alert", 18)}<p>${esc(text)}</p></div>`,
+    actions: [
+      { label: t("common.cancel"), value: "cancel" },
+      { label: t("ban.confirm"), value: "login", kind: "danger" },
+    ],
+  });
+  return answer === "login";
+}
+
 async function login(account: AccountView): Promise<void> {
   if (loginBusy) return;
   loginBusy = true;
   try {
-    await runLogin(account);
+    // A banned account can still sign in to the Riot Client; only the game disconnects.
+    const launching = state.settings?.loginMethod !== "previous" && Boolean(state.settings?.launchGame);
+    const ban = launching ? activeBan(account) : null;
+    if (ban && !(await confirmBannedLogin(account, ban))) return;
+    await runLogin(account, false, ban !== null);
   } finally {
     loginBusy = false;
     activeLogin = null;
   }
 }
 
-async function runLogin(account: AccountView, closeRunning = false): Promise<void> {
+async function runLogin(account: AccountView, closeRunning = false, launchBanned = false): Promise<void> {
   const viaRiot = state.settings?.loginMethod !== "previous";
   const key = keyOf(account);
 
@@ -403,7 +430,7 @@ async function runLogin(account: AccountView, closeRunning = false): Promise<voi
     if (!status) return;
     if ((status.clientOpen || status.inGame) && !status.sameAccount) {
       if (!(await confirmCloseLeague(account, status.inGame))) return;
-      return runLogin(account, true);
+      return runLogin(account, true, launchBanned);
     }
   }
 
@@ -418,11 +445,11 @@ async function runLogin(account: AccountView, closeRunning = false): Promise<voi
   });
   activeLogin = overlay;
   try {
-    const result = await api.login(key, state.mode === "tft", closeRunning);
+    const result = await api.login(key, state.mode === "tft", closeRunning, launchBanned);
     if (result === "signedIn") {
-      overlay.succeed(t("login.success"), launching ? t("toast.launchingGame") : accountLabel(account));
+      overlay.succeed(t("login.success"), launching ? t("toast.gameLaunched") : accountLabel(account));
     } else if (result === "alreadySignedIn") {
-      overlay.succeed(t("toast.alreadySignedIn"), launching ? t("toast.launchingGame") : accountLabel(account));
+      overlay.succeed(t("toast.alreadySignedIn"), launching ? t("toast.gameLaunched") : accountLabel(account));
     } else if (result === "typed") {
       if (viaRiot) overlay.finishInClient();
       else overlay.succeed(t("toast.loggedIn"), accountLabel(account));
@@ -430,11 +457,18 @@ async function runLogin(account: AccountView, closeRunning = false): Promise<voi
   } catch (error) {
     if (error instanceof ApiError && error.code === "login_cancelled") {
       overlay.close();
+    } else if (error instanceof ApiError && error.code === "account_banned") {
+      // Riot reported the ban after sign-in; the game was not started.
+      const until = Number(error.detail) || null;
+      overlay.fail(
+        until == null ? t("ban.stoppedPermanent") : t("ban.stopped", { date: banEnd(until), time: banRemaining(until) }),
+        t("ban.title"),
+      );
     } else if (error instanceof ApiError && error.code === "league_running") {
       // The client was opened between the check and the login: ask again.
       overlay.close();
       activeLogin = null;
-      return runLogin(account, false);
+      return runLogin(account, false, launchBanned);
     } else {
       overlay.fail(describe(error));
     }
@@ -587,30 +621,14 @@ async function openSettings(): Promise<void> {
     title: t("settings.title"),
     wide: true,
     body: `
+      <div class="settings-grid">
+      <div class="settings-col">
       <section class="settings-section">
         <h3>${esc(t("settings.general"))}</h3>
         <label class="field inline"><span>${esc(t("settings.language"))}</span>
           <div class="select-wrap"><select name="language">${languageOptions}</select></div></label>
-        ${toggle("launchAtStartup", current.launchAtStartup, t("settings.startup"), t("settings.startupHint"))}
+        ${toggle("launchAtStartup", current.launchAtStartup, t("settings.startup"))}
         ${toggle("startMinimized", current.startMinimized, t("settings.minimized"), t("settings.minimizedHint"))}
-      </section>
-      <section class="settings-section">
-        <h3>${esc(t("settings.refresh"))}</h3>
-        ${toggle("autoRefresh", current.autoRefresh, t("settings.autoRefresh"))}
-        <div class="interval-row">
-          <span>${esc(t("settings.interval"))}</span>
-          <div class="interval-presets">${[5, 15, 30, 60, 120].map((value) => `<button type="button" data-interval="${value}">${value}</button>`).join("")}</div>
-          <label class="interval-input"><input name="intervalMinutes" type="number" min="5" max="1440" step="5" value="${current.intervalMinutes}"/><span>${esc(t("settings.minutes"))}</span></label>
-        </div>
-        <p class="hint">${esc(t("settings.intervalHint", { min: 5, max: 1440 }))}</p>
-      </section>
-      <section class="settings-section">
-        <h3>${esc(t("settings.login"))}</h3>
-        <label class="radio-row"><input type="radio" name="loginMethod" value="riot" ${current.loginMethod === "riot" ? "checked" : ""}/>
-          <span class="toggle-text"><strong>${esc(t("settings.methodRiot"))}</strong><span>${esc(current.riotClientFound ? t("settings.methodRiotHint") : t("settings.clientMissing"))}</span></span></label>
-        <label class="radio-row"><input type="radio" name="loginMethod" value="previous" ${current.loginMethod === "previous" ? "checked" : ""}/>
-          <span class="toggle-text"><strong>${esc(t("settings.methodPrevious"))}</strong><span>${esc(t("settings.methodPreviousHint"))}</span></span></label>
-        ${toggle("launchGame", current.launchGame, t("settings.launchGame"), t("settings.launchGameHint"))}
       </section>
       <section class="settings-section">
         <h3>${esc(t("settings.updates"))}</h3>
@@ -620,7 +638,28 @@ async function openSettings(): Promise<void> {
           <span class="update-result"></span>
           <button type="button" class="btn btn-ghost" data-check-update>${icon("refresh-cw", 14)}${esc(t("settings.checkNow"))}</button>
         </div>
-      </section>`,
+      </section>
+      </div>
+      <div class="settings-col">
+      <section class="settings-section">
+        <h3>${esc(t("settings.refresh"))}</h3>
+        ${toggle("autoRefresh", current.autoRefresh, t("settings.autoRefresh"))}
+        <div class="interval-row">
+          <span>${esc(t("settings.interval"))}</span>
+          <div class="interval-presets">${[5, 15, 30, 60, 120].map((value) => `<button type="button" data-interval="${value}">${value}</button>`).join("")}</div>
+          <label class="interval-input"><input name="intervalMinutes" type="number" min="5" max="1440" step="5" value="${current.intervalMinutes}"/><span>${esc(t("settings.minutes"))}</span></label>
+        </div>
+      </section>
+      <section class="settings-section">
+        <h3>${esc(t("settings.login"))}</h3>
+        <label class="radio-row"><input type="radio" name="loginMethod" value="riot" ${current.loginMethod === "riot" ? "checked" : ""}/>
+          <span class="toggle-text"><strong>${esc(t("settings.methodRiot"))}</strong><span>${esc(current.riotClientFound ? t("settings.methodRiotHint") : t("settings.clientMissing"))}</span></span></label>
+        <label class="radio-row"><input type="radio" name="loginMethod" value="previous" ${current.loginMethod === "previous" ? "checked" : ""}/>
+          <span class="toggle-text"><strong>${esc(t("settings.methodPrevious"))}</strong><span>${esc(t("settings.methodPreviousHint"))}</span></span></label>
+        ${toggle("launchGame", current.launchGame, t("settings.launchGame"), t("settings.launchGameHint"))}
+      </section>
+      </div>
+      </div>`,
     actions: [
       { label: t("common.cancel"), value: "cancel" },
       { label: t("common.save"), value: "save", kind: "primary" },
@@ -1184,11 +1223,22 @@ async function wireWindow(): Promise<void> {
   const appWindow = getCurrentWindow();
   const actions: Record<string, () => Promise<void>> = {
     minimize: () => appWindow.minimize(),
+    maximize: () => appWindow.toggleMaximize(),
     close: () => appWindow.close(),
   };
   document.querySelectorAll<HTMLButtonElement>("[data-win]").forEach((button) => {
     button.addEventListener("click", () => void actions[button.dataset.win ?? ""]());
   });
+  // Maximize turns into restore while maximized, including after a title bar double-click.
+  const maximize = $<HTMLButtonElement>('[data-win="maximize"]');
+  const sync = async () => {
+    const maximized = await appWindow.isMaximized();
+    maximize.classList.toggle("is-maximized", maximized);
+    maximize.dataset.i18nAria = maximized ? "win.restore" : "win.maximize";
+    applyStatic(maximize.parentElement!);
+  };
+  void sync();
+  void appWindow.onResized(() => void sync());
 }
 
 async function wireEvents(): Promise<void> {
@@ -1214,6 +1264,10 @@ async function wireEvents(): Promise<void> {
     renderAccounts();
     renderDistribution();
     renderSchedule();
+  });
+  await events.onAccountUpdate((account) => {
+    upsert(account);
+    renderAccounts();
   });
   await events.onRefreshDone(({ error, exclusive }) => {
     if (error) toast("error", t("toast.ranksSaveFailed"), describe(new ApiError(error.code, error.detail)), 5000);
@@ -1250,6 +1304,8 @@ function runDemoScene(): void {
     if (scene === "settings") void openSettings();
     if (scene === "add") openAddDrawer();
     if (scene === "login") void login(byName("Hextech"));
+    // The mock bans Kebab Enjoyer: logging in asks first, with the time left.
+    if (scene === "banned") void login(byName("Kebab"));
     if (scene === "update") showUpdateBanner({ version: "3.1.0", name: "v3.1.0", url: "", notes: "", publishedAt: "" }, true);
     if (scene === "menu") {
       const card = document.querySelector<HTMLElement>("#accounts > .card:nth-child(2)")!;

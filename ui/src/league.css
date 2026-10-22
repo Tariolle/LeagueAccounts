@@ -93,7 +93,8 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .search { min-width: 160px; }
 .search input { font-size: 13px; }
 .view-toggle { padding: 2px; }
-.view-toggle button { height: 30px; width: 28px; border-radius: 0; }
+/* Stretch to the 32px box's inner height; a fixed 30px overflowed it by 4px. */
+.view-toggle button { height: auto; width: 28px; border-radius: 0; }
 .view-toggle button.active { color: #dfc690; background: #c8aa6e19; }
 .btn { border-radius: 0; font-family: Beaufort, serif; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; font-size: 12px; }
 .btn-primary { color: #e6d4a9; border: 1px solid #a68b53; background: linear-gradient(180deg, #31332a, #171e20); box-shadow: inset 0 0 0 1px #050c14; }
@@ -121,6 +122,9 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .chip-region { color: #a6b3b7; padding: 1px 5px; border: 1px solid #4c5a60; }
 .chip-level { color: #93a3ab; }
 .chip-level b { color: #d6cdb9; font-weight: 600; margin-left: 2px; }
+.chip-ban { display: inline-flex; align-items: center; gap: 3px; color: #e8a49b; padding: 1px 5px; border: 1px solid #8f3a33; background: #c2433a1a; }
+.chip-ban .icon { --icon-size: 11px; color: #e06d62; }
+.card.banned .emblem-wrap { filter: grayscale(.85) brightness(.75); }
 .acc-id { color: #738891; font-size: 10px; margin-left: auto; }
 .acc-id .icon { display: none; }
 .card-more { margin: -6px -9px 0 0; width: 25px; height: 28px; opacity: .65; color: #9eacb1; }
@@ -150,9 +154,6 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .history b { font-weight: 400; color: #f0e6d2; }
 .card:has(.recent-games) .desc-empty { display: none; }
 .card:has(.recent-games) .card-actions { margin-top: 4px; }
-.rank-provenance { font-size: 10px; line-height: 1.4; color: #a09b8c; margin-top: 4px; overflow-wrap: anywhere; width: 100%; }
-.rank-provenance.has-error { color: #e4bd75; }
-.accounts.list .rank-provenance { max-width: 190px; flex-shrink: 1; }
 .desc { margin: 5px 0 10px; min-height: 14px; height: 14px; font-size: 11px; font-style: normal; color: #a09b8c; }
 .card-actions { gap: 7px; }
 .btn-play { height: 33px; border: 1px solid #517274; border-radius: 0; background: linear-gradient(180deg, #17333a, #10232c); color: #bfe1db; font-size: 11px; letter-spacing: .12em; }
@@ -235,11 +236,11 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 /* Client settings: section titles 14/18 700 caps; selects stacked under their label
    ("Window Size": 232px framed dropdown). */
 .settings-section h3 { font-family: Beaufort, serif; font-size: 14px; line-height: 18px; font-weight: 700; letter-spacing: .075em; text-transform: uppercase; color: #f0e6d2; }
-.settings-section .field.inline { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.settings-section .field.inline { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; padding: 4px 0; }
 .settings-section .field.inline > span { font: 12px/16px Spiegel, sans-serif; letter-spacing: .025em; color: #a09b8c; }
-.settings-section .field.inline .select-wrap { width: 232px; height: 32px; }
+.settings-section .field.inline .select-wrap { width: 180px; height: 32px; }
 .interval-row > span { font-size: 12px; font-weight: 400; letter-spacing: .1em; color: #a09b8c; }
-.settings-section .hint { font-size: 10px; font-weight: 700; letter-spacing: .025em; color: #c89b3c; }
+.settings-section .hint { font-size: 11px; letter-spacing: .025em; color: #7d786c; }
 .menu { border-radius: 0; background: #0c1b25; border-color: #756440; box-shadow: 0 12px 35px #0008; }
 .menu-item { border-radius: 0; }
 .menu-item:hover { background: #c8aa6e14; }
@@ -251,15 +252,16 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .login-orbit { width: 280px; height: 220px; margin: 0 auto 22px; background: radial-gradient(ellipse, #c8aa6e0b, transparent 68%); }
 .login-emblem { animation: none; filter: none; }
 .login-emblem .emblem { --emblem-size: 240px !important; }
+/* The animation fills only the middle of its canvas: oversize it so the drawing matches the crest it gives way to. */
+.login-loader { position: absolute; top: 50%; left: 50%; translate: -50% -50%; width: 520px; aspect-ratio: 1; pointer-events: none; }
 .login-title { font-size: 27px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: #f0e6d2; }
 .login-account { color: #bfac83; margin: 12px 0 0; font-size: 16px; }
 .login-details { border-left: 1px solid #c8aa6e36; padding-left: 35px; }
 .login-steps li { border-radius: 0; padding: 8px 10px; font-size: 13px; }
 .login-steps li.active { background: linear-gradient(90deg, #c8aa6e14, transparent); color: #e7d8b4; }
 .login-steps li.done .step-icon { background: #24524c; color: #9cdbcd; }
-.login-steps li.skipped { opacity: .58; }
 .login-overlay.is-success .login-title { color: #bde6d6; }
-.login-overlay.is-success .login-emblem { animation: crest-settle .5s var(--ease) both; }
+.login-overlay:is(.is-success, .is-info, .is-error) .login-emblem { animation: crest-settle .5s var(--ease) both; }
 .login-message { text-align: left; font-size: 13px; }
 .login-actions { justify-content: flex-end; }
 @keyframes crest-settle { from { opacity: .5; transform: translateY(5px); } }
@@ -282,6 +284,7 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
   .side-link { padding-top: 5px; padding-bottom: 5px; }
   .collection-header { padding-top: 23px; padding-bottom: 20px; }
   .login-orbit { height: 185px; }
+  .login-loader { width: 440px; }
   .login-steps li { padding-top: 5px; padding-bottom: 5px; }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -309,6 +312,7 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
   .login-stage { grid-template-columns: minmax(0,1fr); gap: 24px; width: 440px; max-width: 100%; }
   .login-orbit { height: 110px; margin-bottom: 10px; }
   .login-emblem .emblem { --emblem-size: 130px !important; }
+  .login-loader { width: 280px; }
   .login-details { padding-left: 0; border: 0; }
 }
 

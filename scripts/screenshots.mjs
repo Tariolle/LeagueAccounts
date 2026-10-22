@@ -16,15 +16,22 @@ const { version } = JSON.parse(readFileSync("package.json", "utf8"));
 // and show the release version instead of the mock's.
 async function capturePage(browser, base, scene) {
   const page = await demoPage(browser, base, scene);
+  // GitHub's Windows runners turn animations off, which Chrome reports as
+  // reduced motion; the login loader would then hold a single frame.
+  await page.emulateMediaFeatures([{ name: "prefers-reduced-motion", value: "no-preference" }]);
   await page.evaluate((version) => {
     document.getElementById("dev-tools").hidden = true;
     document.getElementById("version").textContent = `v${version}`;
+    // Settings may already be open, showing the mock's version.
+    for (const row of document.querySelectorAll(".update-row > span:first-child")) {
+      row.textContent = row.textContent.replace(/\d[\w.-]*$/, version);
+    }
   }, version);
   return page;
 }
 
 // Static screens: scene -> wait for animations to settle.
-const STILLS = { tft: 1000, list: 1000, settings: 1000, add: 1000, menu: 1000 };
+const STILLS = { banned: 1000, list: 1000, settings: 1000, add: 1000, menu: 1000 };
 
 // Headless screencasts have no mouse pointer; draw one so viewers can follow the clicks.
 // It lives in the top layer so dropdown flyouts don't cover it.
@@ -48,7 +55,8 @@ async function showPointer(page) {
     }, true);
     document.addEventListener("click", () => setTimeout(raise, 0), true);
   });
-  await page.mouse.move(700, 560);
+  // Rest on the empty header so no card starts highlighted.
+  await page.mouse.move(700, 110);
 }
 
 async function clickAt(page, selector, { steps = 18, dwell = 350 } = {}) {

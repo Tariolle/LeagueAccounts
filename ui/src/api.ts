@@ -127,6 +127,12 @@ export interface AccountView {
   hasPassword: boolean;
   lol: LolRank;
   tft: TftRank;
+  /** League suspension reported at the last Riot sign-in; `until` is null when permanent. */
+  ban?: Ban | null;
+}
+
+export interface Ban {
+  until: number | null;
 }
 
 export const accountLabel = (account: AccountView): string => account.name || account.accountId;
@@ -226,8 +232,9 @@ export const api = {
   refreshRanks: (force = false) => call<number>("refresh_ranks", { force }),
   copyAccountId: (key: Key) => call<void>("copy_account_id", { key }),
   copyPassword: (key: Key) => call<number>("copy_password", { key }),
-  login: (key: Key, tft: boolean, closeRunning: boolean) =>
-    call<LoginResult>("login", { key, tft, closeRunning }),
+  /** `launchBanned` launches the game even if Riot reports a League ban. */
+  login: (key: Key, tft: boolean, closeRunning: boolean, launchBanned: boolean) =>
+    call<LoginResult>("login", { key, tft, closeRunning, launchBanned }),
   cancelLogin: () => call<void>("cancel_login"),
   gameStatus: (key: Key) => call<GameStatus>("game_status", { key }),
   updateStatus: () => call<UpdateStatus>("update_status"),
@@ -259,4 +266,6 @@ export const events = {
     listen<AccountView>("rank-update", (event) => handler(event.payload)),
   onRefreshDone: (handler: (done: RefreshDone) => void): Promise<UnlistenFn> =>
     listen<RefreshDone>("refresh-done", (event) => handler(event.payload)),
+  onAccountUpdate: (handler: (account: AccountView) => void): Promise<UnlistenFn> =>
+    listen<AccountView>("account-update", (event) => handler(event.payload)),
 };

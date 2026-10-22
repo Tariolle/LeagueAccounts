@@ -5,14 +5,18 @@
 mod renderer;
 
 use crate::logging::{self, Event, Reason};
+use crate::models::Ban;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Allow cold starts and client updates without relaxing login readiness.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(120);
+/// Time the player has for steps Riot asks for before the game, as for
+/// confirming the sign-in.
+const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 const POLL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +106,8 @@ pub enum LoginError {
     Timeout,
     /// Signing out of the current session is not available.
     SignOutFailed,
+    /// The Riot session signed out before the game could be launched.
+    SessionEnded,
     RendererFailed,
     AuthRejected,
     CaptchaRejected,
@@ -118,6 +124,8 @@ pub enum LoginError {
     GameLaunchFailed,
     /// Riot or League reports a different account during launch.
     AccountMismatch,
+    /// Riot reports a League suspension; the game would disconnect at once.
+    Banned(Ban),
     WorkerPanicked,
 }
 
@@ -128,6 +136,7 @@ impl LoginError {
             LoginError::LaunchFailed => "riot_launch_failed",
             LoginError::Timeout => "riot_timeout",
             LoginError::SignOutFailed => "riot_sign_out_failed",
+            LoginError::SessionEnded => "riot_session_ended",
             LoginError::RendererFailed => "riot_renderer_failed",
             LoginError::AuthRejected => "riot_auth_rejected",
             LoginError::CaptchaRejected => "riot_captcha_rejected",
@@ -138,6 +147,7 @@ impl LoginError {
             LoginError::CloseFailed => "league_close_failed",
             LoginError::GameLaunchFailed => "game_launch_failed",
             LoginError::AccountMismatch => "game_account_mismatch",
+            LoginError::Banned(_) => "account_banned",
             LoginError::WorkerPanicked => "autotype_failed",
         }
     }
@@ -165,6 +175,7 @@ pub fn record_login_result(result: &Result<LoginOutcome, LoginError>) {
                 LoginError::LaunchFailed => Reason::LaunchFailed,
                 LoginError::Timeout => Reason::Timeout,
                 LoginError::SignOutFailed => Reason::SignOutFailed,
+                LoginError::SessionEnded => Reason::SessionEnded,
                 LoginError::RendererFailed => Reason::RendererFailed,
                 LoginError::AuthRejected => Reason::AuthRejected,
                 LoginError::CaptchaRejected => Reason::CaptchaRejected,
@@ -175,6 +186,7 @@ pub fn record_login_result(result: &Result<LoginOutcome, LoginError>) {
                 LoginError::CloseFailed => Reason::CloseFailed,
                 LoginError::GameLaunchFailed => Reason::GameLaunchFailed,
                 LoginError::AccountMismatch => Reason::AccountMismatch,
+                LoginError::Banned(_) => Reason::AccountBanned,
                 LoginError::WorkerPanicked => Reason::WorkerPanicked,
             },
         ),
@@ -225,10 +237,10 @@ fn launch_game(game: Game, account_id: &str, cancel: &AtomicBool) -> Result<(), 
         || {
             let Some(api) = LocalApi::read().filter(|api| api.session() == Session::SignedIn)
             else {
-                return Ok(false);
+                return Ok(Launch::Rejected);
             };
             let Some(name) = api.username() else {
-                return Ok(false);
+                return Ok(Launch::Rejected);
             };
             check_cancelled(cancel)?;
             if !name.eq_ignore_ascii_case(account_id) {
@@ -240,11 +252,22 @@ fn launch_game(game: Game, account_id: &str, cancel: &AtomicBool) -> Result<(), 
     )
 }
 
+/// Riot answers a launch request only once the game process exists, which
+/// can take half a minute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Launch {
+    Accepted,
+    /// No answer yet; Riot keeps launching after the request times out and
+    /// answers repeated requests with "already launched".
+    Pending,
+    Rejected,
+}
+
 fn launch_game_with(
     account_id: &str,
     cancel: &AtomicBool,
     mut observe: impl FnMut() -> GameStatus,
-    mut request: impl FnMut() -> Result<bool, LoginError>,
+    mut request: impl FnMut() -> Result<Launch, LoginError>,
     mut wait: impl FnMut(),
 ) -> Result<(), LoginError> {
     let mut requested = false;
@@ -271,9 +294,10 @@ fn launch_game_with(
             && current.signed_in_as(account_id)
             && attempt % 2 == 0
         {
-            requested = request()?;
-            if !requested {
-                reason = Reason::LaunchRejected;
+            match request()? {
+                Launch::Accepted => requested = true,
+                Launch::Pending => reason = Reason::LaunchPending,
+                Launch::Rejected => reason = Reason::LaunchRejected,
             }
         }
         diagnostics.waiting(reason);
@@ -321,7 +345,7 @@ fn session_state(response: Option<(u16, serde_json::Value)>) -> Session {
     let Some((200, body)) = response else {
         return Session::Unknown(Reason::AuthUnavailable);
     };
-    if body["puuid"].as_str().is_some_and(|id| !id.is_empty()) {
+    if has_identity(&body) {
         return Session::SignedIn;
     }
     match body["loginState"].as_str() {
@@ -329,6 +353,89 @@ fn session_state(response: Option<(u16, serde_json::Value)>) -> Session {
         Some(_) if body["actionRequired"] == true => Session::Unknown(Reason::AuthInteraction),
         Some(_) => Session::Unknown(Reason::AuthStarting),
         None => Session::Unknown(Reason::AuthUnavailable),
+    }
+}
+
+fn has_identity(body: &serde_json::Value) -> bool {
+    body["puuid"].as_str().is_some_and(|id| !id.is_empty())
+}
+
+/// The identity exists before Riot finishes the session: new terms, a League
+/// region or a Riot ID can still need the player. Only a session waiting for
+/// a product can be handed to a game; one launched earlier cannot log in.
+/// The session stays in that state while and after a game runs.
+fn product_context(response: Option<(u16, serde_json::Value)>) -> Result<(), Reason> {
+    let Some((200, body)) = response else {
+        return Err(Reason::AuthUnavailable);
+    };
+    let state = body["loginState"].as_str();
+    // Signed out meanwhile, for example from the Riot window. The login form
+    // also requires an action, so check this first.
+    if state == Some("PendingLoginStrategy") && !has_identity(&body) {
+        return Err(Reason::SessionEnded);
+    }
+    if body["actionRequired"] == true {
+        return Err(Reason::SessionActionRequired);
+    }
+    match state {
+        Some("PendingProductContext") => Ok(()),
+        _ => Err(Reason::SessionPending),
+    }
+}
+
+/// Wait until the signed-in session can be handed to a game, showing the
+/// Riot window once if Riot needs the player first.
+fn await_product_context(
+    client: &mut renderer::Renderer,
+    progress: &mut dyn FnMut(LoginStep),
+    cancel: &AtomicBool,
+) -> Result<(), LoginError> {
+    await_product_context_with(
+        cancel,
+        SESSION_TIMEOUT,
+        || {
+            LocalApi::read().map_or(Err(Reason::AuthUnavailable), |api| {
+                product_context(api.get("/player-session-lifecycle/v1/session"))
+            })
+        },
+        || {
+            client.show()?;
+            progress(LoginStep::Verification);
+            Ok(())
+        },
+        || thread::sleep(POLL),
+    )
+}
+
+fn await_product_context_with(
+    cancel: &AtomicBool,
+    timeout: Duration,
+    mut observe: impl FnMut() -> Result<(), Reason>,
+    mut show: impl FnMut() -> Result<(), LoginError>,
+    mut wait: impl FnMut(),
+) -> Result<(), LoginError> {
+    let started = Instant::now();
+    let mut shown = false;
+    let mut diagnostics = LoginDiagnostics::default();
+    loop {
+        check_cancelled(cancel)?;
+        let reason = match observe() {
+            Ok(()) => return Ok(()),
+            Err(reason) => reason,
+        };
+        check_cancelled(cancel)?;
+        if reason == Reason::SessionEnded {
+            return Err(LoginError::SessionEnded);
+        }
+        if reason == Reason::SessionActionRequired && !shown {
+            show()?;
+            shown = true;
+        }
+        diagnostics.waiting(reason);
+        if started.elapsed() >= timeout {
+            return Err(LoginError::Timeout);
+        }
+        wait();
     }
 }
 
@@ -409,9 +516,10 @@ impl LocalApi {
         session_state(self.get("/player-session-lifecycle/v1/session"))
     }
 
-    /// Ask the client to launch a product; true when the request is accepted.
-    fn launch(&self, game: Game) -> bool {
-        self.client
+    /// Ask the client to launch a product.
+    fn launch(&self, game: Game) -> Launch {
+        let response = self
+            .client
             .post(format!(
                 "{}/product-launcher/v1/products/{}/patchlines/live",
                 self.base,
@@ -420,22 +528,33 @@ impl LocalApi {
             .basic_auth("riot", Some(&self.password))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body("{}")
-            .send()
-            .is_ok_and(|response| response.status().is_success())
+            .send();
+        match response {
+            // 423: an earlier request already launched it.
+            Ok(response) if response.status().is_success() || response.status() == 423 => {
+                Launch::Accepted
+            }
+            Err(error) if error.is_timeout() => Launch::Pending,
+            _ => Launch::Rejected,
+        }
     }
 
-    /// Username of the signed-in account, if any.
-    fn username(&self) -> Option<String> {
+    /// Riot account information of the signed-in account.
+    fn userinfo(&self) -> Option<serde_json::Value> {
         let (status, body) = self.get("/rso-auth/v1/authorization/userinfo")?;
         if status != 200 {
             return None;
         }
         // `userInfo` is itself a JSON document encoded as a string.
-        let info: serde_json::Value = match &body["userInfo"] {
-            serde_json::Value::String(text) => serde_json::from_str(text).ok()?,
-            other => other.clone(),
-        };
-        info["username"]
+        match &body["userInfo"] {
+            serde_json::Value::String(text) => serde_json::from_str(text).ok(),
+            other => Some(other.clone()),
+        }
+    }
+
+    /// Username of the signed-in account, if any.
+    fn username(&self) -> Option<String> {
+        self.userinfo()?["username"]
             .as_str()
             .filter(|name| !name.is_empty())
             .map(str::to_owned)
@@ -473,6 +592,59 @@ impl LocalApi {
         } else {
             Err(LoginError::SignOutFailed)
         }
+    }
+}
+
+/// The League suspension in Riot's userinfo `ban.restrictions`, if any.
+/// Chat, ranked and reputation restrictions still allow playing.
+fn league_ban(info: &serde_json::Value, now_millis: u64) -> Option<Ban> {
+    let mut ban: Option<Ban> = None;
+    for restriction in info["ban"]["restrictions"].as_array()? {
+        if restriction["scope"] != "lol" {
+            continue;
+        }
+        let until = match restriction["type"].as_str() {
+            Some("PERMANENT_BAN") => None,
+            Some("TIME_BAN") => match restriction["dat"]["expirationMillis"].as_u64() {
+                Some(until) if until > now_millis => Some(until),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        // A permanent ban outlasts any timed one; otherwise the latest end wins.
+        ban = Some(Ban {
+            until: match (ban, until) {
+                (Some(Ban { until: None }), _) | (_, None) => None,
+                (Some(Ban { until: Some(other) }), Some(until)) => Some(other.max(until)),
+                (None, until) => until,
+            },
+        });
+    }
+    ban
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// Hand the League suspension Riot reports for the signed-in account to
+/// `on_ban`. Riot disconnects a suspended account as soon as the game starts,
+/// so stop before launching one unless `on_ban` returns true. An unreadable
+/// userinfo is not reported and does not block the login.
+fn check_ban(
+    game: Option<Game>,
+    on_ban: &mut dyn FnMut(Option<Ban>) -> bool,
+) -> Result<(), LoginError> {
+    let Some(info) = LocalApi::read().and_then(|api| api.userinfo()) else {
+        return Ok(());
+    };
+    let ban = league_ban(&info, now_millis());
+    let launch_banned = on_ban(ban);
+    match ban {
+        Some(ban) if game.is_some() && !launch_banned => Err(LoginError::Banned(ban)),
+        _ => Ok(()),
     }
 }
 
@@ -652,12 +824,15 @@ fn close_league_with(
 }
 
 /// Sign in through Riot's native form, then launch the requested game.
+/// `on_ban` receives the League suspension Riot reports once signed in and
+/// returns whether a suspended account may still launch the game.
 pub fn login(
     account_id: &str,
     password: &str,
     game: Option<Game>,
     close_running: bool,
     progress: &mut dyn FnMut(LoginStep),
+    on_ban: &mut dyn FnMut(Option<Ban>) -> bool,
     cancel: &AtomicBool,
 ) -> Result<LoginOutcome, LoginError> {
     check_cancelled(cancel)?;
@@ -671,6 +846,8 @@ pub fn login(
         progress(LoginStep::CloseLeague);
         close_league(cancel)?;
     }
+    // Otherwise a running game already belongs to this account.
+    let game_open = current.league_running() && !close_running;
     // Keep startup verification visible; temporary renderer ownership starts
     // only after the lifecycle confirms that the client is signed out.
     let mut client = renderer::Renderer::new(&path);
@@ -692,7 +869,11 @@ pub fn login(
                     Some(name) if name.eq_ignore_ascii_case(account_id) => {
                         client.restore()?;
                         check_cancelled(cancel)?;
+                        check_ban(game, on_ban)?;
                         if let Some(game) = game {
+                            if !game_open {
+                                await_product_context(&mut client, progress, cancel)?;
+                            }
                             progress(LoginStep::LaunchGame);
                             start_game(game, account_id, cancel)?;
                         }
@@ -730,7 +911,10 @@ pub fn login(
         thread::sleep(POLL);
     }
     renderer::sign_in(&mut client, account_id, password, progress, cancel)?;
+    // Dropping `client` on a ban reopens the normal Riot window.
+    check_ban(game, on_ban)?;
     if let Some(game) = game {
+        await_product_context(&mut client, progress, cancel)?;
         // The game replaces the Riot window, so do not reopen it in between.
         // If the launch fails or is cancelled, dropping `client` reopens it.
         client.close_debugger()?;
@@ -830,6 +1014,132 @@ mod tests {
             ))),
             Session::SignedIn
         );
+    }
+
+    #[test]
+    fn only_a_finished_session_is_handed_to_the_game() {
+        use serde_json::json;
+
+        let signed_in = |state: &str, action: bool| {
+            Some((
+                200,
+                json!({"loginState": state, "puuid": "player", "actionRequired": action}),
+            ))
+        };
+        assert_eq!(
+            product_context(signed_in("PendingProductContext", false)),
+            Ok(())
+        );
+        // The identity appears during token exchange, before terms and flags.
+        for state in [
+            "LoginTokenExchange",
+            "PendingEulaData",
+            "PendingPersistentFlagsData",
+            "FutureState",
+        ] {
+            assert_eq!(
+                product_context(signed_in(state, false)),
+                Err(Reason::SessionPending)
+            );
+        }
+        for state in ["PendingEulaAcceptance", "PendingProductContext"] {
+            assert_eq!(
+                product_context(signed_in(state, true)),
+                Err(Reason::SessionActionRequired)
+            );
+        }
+        for response in [None, Some((503, json!({})))] {
+            assert_eq!(product_context(response), Err(Reason::AuthUnavailable));
+        }
+        // The login form requires an action too, but nobody is signed in.
+        assert_eq!(
+            product_context(Some((
+                200,
+                json!({"loginState": "PendingLoginStrategy", "puuid": "", "actionRequired": true})
+            ))),
+            Err(Reason::SessionEnded)
+        );
+        // A transitional response that still carries the identity is not a sign-out.
+        assert_eq!(
+            product_context(signed_in("PendingLoginStrategy", false)),
+            Err(Reason::SessionPending)
+        );
+    }
+
+    #[test]
+    fn a_session_waiting_for_the_player_shows_riot_once_before_the_launch() {
+        let states = [
+            Err(Reason::SessionPending),
+            Err(Reason::SessionActionRequired),
+            Err(Reason::SessionActionRequired),
+            Err(Reason::SessionPending),
+            Ok(()),
+        ];
+        let polls = Cell::new(0);
+        let shown = Cell::new(0);
+        let result = await_product_context_with(
+            &AtomicBool::new(false),
+            Duration::MAX,
+            || {
+                polls.set(polls.get() + 1);
+                states[polls.get() - 1]
+            },
+            || {
+                shown.set(shown.get() + 1);
+                Ok(())
+            },
+            || {},
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(polls.get(), states.len());
+        assert_eq!(shown.get(), 1);
+
+        // The limit is time, however long each poll takes.
+        let polls = Cell::new(0);
+        let result = await_product_context_with(
+            &AtomicBool::new(false),
+            Duration::ZERO,
+            || {
+                polls.set(polls.get() + 1);
+                Err(Reason::SessionPending)
+            },
+            || panic!("nothing needs the player"),
+            || panic!("the time is up"),
+        );
+        assert_eq!(result, Err(LoginError::Timeout));
+        assert_eq!(polls.get(), 1);
+
+        // Signing out ends the wait at once instead of at the time limit.
+        let states = [
+            Err(Reason::SessionActionRequired),
+            Err(Reason::SessionEnded),
+        ];
+        let polls = Cell::new(0);
+        let result = await_product_context_with(
+            &AtomicBool::new(false),
+            Duration::MAX,
+            || {
+                polls.set(polls.get() + 1);
+                states[polls.get() - 1]
+            },
+            || Ok(()),
+            || {},
+        );
+        assert_eq!(result, Err(LoginError::SessionEnded));
+        assert_eq!(polls.get(), states.len());
+
+        let cancel = AtomicBool::new(false);
+        let result = await_product_context_with(
+            &cancel,
+            Duration::MAX,
+            || {
+                cancel.store(true, Ordering::SeqCst);
+                Err(Reason::SessionActionRequired)
+            },
+            || panic!("must not show Riot after cancellation"),
+            || {},
+        );
+        assert_eq!(result, Err(LoginError::Cancelled));
     }
 
     #[test]
@@ -937,6 +1247,54 @@ mod tests {
     }
 
     #[test]
+    fn only_current_league_suspensions_count_as_bans() {
+        use serde_json::json;
+
+        let restriction = |kind: &str, scope: &str, until: u64| {
+            json!({
+                "type": kind, "reason": "INAPPROPRIATE_TEXT", "scope": scope,
+                "dat": {"expirationMillis": until, "gameData": {"productName": scope}}
+            })
+        };
+        let info = |restrictions: Vec<serde_json::Value>| json!({"ban": {"restrictions": restrictions}});
+        let now = 1_000;
+
+        // Shape observed on a suspended account: chat limits sit beside the ban.
+        let observed = info(vec![
+            restriction("TEXT_CHAT_RESTRICTION", "lol", 9_000),
+            restriction("REPUTATION_LIMIT", "lol", 0),
+            restriction("TIME_BAN", "lol", 5_000),
+            restriction("TEXT_CHAT_MUTED", "lol", 0),
+        ]);
+        assert_eq!(league_ban(&observed, now), Some(Ban { until: Some(5_000) }));
+
+        assert_eq!(league_ban(&info(vec![]), now), None);
+        assert_eq!(league_ban(&json!({}), now), None);
+        assert_eq!(league_ban(&info(vec![restriction("TIME_BAN", "lol", 1_000)]), now), None);
+        assert_eq!(league_ban(&info(vec![restriction("TIME_BAN", "valorant", 5_000)]), now), None);
+        assert_eq!(
+            league_ban(
+                &info(vec![
+                    restriction("TIME_BAN", "lol", 5_000),
+                    restriction("TIME_BAN", "lol", 7_000),
+                ]),
+                now
+            ),
+            Some(Ban { until: Some(7_000) })
+        );
+        assert_eq!(
+            league_ban(
+                &info(vec![
+                    restriction("PERMANENT_BAN", "lol", 0),
+                    restriction("TIME_BAN", "lol", 7_000),
+                ]),
+                now
+            ),
+            Some(Ban { until: None })
+        );
+    }
+
+    #[test]
     fn riot_identity_does_not_prove_the_open_games_identity() {
         let mut current = GameStatus {
             client_open: true,
@@ -998,7 +1356,7 @@ mod tests {
                 },
                 || {
                     requests.set(requests.get() + 1);
-                    Ok(true)
+                    Ok(Launch::Accepted)
                 },
                 || {},
             );
@@ -1006,6 +1364,39 @@ mod tests {
             assert_eq!(requests.get(), 1);
             assert!(polls.get() > 1);
         }
+
+        // An unanswered request is not a refusal; asking again is harmless
+        // because Riot answers once the first launch has started the game.
+        let polls = Cell::new(0);
+        let requests = Cell::new(0);
+        let log = logging::capture(|| {
+            let result = launch_game_with(
+                "selected",
+                &AtomicBool::new(false),
+                || {
+                    polls.set(polls.get() + 1);
+                    GameStatus {
+                        client_open: polls.get() > 4,
+                        signed_in_user: Some("selected".into()),
+                        game_user: (polls.get() > 4).then(|| "selected".into()),
+                        ..GameStatus::default()
+                    }
+                },
+                || {
+                    requests.set(requests.get() + 1);
+                    Ok(if requests.get() == 1 {
+                        Launch::Pending
+                    } else {
+                        Launch::Accepted
+                    })
+                },
+                || {},
+            );
+            assert_eq!(result, Ok(()));
+        });
+        assert_eq!(requests.get(), 2);
+        assert!(log.contains("reason=launch_pending"));
+        assert!(!log.contains("reason=launch_rejected"));
 
         let cancel = AtomicBool::new(false);
         let result = launch_game_with(
@@ -1104,10 +1495,13 @@ mod tests {
                 Reason::AuthStarting,
                 Reason::AuthInteraction,
                 Reason::AuthIdentityPending,
+                Reason::SessionPending,
+                Reason::SessionActionRequired,
                 Reason::FindWindow,
                 Reason::LoginFormReady,
                 Reason::GameIdentityPending,
                 Reason::GameProcessPending,
+                Reason::LaunchPending,
                 Reason::LaunchRejected,
             ] {
                 diagnostics.waiting(reason);
@@ -1117,6 +1511,7 @@ mod tests {
             record_login_result(&Err(LoginError::AccountMismatch));
             record_login_result(&Err(LoginError::GameLaunchFailed));
             record_login_result(&Err(LoginError::SignOutFailed));
+            record_login_result(&Err(LoginError::SessionEnded));
             record_login_result(&Err(LoginError::Cancelled));
             record_login_result(&Ok(LoginOutcome::AlreadySignedIn));
         });
@@ -1125,15 +1520,19 @@ mod tests {
             "INFO event=login_waiting reason=auth_starting",
             "INFO event=login_waiting reason=auth_interaction",
             "INFO event=login_waiting reason=auth_identity_pending",
+            "INFO event=login_waiting reason=session_pending",
+            "INFO event=login_waiting reason=session_action_required",
             "INFO event=login_waiting reason=find_window",
             "INFO event=login_waiting reason=login_form_ready",
             "INFO event=login_waiting reason=game_identity_pending",
             "INFO event=login_waiting reason=game_process_pending",
+            "INFO event=login_waiting reason=launch_pending",
             "INFO event=login_waiting reason=launch_rejected",
             "INFO event=login_progress reason=launch_game",
             "ERROR event=login_failed reason=account_mismatch",
             "ERROR event=login_failed reason=game_launch_failed",
             "ERROR event=login_failed reason=sign_out_failed",
+            "ERROR event=login_failed reason=session_ended",
             "INFO event=login_cancelled reason=cancelled",
             "INFO event=login_completed reason=already_signed_in",
         ] {
