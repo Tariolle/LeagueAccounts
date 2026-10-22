@@ -209,6 +209,7 @@ const en = {
   "err.riot_launch_failed": "Couldn't start the Riot Client.",
   "err.riot_timeout": "The Riot Client login screen or sign-in status wasn't ready in time.",
   "err.riot_sign_out_failed": "Couldn't sign out of the current Riot Client session.",
+  "err.riot_session_ended": "The Riot Client session ended before the game could start. Please try again.",
   "err.autostart_failed": "Couldn't change the startup setting.",
 
   "toast.signedIn": "Signed in",
@@ -507,6 +508,7 @@ const tr: Dict = {
   "err.riot_launch_failed": "Riot Client başlatılamadı.",
   "err.riot_timeout": "Riot Client giriş ekranı veya oturum durumu zamanında hazır olmadı.",
   "err.riot_sign_out_failed": "Riot Client'taki mevcut oturumdan çıkılamadı.",
+  "err.riot_session_ended": "Riot Client oturumu oyun başlamadan sona erdi. Tekrar deneyin.",
   "err.autostart_failed": "Başlangıç ayarı değiştirilemedi.",
 
   "toast.signedIn": "Giriş yapıldı",
@@ -802,6 +804,7 @@ const de: Dict = {
   "err.riot_launch_failed": "Der Riot Client konnte nicht gestartet werden.",
   "err.riot_timeout": "Der Anmeldebildschirm oder Anmeldestatus des Riot Clients war nicht rechtzeitig bereit.",
   "err.riot_sign_out_failed": "Abmeldung von der aktuellen Riot-Client-Sitzung fehlgeschlagen.",
+  "err.riot_session_ended": "Die Riot-Client-Sitzung wurde vor dem Spielstart beendet. Bitte erneut versuchen.",
   "err.autostart_failed": "Die Autostart-Einstellung konnte nicht geändert werden.",
 
   "toast.signedIn": "Angemeldet",
@@ -1097,6 +1100,7 @@ const es: Dict = {
   "err.riot_launch_failed": "No se pudo iniciar Riot Client.",
   "err.riot_timeout": "La pantalla o el estado de inicio de sesión de Riot Client no estuvo listo a tiempo.",
   "err.riot_sign_out_failed": "No se pudo cerrar la sesión actual de Riot Client.",
+  "err.riot_session_ended": "La sesión de Riot Client terminó antes de iniciar el juego. Inténtalo de nuevo.",
   "err.autostart_failed": "No se pudo cambiar el inicio automático.",
 
   "toast.signedIn": "Sesión iniciada",
@@ -1392,6 +1396,7 @@ const fr: Dict = {
   "err.riot_launch_failed": "Impossible de lancer le Riot Client.",
   "err.riot_timeout": "L'écran ou l'état de connexion du Riot Client n'était pas prêt à temps.",
   "err.riot_sign_out_failed": "Impossible de fermer la session Riot Client actuelle.",
+  "err.riot_session_ended": "La session Riot Client s'est terminée avant le lancement du jeu. Réessaie.",
   "err.autostart_failed": "Impossible de modifier le lancement au démarrage.",
 
   "toast.signedIn": "Connecté",
@@ -1687,6 +1692,7 @@ const pt: Dict = {
   "err.riot_launch_failed": "Não foi possível iniciar o Riot Client.",
   "err.riot_timeout": "O ecrã ou o estado de início de sessão do Riot Client não ficou pronto a tempo.",
   "err.riot_sign_out_failed": "Não foi possível terminar a sessão atual no Riot Client.",
+  "err.riot_session_ended": "A sessão do Riot Client terminou antes de o jogo iniciar. Tenta novamente.",
   "err.autostart_failed": "Não foi possível alterar o arranque automático.",
 
   "toast.signedIn": "Sessão iniciada",

@@ -14,6 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Allow cold starts and client updates without relaxing login readiness.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(120);
+/// Time the player has for steps Riot asks for before the game, as for
+/// confirming the sign-in.
+const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 const POLL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +106,8 @@ pub enum LoginError {
     Timeout,
     /// Signing out of the current session is not available.
     SignOutFailed,
+    /// The Riot session signed out before the game could be launched.
+    SessionEnded,
     RendererFailed,
     AuthRejected,
     CaptchaRejected,
@@ -131,6 +136,7 @@ impl LoginError {
             LoginError::LaunchFailed => "riot_launch_failed",
             LoginError::Timeout => "riot_timeout",
             LoginError::SignOutFailed => "riot_sign_out_failed",
+            LoginError::SessionEnded => "riot_session_ended",
             LoginError::RendererFailed => "riot_renderer_failed",
             LoginError::AuthRejected => "riot_auth_rejected",
             LoginError::CaptchaRejected => "riot_captcha_rejected",
@@ -169,6 +175,7 @@ pub fn record_login_result(result: &Result<LoginOutcome, LoginError>) {
                 LoginError::LaunchFailed => Reason::LaunchFailed,
                 LoginError::Timeout => Reason::Timeout,
                 LoginError::SignOutFailed => Reason::SignOutFailed,
+                LoginError::SessionEnded => Reason::SessionEnded,
                 LoginError::RendererFailed => Reason::RendererFailed,
                 LoginError::AuthRejected => Reason::AuthRejected,
                 LoginError::CaptchaRejected => Reason::CaptchaRejected,
@@ -338,7 +345,7 @@ fn session_state(response: Option<(u16, serde_json::Value)>) -> Session {
     let Some((200, body)) = response else {
         return Session::Unknown(Reason::AuthUnavailable);
     };
-    if body["puuid"].as_str().is_some_and(|id| !id.is_empty()) {
+    if has_identity(&body) {
         return Session::SignedIn;
     }
     match body["loginState"].as_str() {
@@ -349,17 +356,28 @@ fn session_state(response: Option<(u16, serde_json::Value)>) -> Session {
     }
 }
 
+fn has_identity(body: &serde_json::Value) -> bool {
+    body["puuid"].as_str().is_some_and(|id| !id.is_empty())
+}
+
 /// The identity exists before Riot finishes the session: new terms, a League
 /// region or a Riot ID can still need the player. Only a session waiting for
 /// a product can be handed to a game; one launched earlier cannot log in.
+/// The session stays in that state while and after a game runs.
 fn product_context(response: Option<(u16, serde_json::Value)>) -> Result<(), Reason> {
     let Some((200, body)) = response else {
         return Err(Reason::AuthUnavailable);
     };
+    let state = body["loginState"].as_str();
+    // Signed out meanwhile, for example from the Riot window. The login form
+    // also requires an action, so check this first.
+    if state == Some("PendingLoginStrategy") && !has_identity(&body) {
+        return Err(Reason::SessionEnded);
+    }
     if body["actionRequired"] == true {
         return Err(Reason::SessionActionRequired);
     }
-    match body["loginState"].as_str() {
+    match state {
         Some("PendingProductContext") => Ok(()),
         _ => Err(Reason::SessionPending),
     }
@@ -374,13 +392,14 @@ fn await_product_context(
 ) -> Result<(), LoginError> {
     await_product_context_with(
         cancel,
+        SESSION_TIMEOUT,
         || {
             LocalApi::read().map_or(Err(Reason::AuthUnavailable), |api| {
                 product_context(api.get("/player-session-lifecycle/v1/session"))
             })
         },
         || {
-            client.restore()?;
+            client.show()?;
             progress(LoginStep::Verification);
             Ok(())
         },
@@ -390,29 +409,34 @@ fn await_product_context(
 
 fn await_product_context_with(
     cancel: &AtomicBool,
+    timeout: Duration,
     mut observe: impl FnMut() -> Result<(), Reason>,
     mut show: impl FnMut() -> Result<(), LoginError>,
     mut wait: impl FnMut(),
 ) -> Result<(), LoginError> {
+    let started = Instant::now();
     let mut shown = false;
     let mut diagnostics = LoginDiagnostics::default();
-    // About five minutes, as for confirming the sign-in.
-    for _ in 0..600 {
+    loop {
         check_cancelled(cancel)?;
         let reason = match observe() {
             Ok(()) => return Ok(()),
             Err(reason) => reason,
         };
         check_cancelled(cancel)?;
+        if reason == Reason::SessionEnded {
+            return Err(LoginError::SessionEnded);
+        }
         if reason == Reason::SessionActionRequired && !shown {
             show()?;
             shown = true;
         }
         diagnostics.waiting(reason);
+        if started.elapsed() >= timeout {
+            return Err(LoginError::Timeout);
+        }
         wait();
     }
-    check_cancelled(cancel)?;
-    Err(LoginError::Timeout)
 }
 
 #[derive(Default)]
@@ -1027,6 +1051,19 @@ mod tests {
         for response in [None, Some((503, json!({})))] {
             assert_eq!(product_context(response), Err(Reason::AuthUnavailable));
         }
+        // The login form requires an action too, but nobody is signed in.
+        assert_eq!(
+            product_context(Some((
+                200,
+                json!({"loginState": "PendingLoginStrategy", "puuid": "", "actionRequired": true})
+            ))),
+            Err(Reason::SessionEnded)
+        );
+        // A transitional response that still carries the identity is not a sign-out.
+        assert_eq!(
+            product_context(signed_in("PendingLoginStrategy", false)),
+            Err(Reason::SessionPending)
+        );
     }
 
     #[test]
@@ -1042,6 +1079,7 @@ mod tests {
         let shown = Cell::new(0);
         let result = await_product_context_with(
             &AtomicBool::new(false),
+            Duration::MAX,
             || {
                 polls.set(polls.get() + 1);
                 states[polls.get() - 1]
@@ -1056,17 +1094,44 @@ mod tests {
         assert_eq!(polls.get(), states.len());
         assert_eq!(shown.get(), 1);
 
+        // The limit is time, however long each poll takes.
+        let polls = Cell::new(0);
         let result = await_product_context_with(
             &AtomicBool::new(false),
-            || Err(Reason::SessionPending),
+            Duration::ZERO,
+            || {
+                polls.set(polls.get() + 1);
+                Err(Reason::SessionPending)
+            },
             || panic!("nothing needs the player"),
-            || {},
+            || panic!("the time is up"),
         );
         assert_eq!(result, Err(LoginError::Timeout));
+        assert_eq!(polls.get(), 1);
+
+        // Signing out ends the wait at once instead of at the time limit.
+        let states = [
+            Err(Reason::SessionActionRequired),
+            Err(Reason::SessionEnded),
+        ];
+        let polls = Cell::new(0);
+        let result = await_product_context_with(
+            &AtomicBool::new(false),
+            Duration::MAX,
+            || {
+                polls.set(polls.get() + 1);
+                states[polls.get() - 1]
+            },
+            || Ok(()),
+            || {},
+        );
+        assert_eq!(result, Err(LoginError::SessionEnded));
+        assert_eq!(polls.get(), states.len());
 
         let cancel = AtomicBool::new(false);
         let result = await_product_context_with(
             &cancel,
+            Duration::MAX,
             || {
                 cancel.store(true, Ordering::SeqCst);
                 Err(Reason::SessionActionRequired)
@@ -1446,6 +1511,7 @@ mod tests {
             record_login_result(&Err(LoginError::AccountMismatch));
             record_login_result(&Err(LoginError::GameLaunchFailed));
             record_login_result(&Err(LoginError::SignOutFailed));
+            record_login_result(&Err(LoginError::SessionEnded));
             record_login_result(&Err(LoginError::Cancelled));
             record_login_result(&Ok(LoginOutcome::AlreadySignedIn));
         });
@@ -1466,6 +1532,7 @@ mod tests {
             "ERROR event=login_failed reason=account_mismatch",
             "ERROR event=login_failed reason=game_launch_failed",
             "ERROR event=login_failed reason=sign_out_failed",
+            "ERROR event=login_failed reason=session_ended",
             "INFO event=login_cancelled reason=cancelled",
             "INFO event=login_completed reason=already_signed_in",
         ] {
