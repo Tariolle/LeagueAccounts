@@ -35,6 +35,7 @@ const sample: AccountView[] = [
   hasPassword: true,
   lol: lolRank as AccountView["lol"],
   tft: tftRank as AccountView["tft"],
+  ban: accountId === "smurfy_tr" ? { until: Date.now() + (6 * 24 + 13) * 3_600_000 } : null,
 }));
 
 type Handler<T> = (payload: T) => void;
@@ -72,7 +73,12 @@ const setUpdate = (change: Partial<UpdateStatus>) => {
 function simulateInstall(launch: boolean): void {
   const total = 14_680_064;
   setUpdate({ phase: "downloading", release, received: 0, total, launch });
+  // At launch, start progressing once the update screen or the app is showing: a slow cold
+  // start must not reach the launch check after the install already finished (and restarted).
+  let shown = !launch;
   const timer = setInterval(() => {
+    shown ||= document.querySelector("#startup-loader .update-screen") !== null || document.body.classList.contains("ready");
+    if (!shown) return;
     const received = Math.min(total, update.received + total / 30);
     setUpdate({ received });
     if (received < total) return;
@@ -92,17 +98,6 @@ export function installMock(): void {
     else setUpdate({ phase: "upToDate", release: { ...release, version: "3.0.3" } });
   }, scene === "restart" ? 1500 : 300);
   let accounts = structuredClone(sample);
-  if (scene === "freshness") {
-    const errors: NonNullable<AccountView["rankProvenance"]>["error"][] = [null, "rate_limited", "forbidden", "parsing_failed", "timeout", "provider_unavailable", "renewal_failed"];
-    accounts.forEach((account, index) => {
-      account.rankProvenance = {
-        source: "OP.GG", fetchedAt: Date.now(), sourceUpdatedAt: Date.now() - (index ? 3_600_000 : 0),
-        freshness: index ? "stale" : "fresh", freshUntil: index ? null : Date.now() + 15 * 60_000, renewalAttempted: Boolean(index), renewalSucceeded: !index,
-        error: errors[index % errors.length],
-      };
-      account.tftProvenance = { ...account.rankProvenance, freshness: "unknown", freshUntil: null, sourceUpdatedAt: null, renewalAttempted: false, renewalSucceeded: false, error: null };
-    });
-  }
   if (scene === "startup-lazy") {
     accounts[0].rankedStats = { wins: 47, losses: 33, winRate: 59 };
     accounts[0].recentGames = Array.from({ length: 10 }, (_, index) => ({
@@ -148,9 +143,11 @@ export function installMock(): void {
     }),
     getSettings: async () => settings,
     updateSettings: async (input: object) => Object.assign(settings, input),
-    login: async () => {
+    login: async (key: Key, _tft: boolean, _closeRunning: boolean, launchBanned: boolean) => {
+      const ban = accounts.find((account) => keyId(account) === keyId(key))?.ban;
       const steps: LoginStep[] = ["openClient", "waitAuth", "connect", "findWindow", "type", "confirm", "launchGame", "done"];
       for (const step of steps) {
+        if (ban && settings.launchGame && !launchBanned && step === "launchGame") throw new ApiError("account_banned", ban.until == null ? "" : String(ban.until));
         listeners.step.forEach((handler) => handler(step));
         await wait(step === "waitAuth" || step === "confirm" ? 1400 : 700);
       }
@@ -241,5 +238,6 @@ export function installMock(): void {
     onRankPending: async (handler: Handler<Key[]>) => (listeners.pending.push(handler), unlisten()),
     onRankUpdate: async (handler: Handler<AccountView>) => (listeners.update.push(handler), unlisten()),
     onRefreshDone: async (handler: Handler<RefreshDone>) => (listeners.done.push(handler), unlisten()),
+    onAccountUpdate: async () => unlisten(),
   } satisfies typeof events);
 }

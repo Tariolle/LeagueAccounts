@@ -5,7 +5,7 @@
 # League Accounts
 
 **All your League of Legends & Teamfight Tactics accounts in one place.**
-One-click login, current ranks and auto refresh — with passwords kept in Windows Credential Manager.
+One-click login, live ranks and ban countdowns, with passwords kept in Windows Credential Manager.
 
 [![Latest release](https://img.shields.io/github/v/release/Tariolle/LeagueAccounts?label=download&color=c8aa6e)](https://github.com/Tariolle/LeagueAccounts/releases/latest)
 ![Windows](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0ac8b9)
@@ -20,6 +20,7 @@ One-click login, current ranks and auto refresh — with passwords kept in Windo
 - **One-click login.** League Accounts opens the Riot Client, signs in and launches LoL or TFT.
 - **LoL and TFT ranks** from OP.GG, refreshed in the background (every 30 minutes by default).
 - **Duo finder.** The *Friend elo* filter shows which accounts can play ranked with a friend.
+- **Ban check.** Each login reads the account's League ban from Riot; a banned account shows the time left instead of launching a game that would disconnect you.
 - **Safe by design.** Passwords stay in Windows Credential Manager and never reach the interface.
 - **Made for daily use.** Launch with Windows, keyboard shortcuts, import/export, automatic updates, 6 languages.
 
@@ -40,16 +41,16 @@ username1--Player One#EUW--password1
 username2----password2
 ```
 
-**Log in** with the card's **Log in** button. If another account is signed in, it is signed out first, and you're warned before an open League client is closed (or a match left). For 2FA or a captcha, finish in the Riot window; the game launches once the sign-in is confirmed.
+**Log in** with the card's **Log in** button. If another account is signed in, it is signed out first, and you're warned before an open League client is closed (or a match left). For 2FA or a captcha, finish in the Riot window; the game launches once the sign-in is confirmed. If Riot reports a ban, the game isn't started: the card shows the time left, and logging in again before it ends asks whether to launch the game anyway. With game launch off, a banned account still signs in to the Riot Client.
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/tft.png" alt="TFT mode" /><br /><sub><b>TFT mode:</b> ranks, sorting and filters for Teamfight Tactics.</sub></td>
+    <td width="50%"><img src="docs/screenshots/banned.png" alt="Warning before logging in to a banned account" /><br /><sub><b>Ban check:</b> see how long a ban lasts before you log in.</sub></td>
     <td width="50%"><img src="docs/screenshots/list.png" alt="Compact list view" /><br /><sub><b>List view</b> for many accounts.</sub></td>
   </tr>
   <tr>
     <td><img src="docs/screenshots/add.png" alt="Add account panel" /><br /><sub><b>Add one account or paste many.</b></sub></td>
-    <td><img src="docs/screenshots/settings.png" alt="Settings" /><br /><sub><b>Settings:</b> startup, refresh interval, login method, updates.</sub></td>
+    <td><img src="docs/screenshots/settings.png" alt="Settings" /><br /><sub><b>Settings:</b> language, startup, refresh interval, login method, updates.</sub></td>
   </tr>
 </table>
 
@@ -81,7 +82,7 @@ username2----password2
 | Problem | What to do |
 |---|---|
 | *Riot Client was not found* | Install the Riot Client, or use **Settings → Login → Type into the previous window**. |
-| *The login screen didn't appear in time* | Open the Riot Client once manually (it may be updating), then retry. |
+| *The Riot Client login screen or sign-in status wasn't ready in time* | Open the Riot Client once manually (it may be updating), then retry. |
 | Ranks show **Unavailable** or *Riot ID not found* | Check the Riot ID and region; OP.GG may also be rate-limiting. |
 | Anything else | Attach the newest file from **Log folder** (sidebar) to an [issue](https://github.com/Tariolle/LeagueAccounts/issues). |
 

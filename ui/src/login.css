@@ -154,15 +154,6 @@
   color: #06210f;
   animation: pop 0.4s var(--spring);
 }
-.login-steps li.skipped {
-  opacity: 0.4;
-}
-.login-steps li.skipped .step-label {
-  text-decoration: line-through;
-}
-.login-steps li.skipped .step-icon {
-  border-style: dashed;
-}
 .login-steps li.error {
   color: #ff8a8a;
   background: rgba(240, 82, 82, 0.1);

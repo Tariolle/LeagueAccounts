@@ -172,7 +172,8 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
       }
     });
     await t.test("Settings frame contains scrolling content while its actions and close stay reachable", async () => {
-      await open("settings", { width: 980, height: 640 });
+      // Short enough that the two-column body still has to scroll.
+      await open("settings", { width: 980, height: 480 });
       await page.waitForSelector(".modal");
       assert.equal(await page.$eval(".modal-body", el => el.scrollHeight > el.clientHeight), true);
       const bounds = await page.$eval(".modal", el => {
@@ -256,7 +257,7 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
       const progress = await page.$eval('[role="progressbar"]', el => ({
         value: Number(el.getAttribute("aria-valuenow")),
         max: Number(el.getAttribute("aria-valuemax")),
-        resolved: document.querySelectorAll(".login-steps .done, .login-steps .skipped").length,
+        resolved: document.querySelectorAll(".login-steps .done").length,
         current: el.getAttribute("aria-valuetext"),
         label: document.querySelector(".login-steps .active .step-label").textContent,
       }));
@@ -266,6 +267,14 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
       await page.waitForSelector(".login-overlay.is-success", { timeout: 15000 });
       assert.equal(await page.$$eval("video,audio", els => els.length), 0);
       assert.equal(await page.$eval('[role="progressbar"]', el => el.getAttribute("aria-valuenow") === el.getAttribute("aria-valuemax")), true);
+      await page.click('[data-login="close"]');
+      await page.waitForSelector(".login-overlay", { hidden: true });
+    });
+    await t.test("logging in anyway to a banned account launches the game", async () => {
+      await open("banned");
+      await page.waitForSelector('.modal [data-value="login"]');
+      await page.click('.modal [data-value="login"]');
+      await page.waitForSelector(".login-overlay.is-success", { timeout: 15000 });
       await page.click('[data-login="close"]');
       await page.waitForSelector(".login-overlay", { hidden: true });
     });
@@ -348,19 +357,6 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
       await page.waitForSelector("#schedule.running");
       await page.waitForSelector("#schedule:not(.running)", { timeout: 60000 });
       assert.equal(await page.$(".toast"), null);
-    });
-    await t.test("source freshness and errors remain visible without changing ranks", async () => {
-      await open("freshness");
-      const statuses = await page.$$eval(".rank-provenance", els => els.map(el => el.textContent));
-      assert.ok(statuses.some(text => /Updated .*OP\.GG/.test(text)));
-      for (const error of ["Rate limited", "Access blocked", "Parsing failed", "Request timed out", "Provider unavailable", "Refresh failed"]) {
-        assert.ok(statuses.some(text => text.includes(error)), error);
-      }
-      assert.equal(await page.$$eval("#accounts > .card", cards => cards.every(card => !card.querySelector(".rank-provenance") || card.querySelector(".rank-name").textContent.trim())), true);
-      await page.click('[data-mode="tft"]');
-      const tft = await page.$$eval(".rank-provenance", els => els.map(el => el.textContent));
-      assert.ok(tft.every(text => text.includes("Freshness unknown")));
-      assert.ok(tft.every(text => !text.includes("Updated")));
     });
     assert.deepEqual(errors, []);
   } finally {

@@ -42,6 +42,23 @@ pub struct Account {
     pub rank_provenance: Option<RankProvenance>,
     #[serde(default)]
     pub tft_provenance: Option<RankProvenance>,
+    /// League suspension Riot reported at the last sign-in through the app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ban: Option<Ban>,
+}
+
+/// A League suspension read from Riot's account information.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Ban {
+    /// Unix milliseconds when the suspension ends; `None` when permanent.
+    pub until: Option<u64>,
+}
+
+impl Ban {
+    pub fn active(&self, now_millis: u64) -> bool {
+        self.until.is_none_or(|until| until > now_millis)
+    }
 }
 
 /// Ranked TFT standing: the current set and the previous set's final rank.

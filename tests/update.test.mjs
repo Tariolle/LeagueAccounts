@@ -102,7 +102,7 @@ test("automatic updates: launch screen, idle restart and download fallback", { t
         await page.waitForSelector('.modal [name="autoUpdate"]');
         const row = await page.$eval('.modal [name="autoUpdate"]', el => ({ checked: el.checked, text: el.closest(".toggle-row").textContent }));
         assert.equal(row.checked, true);
-        assert.match(row.text, /Update automatically[\s\S]*Installs new versions in the background[\s\S]*checks only when you click Check now/);
+        assert.match(row.text, /Update automatically[\s\S]*Installs in the background/);
         await page.click(".modal [data-check-update]");
         await page.waitForFunction(() => /Downloading version 3\.1\.0/.test(document.querySelector(".update-result").textContent));
         await page.waitForFunction(() => /Version 3\.1\.0 is installed/.test(document.querySelector(".update-result").textContent), { timeout: 15000 });

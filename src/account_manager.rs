@@ -362,6 +362,8 @@ impl AccountManager {
                 tft: item.tft,
                 rank_provenance: item.rank_provenance,
                 tft_provenance: item.tft_provenance,
+                // Re-detected at the next sign-in.
+                ban: None,
             };
             accounts.push(account);
         }

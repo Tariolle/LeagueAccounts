@@ -221,7 +221,13 @@ function enhance(select: HTMLSelectElement): void {
       if (match >= 0) highlight(match);
     }
   });
-  current.addEventListener("click", () => (isOpen() ? close() : open()));
+  current.addEventListener("click", (event) => {
+    // Inside a <label>, the click would also activate the hidden select, whose
+    // click reaches the frame handler below and toggles the list straight back.
+    event.preventDefault();
+    if (isOpen()) close();
+    else open();
+  });
   current.addEventListener("blur", (event) => {
     if (!list.contains(event.relatedTarget as Node | null)) close();
   });
@@ -246,8 +252,10 @@ function enhance(select: HTMLSelectElement): void {
     const item = (event.target as HTMLElement).closest<HTMLElement>(".framed-dropdown-option");
     if (!item || !enabled(Number(item.dataset.index))) return;
     // choose() re-renders the options, detaching the clicked one: the frame's label
-    // handler would no longer see it inside the dropdown and reopen it.
+    // handler would no longer see it inside the dropdown and reopen it. A surrounding
+    // <label> would reopen it too, through the hidden select, unless the click is cancelled.
     event.stopPropagation();
+    event.preventDefault();
     choose(Number(item.dataset.index));
     close();
     current.focus();
