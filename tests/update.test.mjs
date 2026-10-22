@@ -2,8 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { demoBrowser, demoPage } from "../scripts/demo-browser.mjs";
 
-// The browser mock simulates the backend: `?scene=updating-slow` holds a launch
-// update long enough to cover slow CI startup; `?scene=restart` finishes one in the background.
+// The browser mock simulates the backend: `?scene=updating` finds an update at
+// launch, `?scene=restart` finishes one in the background.
 test("automatic updates: launch screen, idle restart and download fallback", { timeout: 120000 }, async t => {
   const demo = await demoBrowser();
   const errors = [];
@@ -15,20 +15,27 @@ test("automatic updates: launch screen, idle restart and download fallback", { t
     });
     return page;
   };
-  async function launch(scene) {
+  async function launch(scene, lateStartup = false) {
     const page = watch(await demo.browser.newPage());
     await page.setViewport({ width: 1360, height: 860, deviceScaleFactor: 1 });
-    await page.evaluateOnNewDocument(() => {
+    await page.evaluateOnNewDocument((late) => {
       localStorage.clear();
       localStorage.setItem("leagueaccounts.dev.lang", "en");
-    });
+      // Deterministically model a cold module load that already consumed the
+      // three-second launch-check hold. The scene must still be downloading
+      // when bootstrap reads the backend, rather than reveal a normal app.
+      if (late) {
+        const now = performance.now.bind(performance);
+        performance.now = () => now() + 4000;
+      }
+    }, lateStartup);
     await page.goto(`${demo.base}?scene=${scene}`, { waitUntil: "domcontentloaded" });
     return page;
   }
   const progress = page => page.$eval(".update-meter", el => Number(el.getAttribute("aria-valuenow")));
   try {
     await t.test("an update found at launch replaces the app with the update screen, then restarts", async () => {
-      const page = await launch("updating-slow");
+      const page = await launch("updating", true);
       try {
         await page.waitForSelector("#startup-loader .update-screen");
         assert.match(await page.$eval(".update-screen-title", el => el.textContent), /Updating League Accounts/i);
@@ -39,7 +46,7 @@ test("automatic updates: launch screen, idle restart and download fallback", { t
         await page.waitForFunction(start => Number(document.querySelector(".update-meter").getAttribute("aria-valuenow")) > start, {}, first);
         assert.match(await page.$eval(".update-screen-detail", el => el.textContent), /^\d+\.\d \/ 14\.0 MB$/);
         // Installed: the app restarts by itself, here as a reload without the scene.
-        await page.waitForNavigation({ timeout: 35000 });
+        await page.waitForNavigation({ timeout: 20000 });
         assert.equal(new URL(page.url()).search, "");
         await page.waitForSelector("body.ready #accounts > .card");
         assert.equal(await page.$(".update-screen"), null);

@@ -545,6 +545,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    // Native fixture round-trips interfere under parallel test execution on
+    // Windows. Keep only those two tests serial; in-memory tests stay parallel.
+    #[cfg(windows)]
+    static NATIVE_CREDENTIAL_FIXTURE: Mutex<()> = Mutex::new(());
+
     #[derive(Default)]
     struct TestPasswords {
         values: RefCell<HashMap<String, String>>,
@@ -585,6 +590,53 @@ mod tests {
 
     fn test_manager(path: impl Into<PathBuf>) -> AccountManager {
         AccountManager::with_path(path, Arc::new(crate::rank_fetcher::RankFetcher::default()))
+    }
+
+    #[test]
+    fn ranked_overlay_survives_real_export_import_and_legacy_files_remain_readable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut original = test_manager(directory.path().join("original.json"));
+        let mut account = test_account("overlay");
+        account.ranked_stats = Some(RankedStats {
+            wins: 47,
+            losses: 33,
+            win_rate: 59,
+        });
+        account.recent_games = vec![RecentGame {
+            champion: "Zeri".into(),
+            icon_url: "portrait.png".into(),
+            won: true,
+        }];
+        original.accounts.push(account.clone());
+        let json = original.export_accounts().unwrap();
+        let mut restored = test_manager(directory.path().join("restored.json"));
+        assert_eq!(
+            restored
+                .import_accounts_with(&json, &TestPasswords::default())
+                .unwrap(),
+            (1, 0)
+        );
+        let saved: Vec<Account> =
+            serde_json::from_slice(&std::fs::read(&restored.accounts_file).unwrap()).unwrap();
+        assert_eq!(saved[0].ranked_stats, account.ranked_stats);
+        assert_eq!(saved[0].recent_games, account.recent_games);
+        assert_eq!(restored.accounts[0].ranked_stats, account.ranked_stats);
+        assert_eq!(restored.accounts[0].recent_games, account.recent_games);
+        assert!(!std::fs::read_to_string(&restored.accounts_file)
+            .unwrap()
+            .contains("dummy-password"));
+        // An upstream build ignores the extra fields; the fork defaults them
+        // when opening a pre-feature save or explicit export.
+        let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+        legacy[0].as_object_mut().unwrap().remove("ranked_stats");
+        legacy[0].as_object_mut().unwrap().remove("recent_games");
+        let mut old_import = test_manager(directory.path().join("legacy.json"));
+        old_import
+            .import_accounts_with(&legacy.to_string(), &TestPasswords::default())
+            .unwrap();
+        assert_eq!(old_import.accounts[0].ranked_stats, None);
+        assert!(old_import.accounts[0].recent_games.is_empty());
+        assert_eq!(old_import.accounts[0].password, account.password);
     }
 
     struct SlowProvider {
@@ -913,6 +965,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_rollback_does_not_modify_another_accounts_credential() {
+        let _fixture = NATIVE_CREDENTIAL_FIXTURE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use std::os::windows::fs::OpenOptionsExt;
 
         // Use an isolated service, and clean up its dummy entries even if an
@@ -974,6 +1029,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn loading_migrates_legacy_only_passwords_without_changing_other_credentials() {
+        let _fixture = NATIVE_CREDENTIAL_FIXTURE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Isolate every target, including the shared legacy entry, from the
         // user's credentials and from the native rollback regression above.
         struct Cleanup(Vec<keyring::Entry>);

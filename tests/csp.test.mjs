@@ -91,6 +91,22 @@ test("the packaged UI keeps its inline styles under Tauri's CSP", { timeout: 600
     });
     assert.ok(icon.width > 0);
     assert.match(icon.mask, /icon_settings\.png/);
+    // Exercise the actual browser policy, rather than just searching its text.
+    // A local fixture supplies the response so this stays deterministic/offline.
+    const portraitUrl = "https://opgg-static.akamaized.net/meta/images/lol/16.20.1/champion/Zeri.png";
+    const portrait = await readFile(join(DIST, "league/ranks/iron.png"));
+    await page.setRequestInterception(true);
+    page.on("request", request => {
+      if (request.url() === portraitUrl) void request.respond({ status: 200, contentType: "image/png", body: portrait });
+      else void request.continue();
+    });
+    assert.ok(await page.evaluate(async url => {
+      const image = new Image();
+      image.src = url;
+      document.body.append(image);
+      await image.decode();
+      return image.naturalWidth;
+    }, portraitUrl));
     assert.deepEqual(await page.evaluate(() => window.__violations), []);
   } finally {
     await browser.close();

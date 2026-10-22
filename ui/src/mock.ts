@@ -69,7 +69,7 @@ const setUpdate = (change: Partial<UpdateStatus>) => {
   listeners.status.forEach((handler) => handler(update));
 };
 /** About six seconds of simulated download, then installed. */
-function simulateInstall(launch: boolean, intervalMs = 200): void {
+function simulateInstall(launch: boolean): void {
   const total = 14_680_064;
   setUpdate({ phase: "downloading", release, received: 0, total, launch });
   const timer = setInterval(() => {
@@ -78,25 +78,20 @@ function simulateInstall(launch: boolean, intervalMs = 200): void {
     if (received < total) return;
     clearInterval(timer);
     setUpdate({ phase: "ready" });
-  }, intervalMs);
+  }, 200);
 }
 
 export function installMock(): void {
   const scene = new URLSearchParams(location.search).get("scene");
-  setTimeout(() => {
-    if (scene === "updating") simulateInstall(true);
-    else if (scene === "updating-slow") simulateInstall(true, 600);
-    else if (scene === "restart") setUpdate({ phase: "ready", release, launch: false });
+  // This scene represents an update already found at launch. Seed that state
+  // before bootstrap: a cold Vite load may consume the launch-check hold before
+  // a delayed mock timer fires. Real backend state is also read at bootstrap.
+  if (scene === "updating") simulateInstall(true);
+  else setTimeout(() => {
+    if (scene === "restart") setUpdate({ phase: "ready", release, launch: false });
     else setUpdate({ phase: "upToDate", release: { ...release, version: "3.0.3" } });
   }, scene === "restart" ? 1500 : 300);
   let accounts = structuredClone(sample);
-  if (scene === "startup-lazy") {
-    accounts[0].recentGames = Array.from({ length: 10 }, (_, index) => ({
-      champion: `Champion ${index + 1}`,
-      iconUrl: `/startup-lazy-${index}.png`,
-      won: index % 2 === 0,
-    }));
-  }
   if (scene === "freshness") {
     const errors: NonNullable<AccountView["rankProvenance"]>["error"][] = [null, "rate_limited", "forbidden", "parsing_failed", "timeout", "provider_unavailable", "renewal_failed"];
     accounts.forEach((account, index) => {
@@ -115,6 +110,16 @@ export function installMock(): void {
       iconUrl: `/startup-lazy-${index}.png`,
       won: index % 2 === 0,
     }));
+  }
+  if (scene === "ranked-cards") {
+    [10, 2, 0, 12].forEach((count, index) => {
+      accounts[index].description = "";
+      accounts[index].rankedStats = { wins: 47, losses: 33, winRate: 49 + index };
+      accounts[index].rankProvenance = { source: "OP.GG", fetchedAt: Date.now(), sourceUpdatedAt: Date.now(), freshness: "fresh", freshUntil: Date.now() + 900000, renewalAttempted: false, renewalSucceeded: false, error: null };
+      accounts[index].recentGames = Array.from({ length: count }, (_, game) => ({
+        champion: `Champion ${game + 1}`, iconUrl: "/league/ranks/iron.png", won: game % 2 === 0,
+      }));
+    });
   }
   const find = (key: Key) => accounts.find((account) => keyId(account) === keyId(key));
   const fakeFetch = (targets: AccountView[], exclusive = false) => {

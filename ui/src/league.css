@@ -175,6 +175,8 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .accounts.list .meta { gap: 7px; flex-wrap: wrap; }
 .accounts.list .acc-id { display: none; }
 .accounts.list .history { border: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.accounts.list .history { min-width: 0; align-items: stretch; }
+.accounts.list .recent-games { flex-basis: auto; width: 100%; }
 .accounts.list .desc { display: none; }
 .accounts.list .card-actions { gap: 3px; }
 .accounts.list .btn-play { padding: 0 11px; }
