@@ -88,6 +88,7 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
     });
     await t.test("rank, region and search filters keep counts and reset in sync", async () => {
       await open();
+      await page.emulateMediaFeatures([{ name: "prefers-reduced-motion", value: "reduce" }]);
       assert.equal(await count(), 11);
       assert.equal(await text("#account-count"), "11 of 11 accounts");
       await page.select("#region-filter", "EUW");
