@@ -102,6 +102,11 @@ impl LoginStep {
 pub enum LoginError {
     ClientMissing,
     LaunchFailed,
+    /// The Riot Client runs, or must run, as administrator, so this app can
+    /// neither start nor close it.
+    RiotElevated,
+    /// The Riot Client did not close before the login form could be opened.
+    RiotCloseFailed,
     /// The login window or sign-in state never became observable.
     Timeout,
     /// Signing out of the current session is not available.
@@ -134,6 +139,8 @@ impl LoginError {
         match self {
             LoginError::ClientMissing => "riot_client_missing",
             LoginError::LaunchFailed => "riot_launch_failed",
+            LoginError::RiotElevated => "riot_elevated",
+            LoginError::RiotCloseFailed => "riot_close_failed",
             LoginError::Timeout => "riot_timeout",
             LoginError::SignOutFailed => "riot_sign_out_failed",
             LoginError::SessionEnded => "riot_session_ended",
@@ -151,9 +158,33 @@ impl LoginError {
             LoginError::WorkerPanicked => "autotype_failed",
         }
     }
+
+    /// Only fixed categories cross the logging boundary; never account identifiers.
+    fn reason(self) -> Reason {
+        match self {
+            LoginError::ClientMissing => Reason::ClientMissing,
+            LoginError::LaunchFailed => Reason::LaunchFailed,
+            LoginError::RiotElevated => Reason::RiotElevated,
+            LoginError::RiotCloseFailed => Reason::RiotCloseFailed,
+            LoginError::Timeout => Reason::Timeout,
+            LoginError::SignOutFailed => Reason::SignOutFailed,
+            LoginError::SessionEnded => Reason::SessionEnded,
+            LoginError::RendererFailed => Reason::RendererFailed,
+            LoginError::AuthRejected => Reason::AuthRejected,
+            LoginError::CaptchaRejected => Reason::CaptchaRejected,
+            LoginError::RateLimited => Reason::HttpRateLimited,
+            LoginError::TypingFailed => Reason::TypingFailed,
+            LoginError::Cancelled => Reason::Cancelled,
+            LoginError::LeagueRunning => Reason::LeagueRunning,
+            LoginError::CloseFailed => Reason::CloseFailed,
+            LoginError::GameLaunchFailed => Reason::GameLaunchFailed,
+            LoginError::AccountMismatch => Reason::AccountMismatch,
+            LoginError::Banned(_) => Reason::AccountBanned,
+            LoginError::WorkerPanicked => Reason::WorkerPanicked,
+        }
+    }
 }
 
-/// Only fixed categories cross the logging boundary; never account identifiers.
 pub fn record_login_result(result: &Result<LoginOutcome, LoginError>) {
     let (event, reason) = match result {
         Ok(outcome) => (
@@ -170,25 +201,7 @@ pub fn record_login_result(result: &Result<LoginOutcome, LoginError>) {
             } else {
                 Event::LoginFailed
             },
-            match error {
-                LoginError::ClientMissing => Reason::ClientMissing,
-                LoginError::LaunchFailed => Reason::LaunchFailed,
-                LoginError::Timeout => Reason::Timeout,
-                LoginError::SignOutFailed => Reason::SignOutFailed,
-                LoginError::SessionEnded => Reason::SessionEnded,
-                LoginError::RendererFailed => Reason::RendererFailed,
-                LoginError::AuthRejected => Reason::AuthRejected,
-                LoginError::CaptchaRejected => Reason::CaptchaRejected,
-                LoginError::RateLimited => Reason::HttpRateLimited,
-                LoginError::TypingFailed => Reason::TypingFailed,
-                LoginError::Cancelled => Reason::Cancelled,
-                LoginError::LeagueRunning => Reason::LeagueRunning,
-                LoginError::CloseFailed => Reason::CloseFailed,
-                LoginError::GameLaunchFailed => Reason::GameLaunchFailed,
-                LoginError::AccountMismatch => Reason::AccountMismatch,
-                LoginError::Banned(_) => Reason::AccountBanned,
-                LoginError::WorkerPanicked => Reason::WorkerPanicked,
-            },
+            error.reason(),
         ),
     };
     logging::record(event, reason);
@@ -881,6 +894,9 @@ pub fn login(
                         return Ok(LoginOutcome::AlreadySignedIn);
                     }
                     Some(_) if sign_out_sent.is_none() => {
+                        // Signing in needs a client this app can restart; do
+                        // not sign the other account out without one.
+                        client.ensure_controllable()?;
                         progress(LoginStep::SignOut);
                         api.sign_out(cancel)?;
                         sign_out_sent = Some(Instant::now());
@@ -932,10 +948,27 @@ pub fn login(
 
 #[cfg(windows)]
 mod windows {
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED};
     use windows_sys::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_TERMINATE,
     };
+
+    /// Whether Windows refuses to let this process end `pid`, as for a process
+    /// running as administrator when this one is not. An exited process is
+    /// not refused.
+    pub fn terminate_denied(pid: u32) -> bool {
+        // SAFETY: plain terminate-right probe, closed below; nothing is ended.
+        let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if process.is_null() {
+            // SAFETY: reads this thread's error from the call above.
+            return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+        }
+        // SAFETY: handle opened above.
+        unsafe { CloseHandle(process) };
+        false
+    }
+
     pub fn process_path(pid: u32) -> Option<std::path::PathBuf> {
         // SAFETY: plain query handle, closed below.
         let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
@@ -959,6 +992,10 @@ mod windows {
 
 #[cfg(not(windows))]
 mod windows {
+    pub fn terminate_denied(_: u32) -> bool {
+        false
+    }
+
     pub fn process_path(_: u32) -> Option<std::path::PathBuf> {
         None
     }
@@ -1247,6 +1284,16 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn only_a_refused_process_counts_as_out_of_reach() {
+        assert!(!windows::terminate_denied(std::process::id()));
+        // The protected System process refuses even administrators.
+        assert!(windows::terminate_denied(4));
+        // No process has this ID; one that exited is not refused either.
+        assert!(!windows::terminate_denied(u32::MAX - 3));
+    }
+
+    #[test]
     fn only_current_league_suspensions_count_as_bans() {
         use serde_json::json;
 
@@ -1512,6 +1559,9 @@ mod tests {
             record_login_result(&Err(LoginError::GameLaunchFailed));
             record_login_result(&Err(LoginError::SignOutFailed));
             record_login_result(&Err(LoginError::SessionEnded));
+            record_login_result(&Err(LoginError::RiotElevated));
+            record_login_result(&Err(LoginError::RiotCloseFailed));
+            record_login_result(&Err(LoginError::CloseFailed));
             record_login_result(&Err(LoginError::Cancelled));
             record_login_result(&Ok(LoginOutcome::AlreadySignedIn));
         });
@@ -1533,6 +1583,9 @@ mod tests {
             "ERROR event=login_failed reason=game_launch_failed",
             "ERROR event=login_failed reason=sign_out_failed",
             "ERROR event=login_failed reason=session_ended",
+            "ERROR event=login_failed reason=riot_elevated",
+            "ERROR event=login_failed reason=riot_close_failed",
+            "ERROR event=login_failed reason=close_failed",
             "INFO event=login_cancelled reason=cancelled",
             "INFO event=login_completed reason=already_signed_in",
         ] {
