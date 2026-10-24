@@ -22,7 +22,7 @@ One-click login, live ranks and ban countdowns, with passwords kept in Windows C
 - **Duo finder.** The *Friend elo* filter shows which accounts can play ranked with a friend.
 - **Ban check.** Each login reads the account's League ban from Riot; a banned account shows the time left instead of launching a game that would disconnect you.
 - **Safe by design.** Passwords stay in Windows Credential Manager and never reach the interface.
-- **Made for daily use.** Launch with Windows, keyboard shortcuts, import/export, automatic updates, 6 languages.
+- **Made for daily use.** Launch with Windows, keyboard shortcuts, import/export, automatic updates, 6 languages, interface size from 80 to 200%.
 
 ## Installation
 
@@ -50,7 +50,7 @@ username2----password2
   </tr>
   <tr>
     <td><img src="docs/screenshots/add.png" alt="Add account panel" /><br /><sub><b>Add one account or paste many.</b></sub></td>
-    <td><img src="docs/screenshots/settings.png" alt="Settings" /><br /><sub><b>Settings:</b> language, startup, refresh interval, login method, updates.</sub></td>
+    <td><img src="docs/screenshots/settings.png" alt="Settings" /><br /><sub><b>Settings:</b> language, interface size, startup, refresh interval, login method, updates.</sub></td>
   </tr>
 </table>
 
