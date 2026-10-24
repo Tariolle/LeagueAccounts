@@ -32,6 +32,8 @@ export interface Settings {
   launchGame: boolean;
   /** Install new releases automatically; when off, only notify. */
   autoUpdate: boolean;
+  /** Interface size in percent; the window zooms and resizes with it. */
+  uiScale: number;
   riotClientFound: boolean;
   tftInstalled: boolean;
 }

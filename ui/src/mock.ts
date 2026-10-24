@@ -57,6 +57,7 @@ const settings: Settings = {
   loginMethod: "riot",
   launchGame: true,
   autoUpdate: true,
+  uiScale: 100,
   riotClientFound: true,
   tftInstalled: true,
 };
