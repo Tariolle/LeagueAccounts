@@ -402,25 +402,22 @@ impl RankFetcher {
         }
         let body = section.select(&body_selector).next()?;
         let text = body.text().collect::<Vec<_>>().join(" ");
-        if let Some(current) = body.select(&strong).next() {
-            let current_block = scraper::ElementRef::wrap(current.parent()?)?;
-            let current_text = current_block.text().collect::<Vec<_>>().join(" ");
-            let (tier, division, lp) = self.parse_rank_text(&current_text)?;
-            rank.tier = tier;
-            rank.division = division;
-            rank.lp = lp;
-            // The first stats row belongs to the current rank, before Top tier.
-            static RECORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s*W\s*(\d+)\s*L\s*Win rate\s*(\d+)\s*%").expect("valid Flex record regex"));
-            if let Some(captures) = RECORD.captures(&text) {
-                let win_rate = captures[3].parse::<u8>().ok()?;
-                if win_rate <= 100 {
-                    rank.ranked_stats = Some(RankedStats {
-                        wins: captures[1].parse().ok()?, losses: captures[2].parse().ok()?, win_rate,
-                    });
-                }
+        let current = body.select(&strong).next()?;
+        let current_block = scraper::ElementRef::wrap(current.parent()?)?;
+        let current_text = current_block.text().collect::<Vec<_>>().join(" ");
+        let (tier, division, lp) = self.parse_rank_text(&current_text)?;
+        rank.tier = tier;
+        rank.division = division;
+        rank.lp = lp;
+        // The first stats row belongs to the current rank, before Top tier.
+        static RECORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s*W\s*(\d+)\s*L\s*Win rate\s*(\d+)\s*%").expect("valid Flex record regex"));
+        if let Some(captures) = RECORD.captures(&text) {
+            let win_rate = captures[3].parse::<u8>().ok()?;
+            if win_rate <= 100 {
+                rank.ranked_stats = Some(RankedStats {
+                    wins: captures[1].parse().ok()?, losses: captures[2].parse().ok()?, win_rate,
+                });
             }
-        } else {
-            return None;
         }
         let cells = Selector::parse("table tbody tr:first-child td").ok()?;
         let history: Vec<_> = section.select(&cells).map(|cell| cell.text().collect::<String>()).collect();
