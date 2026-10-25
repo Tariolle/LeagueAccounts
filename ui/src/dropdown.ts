@@ -113,12 +113,43 @@ function enhance(select: HTMLSelectElement): void {
     } else current.removeAttribute("aria-activedescendant");
   }
 
+  /**
+   * Show the flyout, preferring below the frame and flipping above only when
+   * the room below cannot hold a usable list.
+   *
+   * CSS anchor positioning picks a side but cannot size the list to it: a
+   * popover anchored near the bottom of the window grew past the viewport, and
+   * its last rows were unreachable because nothing behind it scrolls. Measuring
+   * here lets the list take exactly the room it has, so it either fits or
+   * scrolls to its end.
+   *
+   * Opening downwards is the convention every other menu follows, so a short
+   * list stays below even when the space above happens to be larger; flipping
+   * is reserved for the case where below is genuinely unusable.
+   */
+  function place(): void {
+    const box = (frame ?? host).getBoundingClientRect();
+    const margin = 8;
+    const below = window.innerHeight - box.bottom - margin * 2;
+    const above = box.top - margin * 2;
+    const natural = scroller.scrollHeight;
+    // A few rows are enough to read and scroll through; below this, flipping up
+    // reads better than a two-row window.
+    const usable = 6 * 31;
+    const downwards = below >= Math.min(natural, usable) || above < usable;
+    const room = Math.max(120, Math.min(downwards ? below : above, natural));
+    list.style.maxHeight = `${room}px`;
+    list.style.top = downwards ? `${box.bottom}px` : "auto";
+    list.style.bottom = downwards ? "auto" : `${window.innerHeight - box.top}px`;
+  }
+
   function open(): void {
     if (select.disabled || isOpen()) return;
     openDropdown?.close();
     active = select.selectedIndex;
     renderOptions();
     list.showPopover();
+    place();
     highlight(active);
     current.setAttribute("aria-expanded", "true");
     frame?.classList.add("is-open");
@@ -131,6 +162,10 @@ function enhance(select: HTMLSelectElement): void {
   function close(): void {
     if (!isOpen()) return;
     list.hidePopover();
+    // Placement was measured for this frame; the next open measures again.
+    list.style.removeProperty("max-height");
+    list.style.removeProperty("top");
+    list.style.removeProperty("bottom");
     current.setAttribute("aria-expanded", "false");
     current.removeAttribute("aria-activedescendant");
     frame?.classList.remove("is-open");

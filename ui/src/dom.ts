@@ -88,6 +88,9 @@ export function modal(options: {
   body: string;
   actions: ModalAction[];
   wide?: boolean;
+  /// Stack the footer actions vertically; for dialogs whose labels are long
+  /// enough that a single row would overflow the modal width.
+  stacked?: boolean;
   onOpen?: (root: HTMLElement) => void;
   onSubmit?: (value: string, root: HTMLElement) => boolean | Promise<boolean>;
 }): Promise<string | null> {
@@ -102,7 +105,7 @@ export function modal(options: {
             <button class="modal-close" data-value="__close" aria-label="${esc(t("common.close"))}"><span></span></button>
           </div>
           <form class="modal-body" novalidate>${options.body}</form>
-          <footer class="modal-foot">
+          <footer class="modal-foot${options.stacked ? " is-stacked" : ""}">
             ${options.actions
               .map(
                 (action) =>

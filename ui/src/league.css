@@ -139,6 +139,11 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .acc-id { color: #738891; font-size: 10px; margin-left: auto; }
 .acc-id .icon { display: none; }
 .card-more { margin: -6px -9px 0 0; width: 25px; height: 28px; opacity: .65; color: #9eacb1; }
+/* Sits beside the Name#TAG in the title row: quiet until hovered so it does not
+   compete with the name it copies. */
+.copy-riot-id { width: 20px; height: 20px; padding: 0; border: 0; background: none; color: #7c8d98; opacity: 0; transition: opacity 160ms, color 160ms; }
+.card:hover .copy-riot-id, .copy-riot-id:focus-visible { opacity: 1; }
+.copy-riot-id:hover { color: #f0e6d2; }
 .card-rank { display: grid; grid-template-columns: 118px minmax(0,1fr); align-items: center; min-height: 114px; margin: 4px -4px 0; gap: 10px; }
 .emblem-wrap { display: grid; place-items: center; filter: none; }
 .card:hover .emblem-wrap { transform: none; }
@@ -166,6 +171,10 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .desc { margin: 5px 0 10px; min-height: 14px; height: 14px; font-size: 11px; font-style: normal; color: #a09b8c; }
 .card-actions { gap: 7px; }
 .btn-play { height: 33px; border: 1px solid #517274; border-radius: 0; background: linear-gradient(180deg, #17333a, #10232c); color: #bfe1db; font-size: 11px; letter-spacing: .12em; }
+/* A single Chinese character at 11px with .12em tracking reads as a stray mark
+   next to the Latin "Log in" it replaces. Chinese has no uppercase, so the wide
+   tracking buys nothing either: drop it, and give the label size and weight. */
+:lang(zh) .btn-play { font-size: 14px; font-weight: 700; letter-spacing: .04em; }
 .btn-play:hover { background: linear-gradient(180deg, #23525a, #173740); color: #e3f9f5; border-color: #7fbbb5; box-shadow: 0 0 15px #5ccbc012; }
 .btn-play .icon { width: 14px; height: 14px; }
 .card-actions .icon-btn { width: 32px; height: 32px; border: 0; color: #899da5; background: #ffffff03; }
@@ -282,7 +291,6 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
   .select-label { display: none; }
   .accounts.list .card { grid-template-columns: minmax(155px,1fr) minmax(185px,1fr) auto; gap: 14px; }
   .accounts.list .history { display: none; }
-  .accounts.list .card-actions .icon-btn { display: none; }
   .accounts.list .card-more { display: flex; }
 }
 @media (max-height: 730px) {
