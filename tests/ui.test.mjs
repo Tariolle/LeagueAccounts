@@ -33,12 +33,15 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
       const flexCards = await page.$$eval("#accounts > .card", cards => cards.map(card => ({
         name: card.querySelector(".game-name").textContent, rank: card.querySelector(".rank-name").textContent,
         stats: card.querySelector(".ranked-stats")?.textContent ?? "",
+        stale: Boolean(card.querySelector(".flex-stale")),
       })));
       assert.deepEqual(flexCards.map(card => card.name), ["Kebab Enjoyer", "Hextech Fox", "Piltover Queen", "Snowball King"]);
       assert.match(flexCards[0].rank, /Diamond IV/);
       assert.match(flexCards[1].stats, /20W.*10L.*67%/);
       assert.match(flexCards[2].rank, /Unranked/);
       assert.match(flexCards[3].rank, /Unavailable/);
+      assert.equal(flexCards[0].stale, true);
+      assert.equal(flexCards[1].stale, false);
       for (const view of ["grid", "list"]) {
         await page.click(`[data-view="${view}"]`);
         await page.setViewport({ width: 980, height: 640 });

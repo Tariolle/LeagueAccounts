@@ -349,6 +349,7 @@ impl AccountManager {
                 level: item.level,
                 ranked_stats: item.ranked_stats,
                 flex: item.flex,
+                flex_provenance: item.flex_provenance,
                 recent_games: item.recent_games,
                 reached_last_season: if item.reached_last_season.is_empty() {
                     "N/A".to_owned()
@@ -430,6 +431,7 @@ struct ExportAccount {
     level: String,
     ranked_stats: Option<RankedStats>,
     flex: Option<FlexRank>,
+    flex_provenance: Option<RankProvenance>,
     recent_games: Vec<RecentGame>,
     reached_last_season: String,
     finished_last_season: String,
@@ -454,6 +456,7 @@ impl From<&Account> for ExportAccount {
             level: account.level.clone(),
             ranked_stats: account.ranked_stats.clone(),
             flex: account.flex.clone(),
+            flex_provenance: account.flex_provenance.clone(),
             recent_games: account.recent_games.clone(),
             reached_last_season: account.reached_last_season.clone(),
             finished_last_season: account.finished_last_season.clone(),
@@ -493,6 +496,8 @@ struct ImportAccount {
     #[serde(default)]
     flex: Option<FlexRank>,
     #[serde(default)]
+    flex_provenance: Option<RankProvenance>,
+    #[serde(default)]
     recent_games: Vec<RecentGame>,
     #[serde(default)]
     reached_last_season: String,
@@ -518,12 +523,19 @@ mod tests {
                 source_updated_at: Some(42),
                 ..Default::default()
             }),
+            flex_provenance: Some(RankProvenance {
+                source: "OP.GG".into(),
+                freshness: crate::models::Freshness::Stale,
+                error: Some(crate::models::RankFetchError::ParsingFailed),
+                ..Default::default()
+            }),
             tft_provenance: Some(RankProvenance::default()),
             ..Default::default()
         };
         let json = serde_json::to_string(&ExportAccount::from(&account)).unwrap();
         let imported: ImportAccount = serde_json::from_str(&json).unwrap();
         assert_eq!(imported.rank_provenance, account.rank_provenance);
+        assert_eq!(imported.flex_provenance, account.flex_provenance);
         assert_eq!(imported.tft_provenance, account.tft_provenance);
     }
 

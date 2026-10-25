@@ -104,6 +104,11 @@ export function installMock(): void {
     accounts[0].flex = { tier: "Gold", division: "II", lp: "40", lastSeason: "Silver I", rankedStats: { wins: 20, losses: 10, winRate: 67 } };
     accounts[1].flex = { tier: "Diamond", division: "IV", lp: "1", lastSeason: "Platinum II", rankedStats: { wins: 15, losses: 15, winRate: 50 } };
     accounts[2].flex = { tier: "Unranked", division: "", lp: "", lastSeason: "N/A", rankedStats: null };
+    const flexCheckedAt = Date.now();
+    const flexFresh = { source: "OP.GG", fetchedAt: flexCheckedAt, sourceUpdatedAt: flexCheckedAt, freshness: "fresh" as const, freshUntil: flexCheckedAt + 900_000, renewalAttempted: false, renewalSucceeded: false, error: null };
+    accounts[0].flexProvenance = flexFresh;
+    accounts[1].flexProvenance = { ...flexFresh, freshness: "stale", error: "parsing_failed" };
+    accounts[2].flexProvenance = flexFresh;
     // The fourth account predates Flex support: unknown, rather than Unranked.
   }
   if (scene === "startup-lazy") {

@@ -77,6 +77,7 @@ impl RankFetcher {
         // If a network request failed, provenance still describes the retained data.
         for (next, previous) in [
             (&mut info.provenance, &account.rank_provenance),
+            (&mut info.flex_provenance, &account.flex_provenance),
             (&mut info.tft_provenance, &account.tft_provenance),
         ] {
             if let (Some(next), Some(previous)) = (next.as_mut(), previous) {
@@ -236,9 +237,11 @@ impl RankFetcher {
             .map(|info| self.with_defaults(info))
             .unwrap_or_else(|reason| {
                 logging::record(Event::RankFetchFailed, reason);
+                let provenance = failed_provenance(reason);
                 RankInfo {
                     riot_id_not_found: (reason == Reason::HttpNotFound).then_some(true),
-                    provenance: Some(failed_provenance(reason)),
+                    provenance: Some(provenance.clone()),
+                    flex_provenance: Some(provenance),
                     ..RankInfo::error()
                 }
             })
@@ -353,6 +356,7 @@ impl RankFetcher {
                 Err(_) => {}
             }
         }
+        rank.flex_provenance = Some(flex_provenance(provenance.clone(), rank.flex.is_some()));
         rank.provenance = Some(provenance);
         Ok(rank)
     }
@@ -697,6 +701,7 @@ impl RankFetcher {
             },
             tft: rank.tft,
             provenance: rank.provenance,
+            flex_provenance: rank.flex_provenance,
             tft_provenance: rank.tft_provenance,
         }
     }
@@ -735,6 +740,19 @@ fn sourced_provenance(source_updated_at: Option<u64>) -> RankProvenance {
             .map(|at| at + MAX_AGE.as_millis() as u64),
         ..Default::default()
     }
+}
+
+fn flex_provenance(mut profile: RankProvenance, verified: bool) -> RankProvenance {
+    if !verified {
+        // The profile was fetched, but its Flex standing could not be verified.
+        // Do not report this request's timestamps as the age of the retained rank.
+        profile.fetched_at = None;
+        profile.source_updated_at = None;
+        profile.fresh_until = None;
+        profile.freshness = Freshness::Stale;
+        profile.error = Some(RankFetchError::ParsingFailed);
+    }
+    profile
 }
 
 fn failed_provenance(reason: Reason) -> RankProvenance {
@@ -976,6 +994,26 @@ fn title_case(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_flex_does_not_inherit_the_profile_fetch_time() {
+        let profile = RankProvenance {
+            source: "OP.GG".into(),
+            fetched_at: Some(200),
+            source_updated_at: Some(100),
+            freshness: Freshness::Fresh,
+            fresh_until: Some(500),
+            ..Default::default()
+        };
+
+        let flex = flex_provenance(profile, false);
+
+        assert_eq!(flex.fetched_at, None);
+        assert_eq!(flex.source_updated_at, None);
+        assert_eq!(flex.fresh_until, None);
+        assert_eq!(flex.freshness, Freshness::Stale);
+        assert_eq!(flex.error, Some(RankFetchError::ParsingFailed));
+    }
 
     #[test]
     fn ranked_record_does_not_use_a_champions_record() {

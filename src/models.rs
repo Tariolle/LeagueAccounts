@@ -30,6 +30,10 @@ pub struct Account {
     /// None until the Flex section has been read successfully.
     #[serde(default)]
     pub flex: Option<FlexRank>,
+    /// Flex has independent freshness because its section can fail to parse
+    /// while the rest of the LoL profile is still readable.
+    #[serde(default)]
+    pub flex_provenance: Option<RankProvenance>,
     /// Recent LoL games in source order, newest first.
     #[serde(default)]
     pub recent_games: Vec<RecentGame>,
@@ -160,6 +164,8 @@ pub struct RankInfo {
     pub ranked_stats: Option<RankedStats>,
     /// None preserves saved Flex data on an unreadable or missing section.
     pub flex: Option<FlexRank>,
+    /// None when Flex freshness was not updated by this fetch.
+    pub flex_provenance: Option<RankProvenance>,
     /// None means history could not be read; Some(empty) is a successful empty result.
     pub recent_games: Option<Vec<RecentGame>>,
     pub reached_last_season: String,
@@ -275,6 +281,13 @@ impl RankInfo {
             // No successful fetch yet: show Error rather than an invented standing.
             account.tier = "Error".to_owned();
         }
+        if let Some(provenance) = &self.flex_provenance {
+            account.flex_provenance = Some(provenance.clone());
+        } else if self.flex.is_some() {
+            if let Some(provenance) = &self.provenance {
+                account.flex_provenance = Some(provenance.clone());
+            }
+        }
         if let Some(tft) = &self.tft {
             account.tft = tft.clone();
         } else if !tft_fetched_before && account.tft.tier == "Unranked" {
@@ -347,5 +360,48 @@ mod tests {
 
         assert_eq!(account.ranked_stats, Some(saved_stats));
         assert_eq!(account.tier, "Diamond");
+    }
+
+    #[test]
+    fn unreadable_flex_keeps_saved_rank_but_marks_only_flex_stale() {
+        let saved_flex = FlexRank {
+            tier: "Gold".into(),
+            division: "II".into(),
+            lp: "40".into(),
+            last_season: "Silver I".into(),
+            ranked_stats: None,
+        };
+        let fresh_profile = RankProvenance {
+            source: "OP.GG".into(),
+            freshness: Freshness::Fresh,
+            fetched_at: Some(100),
+            source_updated_at: Some(100),
+            ..Default::default()
+        };
+        let stale_flex = RankProvenance {
+            source: "OP.GG".into(),
+            freshness: Freshness::Stale,
+            error: Some(RankFetchError::ParsingFailed),
+            ..Default::default()
+        };
+        let mut account = Account {
+            tier: "Gold".into(),
+            flex: Some(saved_flex.clone()),
+            flex_provenance: Some(fresh_profile.clone()),
+            ..Default::default()
+        };
+
+        RankInfo {
+            tier: "Platinum".into(),
+            provenance: Some(fresh_profile.clone()),
+            flex_provenance: Some(stale_flex.clone()),
+            ..Default::default()
+        }
+        .apply_to(&mut account);
+
+        assert_eq!(account.flex, Some(saved_flex));
+        assert_eq!(account.tier, "Platinum");
+        assert_eq!(account.rank_provenance, Some(fresh_profile));
+        assert_eq!(account.flex_provenance, Some(stale_flex));
     }
 }
