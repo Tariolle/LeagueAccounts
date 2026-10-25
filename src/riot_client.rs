@@ -245,6 +245,14 @@ pub fn game_installed(game: Game) -> bool {
         .exists()
 }
 
+/// Riot's per-product locale resource for the live patchline.
+fn product_locale_path(game: Game) -> String {
+    format!(
+        "/riotclient/product-locales/products/{}/patchlines/live",
+        game.product()
+    )
+}
+
 /// Start `game` for the signed-in account and wait until its client process
 /// confirms the same account. Requests go through the local API, after
 /// rechecking the Riot session immediately before each launch request.
@@ -342,13 +350,56 @@ fn launch_confirmed(current: &GameStatus, account_id: &str) -> Result<bool, Logi
 
 /// Launch the requested game; TFT falls back to the League client, which
 /// also hosts TFT, when the standalone TFT client cannot start.
-fn start_game(game: Game, account_id: &str, cancel: &AtomicBool) -> Result<(), LoginError> {
+///
+/// `locale` is applied to the product before the launch request. A locale the
+/// client refuses is not fatal: the game still starts in whatever language the
+/// client already had.
+fn start_game(
+    game: Game,
+    account_id: &str,
+    locale: Option<&str>,
+    cancel: &AtomicBool,
+) -> Result<(), LoginError> {
+    if let Some(locale) = locale {
+        apply_locale(game, locale);
+    }
     match launch_game(game, account_id, cancel) {
         Err(LoginError::GameLaunchFailed) if game == Game::Tft => {
+            if let Some(locale) = locale {
+                apply_locale(Game::League, locale);
+            }
             launch_game(Game::League, account_id, cancel)
         }
         result => result,
     }
+}
+
+/// Set the game's language and record the outcome.
+///
+/// The Riot Client's local API accepts any locale and reads it back, but it
+/// builds the game's `--locale=` argument from the product settings file, so
+/// that file is what decides. Both are written: the API keeps the client's own
+/// UI in step, and the file is what the game starts with. `zh_CN` — which the
+/// registry does not list but the game does ship assets for — only takes effect
+/// through the file.
+///
+/// Failures stay non-fatal; the user still gets the game, just not the
+/// requested language.
+fn apply_locale(game: Game, locale: &str) {
+    let by_file = crate::game_locale::settings_file(game.product())
+        .is_some_and(|path| crate::game_locale::write(&path, locale));
+    let by_api = LocalApi::read()
+        .filter(|api| api.set_product_locale(game, locale))
+        .is_some_and(|api| api.product_locale(game).as_deref() == Some(locale));
+    logging::record(
+        Event::LoginProgress,
+        match (by_file, by_api) {
+            (true, _) => Reason::LocaleApplied,
+            // The file is authoritative, so an API-only result is not enough.
+            (false, true) => Reason::LocaleRejected,
+            (false, false) => Reason::LocaleUnavailable,
+        },
+    );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -559,6 +610,25 @@ impl LocalApi {
         }
     }
 
+    /// Read the product locale the client will launch `game` with.
+    fn product_locale(&self, game: Game) -> Option<String> {
+        let (status, body) = self.get(&product_locale_path(game))?;
+        (status == 200).then(|| body.as_str().map(str::to_owned)).flatten()
+    }
+
+    /// Set the product locale before launching. Riot answers 201 on success and
+    /// keeps the previous value when the locale is not installable, so callers
+    /// verify with [`LocalApi::product_locale`] instead of trusting the status.
+    fn set_product_locale(&self, game: Game, locale: &str) -> bool {
+        self.client
+            .put(format!("{}{}", self.base, product_locale_path(game)))
+            .basic_auth("riot", Some(&self.password))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::json!(locale).to_string())
+            .send()
+            .is_ok_and(|response| response.status().is_success())
+    }
+
     /// The game signs in to the region the Riot Client is set to. Riot's
     /// window moves it to the account's League region after each sign-in;
     /// without that window, an account from another region would start
@@ -642,6 +712,21 @@ impl LocalApi {
             .map(str::to_owned)
     }
 
+    /// The signed-in player's `GameName#TagLine`, read from the game client.
+    ///
+    /// Accounts added in bulk often carry only a login name and a password.
+    /// Once the game client has a session, its own summoner record knows the
+    /// Riot ID, so the account can be filled in without asking the user.
+    /// `gameName` is empty for an unnamed account, and `tagLine` is
+    /// upper-cased to match how Riot displays it.
+    fn riot_id(&self) -> Option<String> {
+        let (status, body) = self.get("/lol-summoner/v1/current-summoner")?;
+        if status != 200 {
+            return None;
+        }
+        riot_id_from_summoner(&body)
+    }
+
     fn sign_out(&self, cancel: &AtomicBool) -> Result<(), LoginError> {
         check_cancelled(cancel)?;
         if !self
@@ -663,6 +748,19 @@ impl LocalApi {
             Err(LoginError::SignOutFailed)
         }
     }
+}
+
+/// `GameName#TAGLINE` from a `/lol-summoner/v1/current-summoner` body.
+///
+/// `tagLine` arrives lower-cased (`tw2`) while Riot displays it upper-cased.
+/// An unnamed account reports empty strings for both, which is not an error.
+fn riot_id_from_summoner(body: &serde_json::Value) -> Option<String> {
+    let game_name = body["gameName"].as_str()?.trim();
+    let tag_line = body["tagLine"].as_str()?.trim();
+    if game_name.is_empty() || tag_line.is_empty() {
+        return None;
+    }
+    Some(format!("{game_name}#{}", tag_line.to_uppercase()))
 }
 
 /// The Riot Client region (a `region_data` key such as `EUW`) to switch to so
@@ -844,6 +942,45 @@ impl GameStatus {
     }
 }
 
+/// The signed-in player's `GameName#TagLine`, from the game client's own API.
+///
+/// `/lol-summoner/v1/current-summoner` belongs to the League client, which
+/// listens on its own port described by its own lockfile. Asking the Riot
+/// Client's API for it always fails, which is why this asks through the same
+/// path as [`game_username`]: the League client process, its install directory,
+/// and a lockfile whose PID matches that process.
+///
+/// Returns `None` while the game client is still starting, when it has no
+/// session yet, or for an account that has not picked a name.
+pub fn signed_in_riot_id() -> Option<String> {
+    riot_id_from_processes(&running_processes())
+}
+
+fn riot_id_from_processes(processes: &[Process]) -> Option<String> {
+    let mut riot_id: Option<String> = None;
+    for process in processes
+        .iter()
+        .filter(|process| matches!(process.name.as_str(), "leagueclient.exe" | "tftclient.exe"))
+    {
+        let executable = windows::process_path(process.pid)?;
+        let contents = std::fs::read_to_string(executable.parent()?.join("lockfile")).ok()?;
+        // Do not trust a lockfile left by a different process or installation.
+        if contents.split(':').nth(1)?.parse::<u32>().ok()? != process.pid {
+            return None;
+        }
+        let found = LocalApi::from_lockfile(&contents)?.riot_id()?;
+        // Two clients on one machine must not disagree about who is signed in.
+        if riot_id
+            .as_ref()
+            .is_some_and(|previous| !previous.eq_ignore_ascii_case(&found))
+        {
+            return None;
+        }
+        riot_id = Some(found);
+    }
+    riot_id
+}
+
 pub fn status() -> GameStatus {
     let processes = running_processes();
     let signed_in_user = LocalApi::read()
@@ -871,6 +1008,9 @@ fn close_league(cancel: &AtomicBool) -> Result<(), LoginError> {
         if force {
             command.arg("/F");
         }
+        // `/T` also ends the crash-handler and crashpad children, which are not
+        // in `names` and would otherwise keep the tree alive.
+        command.arg("/T");
         for name in &names {
             command.args(["/IM", name]);
         }
@@ -927,19 +1067,43 @@ fn close_league_with(
     }
 }
 
+/// What to do once the account is signed in.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LaunchOptions<'a> {
+    /// Product to start after signing in; `None` leaves the client open.
+    pub game: Option<Game>,
+    /// Product locale to apply before the launch request.
+    pub locale: Option<&'a str>,
+    /// Close a League client that belongs to another account.
+    pub close_running: bool,
+    /// Block the VN identity-provider domains in `hosts` for this login and
+    /// restore them afterwards. Riot then skips its "update your profile"
+    /// flow, which otherwise hangs a VN account until its retry limit.
+    pub skip_profile_update: bool,
+}
+
 /// Sign in through Riot's native form, then launch the requested game.
 /// `on_ban` receives the League suspension Riot reports once signed in and
 /// returns whether a suspended account may still launch the game.
 pub fn login(
     account_id: &str,
     password: &str,
-    game: Option<Game>,
-    close_running: bool,
+    options: LaunchOptions<'_>,
     progress: &mut dyn FnMut(LoginStep),
     on_ban: &mut dyn FnMut(Option<Ban>) -> bool,
     cancel: &AtomicBool,
 ) -> Result<LoginOutcome, LoginError> {
+    let LaunchOptions {
+        game,
+        locale,
+        close_running,
+        skip_profile_update,
+    } = options;
     check_cancelled(cancel)?;
+    // The patch must stay in place for the whole login: Riot's profile flow
+    // runs during it, not before. Restored in a scope guard so an error or
+    // cancellation cannot leave the machine patched.
+    let _vn_patch = crate::vn_hosts::Guard::new(skip_profile_update);
     let path = client_path().ok_or(LoginError::ClientMissing)?;
     let current = status();
     check_cancelled(cancel)?;
@@ -979,7 +1143,7 @@ pub fn login(
                                 await_product_context(&mut client, progress, cancel)?;
                             }
                             progress(LoginStep::LaunchGame);
-                            start_game(game, account_id, cancel)?;
+                            start_game(game, account_id, locale, cancel)?;
                         }
                         progress(LoginStep::Done);
                         return Ok(LoginOutcome::AlreadySignedIn);
@@ -1027,9 +1191,14 @@ pub fn login(
         client.close_debugger()?;
         check_cancelled(cancel)?;
         progress(LoginStep::LaunchGame);
-        start_game(game, account_id, cancel)?;
+        start_game(game, account_id, locale, cancel)?;
         client.replaced_by_game();
     } else {
+        // No launch now, but the next manual start should already be in the
+        // account's language, so apply it to the product the user plays.
+        if let Some(locale) = locale {
+            apply_locale(game.unwrap_or(Game::League), locale);
+        }
         client.restore()?;
         check_cancelled(cancel)?;
     }
@@ -1096,6 +1265,38 @@ mod windows {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn summoner_riot_id_joins_name_and_uppercased_tag() {
+        use serde_json::json;
+
+        // The client reports the tag lower-cased; Riot displays it upper-cased.
+        assert_eq!(
+            riot_id_from_summoner(&json!({"gameName": "YuukiYura", "tagLine": "tw2"})).as_deref(),
+            Some("YuukiYura#TW2")
+        );
+        assert_eq!(
+            riot_id_from_summoner(&json!({"gameName": " 你妹有妲己吧 ", "tagLine": " euw "}))
+                .as_deref(),
+            Some("你妹有妲己吧#EUW")
+        );
+    }
+
+    #[test]
+    fn summoner_without_a_name_yields_nothing() {
+        use serde_json::json;
+
+        // An account that has not chosen a Riot ID reports empty strings.
+        for body in [
+            json!({"gameName": "", "tagLine": ""}),
+            json!({"gameName": "Name", "tagLine": ""}),
+            json!({"gameName": "", "tagLine": "EUW"}),
+            json!({"gameName": "   ", "tagLine": "EUW"}),
+            json!({}),
+        ] {
+            assert_eq!(riot_id_from_summoner(&body), None, "{body}");
+        }
+    }
 
     #[test]
     fn lifecycle_never_treats_startup_errors_or_challenges_as_a_login_form() {

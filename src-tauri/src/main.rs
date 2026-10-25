@@ -17,6 +17,7 @@ use leagueaccounts::credentials;
 use leagueaccounts::logging::{self, Event, Reason};
 use leagueaccounts::models::{Account, AccountKey, Ban, RankInfo};
 use leagueaccounts::rank_fetcher::{RankFetcher, RankProvider};
+use leagueaccounts::locales;
 use leagueaccounts::riot_client::{self, Game, LoginError, LoginOutcome, LoginStep};
 use leagueaccounts::utils::{app_data_dir, parse_account_line, region_from_display, settings_file, REGION_MAP};
 use leagueaccounts::AccountManager;
@@ -71,11 +72,38 @@ struct SettingsInput {
     ui_scale: u32,
 }
 
+/// Fields the edit dialog can change. `password: None` keeps the stored
+/// credential; an empty value is a no-op so an untouched field cannot wipe it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateAccount {
+    name: String,
+    description: String,
+    locale: Option<String>,
+    password: Option<String>,
+    skip_profile_update: Option<bool>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocaleOption {
+    code: &'static str,
+    name: &'static str,
+    /// False for locales whose client home page does not render, so the UI
+    /// can warn before the user picks one.
+    home_page_works: bool,
+    /// False when the Riot Client substitutes another locale at launch, so the
+    /// UI does not promise a language the game will not load.
+    launchable: bool,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Bootstrap {
     accounts: Vec<AccountView>,
     regions: Vec<String>,
+    /// Every game locale the client can install, with display names.
+    locales: Vec<LocaleOption>,
     version: &'static str,
     logging_available: bool,
     load_error: Option<AppError>,
@@ -92,6 +120,12 @@ struct NewAccount {
     region: String,
     password: String,
     description: String,
+    /// Product locale the game should start in; omitted means Riot's choice.
+    #[serde(default)]
+    locale: Option<String>,
+    /// Skip Riot's "update your profile" flow at sign-in (VN accounts).
+    #[serde(default)]
+    skip_profile_update: bool,
 }
 
 #[derive(Serialize)]
@@ -106,6 +140,17 @@ struct BatchResult {
 struct BulkAddResult {
     added: usize,
     skipped_lines: Vec<usize>,
+}
+
+/// Validate a locale coming from the web view. An empty value clears the
+/// override; an unknown one is rejected instead of silently becoming `en_US`.
+fn normalize_locale(value: Option<&str>) -> CommandResult<Option<String>> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => locales::normalize(value)
+            .map(|locale| Some(locale.to_owned()))
+            .ok_or_else(|| fail("invalid_locale")),
+    }
 }
 
 fn manager(state: &Shared) -> CommandResult<MutexGuard<'_, AccountManager>> {
@@ -165,6 +210,15 @@ fn bootstrap(app: AppHandle, state: AppState<'_>) -> CommandResult<Bootstrap> {
             .iter()
             .map(|(label, _)| (*label).to_owned())
             .collect(),
+        locales: locales::GAME_LOCALES
+            .iter()
+            .map(|code| LocaleOption {
+                code,
+                name: locales::locale_name(code),
+                home_page_works: locales::home_page_works(code),
+                launchable: locales::is_launchable(code),
+            })
+            .collect(),
         version: env!("CARGO_PKG_VERSION"),
         logging_available: logging::is_available(),
         load_error: state.load_error.clone(),
@@ -188,6 +242,7 @@ fn add_account(app: AppHandle, state: AppState<'_>, input: NewAccount) -> Comman
     }
     let region_label = input.region.trim().to_owned();
     let region = region_from_display(&region_label).ok_or_else(|| fail("invalid_region"))?;
+    let locale = normalize_locale(input.locale.as_deref())?;
     let account = {
         let mut manager = manager(&state)?;
         if manager.accounts.iter().any(|account| {
@@ -202,6 +257,8 @@ fn add_account(app: AppHandle, state: AppState<'_>, input: NewAccount) -> Comman
             region_display: region_label,
             password,
             description: input.description.trim().to_owned(),
+            locale,
+            skip_profile_update: input.skip_profile_update,
             tier: "Unranked".to_owned(),
             reached_last_season: "N/A".to_owned(),
             finished_last_season: "N/A".to_owned(),
@@ -218,9 +275,16 @@ fn add_account(app: AppHandle, state: AppState<'_>, input: NewAccount) -> Comman
 }
 
 #[tauri::command]
-fn multi_add(app: AppHandle, state: AppState<'_>, text: String, region: String) -> CommandResult<BulkAddResult> {
+fn multi_add(
+    app: AppHandle,
+    state: AppState<'_>,
+    text: String,
+    region: String,
+    locale: Option<String>,
+) -> CommandResult<BulkAddResult> {
     let region_label = region.trim().to_owned();
     let region = region_from_display(&region_label).ok_or_else(|| fail("invalid_region"))?;
+    let locale = normalize_locale(locale.as_deref())?;
     let mut candidates = Vec::new();
     let mut source_lines = Vec::new();
     let mut skipped_lines = Vec::new();
@@ -240,6 +304,7 @@ fn multi_add(app: AppHandle, state: AppState<'_>, text: String, region: String) 
             region_display: region_label.clone(),
             password: password.to_owned(),
             description: String::new(),
+            locale: locale.clone(),
             tier: "Unranked".to_owned(),
             reached_last_season: "N/A".to_owned(),
             finished_last_season: "N/A".to_owned(),
@@ -261,11 +326,20 @@ fn update_account(
     app: AppHandle,
     state: AppState<'_>,
     key: Key,
-    name: String,
-    description: String,
+    input: UpdateAccount,
 ) -> CommandResult<AccountView> {
     let key = AccountKey::from(key);
-    let name = name.trim().to_owned();
+    let name = input.name.trim().to_owned();
+    let locale = normalize_locale(input.locale.as_deref())?;
+    let skip_profile_update = input.skip_profile_update.unwrap_or(false);
+    // `None` leaves the stored password alone; an empty value is a no-op too,
+    // so an untouched password field cannot wipe the credential.
+    let new_password = input
+        .password
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     let (updated, renamed) = {
         let mut manager = manager(&state)?;
         let account = manager.account_mut(&key).ok_or_else(|| fail("not_found"))?;
@@ -275,13 +349,20 @@ fn update_account(
             account.riot_id_not_found = false;
             RankInfo::unranked().apply_to(account);
         }
-        account.description = description.trim().to_owned();
+        account.description = input.description.trim().to_owned();
+        account.locale = locale;
+        account.skip_profile_update = skip_profile_update;
         let updated = account.clone();
         manager
             .save_accounts()
             .map_err(|error| fail_with("save_failed", error))?;
         (updated, renamed)
     };
+    if let Some(password) = new_password {
+        let credential_key = format!("{}:{}", key.region, key.account_id);
+        credentials::set_password(KEYRING_SERVICE, &credential_key, &password)
+            .map_err(|error| fail_with("password_save", error))?;
+    }
     let view = account_view(&updated);
     if renamed {
         start_refresh(app, Arc::clone(&state), vec![updated], RefreshKind::Partial);
@@ -461,15 +542,25 @@ async fn login(
                 Game::League
             }
         });
-        riot_client::login(
+        let outcome = riot_client::login(
             &account.account_id,
             &password,
-            game,
-            close_running,
+            riot_client::LaunchOptions {
+                game,
+                locale: account.locale.as_deref(),
+                close_running,
+                skip_profile_update: account.skip_profile_update,
+            },
             &mut progress,
             &mut on_ban,
             &shared.login.cancel,
-        )
+        );
+        // Bulk-imported accounts usually have no Riot ID. The client now knows
+        // it, so record it instead of making the user look it up.
+        if outcome.is_ok() {
+            adopt_riot_id(&app, &shared, &account_key);
+        }
+        outcome
     })
     .await
     .unwrap_or(Err(LoginError::WorkerPanicked));
@@ -504,6 +595,64 @@ fn remember_ban(app: &AppHandle, state: &Shared, key: &AccountKey, ban: Option<B
     let _ = manager.save_accounts();
     drop(manager);
     let _ = app.emit("account-update", view);
+}
+
+/// Wait for the League client's session, record the Riot ID it reports, then
+/// refresh that account's rank.
+///
+/// The client is still starting when the Riot sign-in finishes: it needs a few
+/// more seconds before `/lol-summoner/v1/current-summoner` answers. A single
+/// immediate read therefore usually found nothing and the account stayed
+/// nameless, so this polls for a bounded time.
+///
+/// Only an empty name is filled: a name the user typed is never replaced, and
+/// giving up (no client, unnamed account) leaves the account untouched. The
+/// rank refresh rides on that same condition — it only runs when this call
+/// actually supplied the ID, because a rank lookup needs a Riot ID and the
+/// account that already had one has been refreshable all along.
+fn adopt_riot_id(app: &AppHandle, shared: &Arc<Shared>, key: &AccountKey) {
+    if !needs_riot_id(shared, key) {
+        return;
+    }
+    // The client needs a few more seconds after the Riot sign-in finishes.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut riot_id = None;
+    while std::time::Instant::now() < deadline {
+        if let Some(found) = riot_client::signed_in_riot_id() {
+            riot_id = Some(found);
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    let Some(riot_id) = riot_id else { return };
+    let Ok(mut manager) = manager(shared) else { return };
+    let Some(stored) = manager.account_mut(key) else { return };
+    // Re-checked against the stored value: an edit may have landed meanwhile.
+    if !stored.name.trim().is_empty() {
+        return;
+    }
+    stored.name = riot_id;
+    stored.riot_id_not_found = false;
+    let view = account_view(stored);
+    // Saved before the refresh so the lookup reads the name from storage rather
+    // than from the caller's snapshot.
+    let account = stored.clone();
+    let _ = manager.save_accounts();
+    drop(manager);
+    let _ = app.emit("account-update", view);
+    start_refresh(app.clone(), Arc::clone(shared), vec![account], RefreshKind::Partial);
+}
+
+/// Whether the account still has no Riot ID to fill in.
+fn needs_riot_id(state: &Shared, key: &AccountKey) -> bool {
+    manager(state)
+        .ok()
+        .and_then(|manager| {
+            manager
+                .account(key)
+                .map(|account| account.name.trim().is_empty())
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Serialize)]
@@ -644,6 +793,29 @@ fn open_release(url: String) -> CommandResult<()> {
         .map_err(|_| fail("browser"))
 }
 
+/// Open ABC's Bilibili page, where the zh-cn-home-locale Pengu plugin is
+/// published. The URL is fixed here rather than passed in from the UI so the
+/// command cannot be repurposed to open an arbitrary link.
+#[tauri::command]
+fn open_home_fix_author() -> CommandResult<()> {
+    std::process::Command::new("explorer.exe")
+        .arg("https://space.bilibili.com/230327779")
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| fail("browser"))
+}
+
+/// Open Pengu Loader's site, which the zh-cn-home-locale plugin needs. Fixed
+/// here for the same reason as the author link above.
+#[tauri::command]
+fn open_pengu_loader() -> CommandResult<()> {
+    std::process::Command::new("explorer.exe")
+        .arg("https://pengu.lol")
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| fail("browser"))
+}
+
 #[tauri::command]
 fn open_logs_folder() -> CommandResult<()> {
     // Fall back to the default location when file logging failed to start,
@@ -766,6 +938,8 @@ fn main() {
             restart_to_update,
             open_release,
             open_logs_folder,
+            open_home_fix_author,
+            open_pengu_loader,
         ])
         .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {

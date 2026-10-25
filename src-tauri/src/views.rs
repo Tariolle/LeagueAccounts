@@ -79,6 +79,8 @@ pub struct AccountView {
     description: String,
     level: String,
     has_password: bool,
+    /// Product locale this account starts the game in; `None` = Riot's choice.
+    locale: Option<String>,
     lol: LolView,
     tft: TftView,
     rank_provenance: Option<RankProvenance>,
@@ -96,6 +98,7 @@ pub fn account_view(account: &Account) -> AccountView {
         description: account.description.clone(),
         level: account.level.clone(),
         has_password: !account.password.is_empty(),
+        locale: account.locale.clone(),
         rank_provenance: account.rank_provenance.clone(),
         tft_provenance: account.tft_provenance.clone(),
         ban: account.ban,

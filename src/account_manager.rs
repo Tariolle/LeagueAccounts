@@ -356,6 +356,8 @@ impl AccountManager {
                     item.finished_last_season
                 },
                 tft: item.tft,
+                locale: item.locale,
+                skip_profile_update: item.skip_profile_update,
                 rank_provenance: item.rank_provenance,
                 tft_provenance: item.tft_provenance,
                 // Re-detected at the next sign-in.
@@ -469,6 +471,10 @@ struct ImportAccount {
     password: String,
     #[serde(default)]
     description: String,
+    #[serde(default)]
+    locale: Option<String>,
+    #[serde(default)]
+    skip_profile_update: bool,
     #[serde(default)]
     tier: String,
     #[serde(default)]
