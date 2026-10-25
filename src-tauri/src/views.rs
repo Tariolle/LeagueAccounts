@@ -1,6 +1,6 @@
 //! Data shapes sent to the web interface. Passwords never appear here.
 
-use leagueaccounts::models::{Account, AccountKey, Ban, RankProvenance, RankedStats, RecentGame};
+use leagueaccounts::models::{Account, AccountKey, Ban, FlexRank, RankProvenance, RankedStats, RecentGame};
 use serde::{Deserialize, Serialize};
 
 /// A command failure the UI translates: a stable `code` plus an optional
@@ -79,6 +79,8 @@ pub struct AccountView {
     description: String,
     level: String,
     ranked_stats: Option<RankedStats>,
+    flex: Option<FlexRank>,
+    flex_provenance: Option<RankProvenance>,
     recent_games: Vec<RecentGame>,
     has_password: bool,
     lol: LolView,
@@ -98,6 +100,8 @@ pub fn account_view(account: &Account) -> AccountView {
         description: account.description.clone(),
         level: account.level.clone(),
         ranked_stats: account.ranked_stats.clone(),
+        flex: account.flex.clone(),
+        flex_provenance: account.flex_provenance.clone(),
         recent_games: account.recent_games.clone(),
         has_password: !account.password.is_empty(),
         rank_provenance: account.rank_provenance.clone(),

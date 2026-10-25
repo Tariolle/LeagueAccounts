@@ -1,7 +1,7 @@
 use crate::credentials;
 use crate::logging::{self, Event, Reason};
 use crate::models::{
-    Account, AccountKey, RankInfo, RankProvenance, RankedStats, RecentGame, TftRank,
+    Account, AccountKey, FlexRank, RankInfo, RankProvenance, RankedStats, RecentGame, TftRank,
 };
 use crate::rank_fetcher::RankProvider;
 use crate::utils::{accounts_file, region_display, sort_accounts};
@@ -348,6 +348,8 @@ impl AccountManager {
                 lp: item.lp,
                 level: item.level,
                 ranked_stats: item.ranked_stats,
+                flex: item.flex,
+                flex_provenance: item.flex_provenance,
                 recent_games: item.recent_games,
                 reached_last_season: if item.reached_last_season.is_empty() {
                     "N/A".to_owned()
@@ -428,6 +430,8 @@ struct ExportAccount {
     lp: String,
     level: String,
     ranked_stats: Option<RankedStats>,
+    flex: Option<FlexRank>,
+    flex_provenance: Option<RankProvenance>,
     recent_games: Vec<RecentGame>,
     reached_last_season: String,
     finished_last_season: String,
@@ -451,6 +455,8 @@ impl From<&Account> for ExportAccount {
             lp: account.lp.clone(),
             level: account.level.clone(),
             ranked_stats: account.ranked_stats.clone(),
+            flex: account.flex.clone(),
+            flex_provenance: account.flex_provenance.clone(),
             recent_games: account.recent_games.clone(),
             reached_last_season: account.reached_last_season.clone(),
             finished_last_season: account.finished_last_season.clone(),
@@ -488,6 +494,10 @@ struct ImportAccount {
     #[serde(default)]
     ranked_stats: Option<RankedStats>,
     #[serde(default)]
+    flex: Option<FlexRank>,
+    #[serde(default)]
+    flex_provenance: Option<RankProvenance>,
+    #[serde(default)]
     recent_games: Vec<RecentGame>,
     #[serde(default)]
     reached_last_season: String,
@@ -513,18 +523,29 @@ mod tests {
                 source_updated_at: Some(42),
                 ..Default::default()
             }),
+            flex_provenance: Some(RankProvenance {
+                source: "OP.GG".into(),
+                freshness: crate::models::Freshness::Stale,
+                error: Some(crate::models::RankFetchError::ParsingFailed),
+                ..Default::default()
+            }),
             tft_provenance: Some(RankProvenance::default()),
             ..Default::default()
         };
         let json = serde_json::to_string(&ExportAccount::from(&account)).unwrap();
         let imported: ImportAccount = serde_json::from_str(&json).unwrap();
         assert_eq!(imported.rank_provenance, account.rank_provenance);
+        assert_eq!(imported.flex_provenance, account.flex_provenance);
         assert_eq!(imported.tft_provenance, account.tft_provenance);
     }
 
     #[test]
     fn export_round_trips_ranked_stats_and_recent_games() {
         let account = Account {
+            flex: Some(FlexRank {
+                tier: "Diamond".into(), division: "II".into(), lp: "75".into(),
+                last_season: "Gold I".into(), ranked_stats: None,
+            }),
             ranked_stats: Some(RankedStats {
                 wins: 47,
                 losses: 33,
@@ -540,6 +561,7 @@ mod tests {
         let json = serde_json::to_string(&ExportAccount::from(&account)).unwrap();
         let imported: ImportAccount = serde_json::from_str(&json).unwrap();
         assert_eq!(imported.ranked_stats, account.ranked_stats);
+        assert_eq!(imported.flex, account.flex);
         assert_eq!(imported.recent_games, account.recent_games);
     }
     use std::cell::RefCell;
@@ -599,6 +621,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut original = test_manager(directory.path().join("original.json"));
         let mut account = test_account("overlay");
+        account.flex = Some(FlexRank {
+            tier: "Diamond".into(), division: "II".into(), lp: "75".into(),
+            last_season: "Gold I".into(), ranked_stats: None,
+        });
         account.ranked_stats = Some(RankedStats {
             wins: 47,
             losses: 33,
@@ -621,6 +647,8 @@ mod tests {
         let saved: Vec<Account> =
             serde_json::from_slice(&std::fs::read(&restored.accounts_file).unwrap()).unwrap();
         assert_eq!(saved[0].ranked_stats, account.ranked_stats);
+        assert_eq!(saved[0].flex, account.flex);
+        assert_eq!(restored.accounts[0].flex, account.flex);
         assert_eq!(saved[0].recent_games, account.recent_games);
         assert_eq!(restored.accounts[0].ranked_stats, account.ranked_stats);
         assert_eq!(restored.accounts[0].recent_games, account.recent_games);
@@ -631,12 +659,14 @@ mod tests {
         // when opening a pre-feature save or explicit export.
         let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
         legacy[0].as_object_mut().unwrap().remove("ranked_stats");
+        legacy[0].as_object_mut().unwrap().remove("flex");
         legacy[0].as_object_mut().unwrap().remove("recent_games");
         let mut old_import = test_manager(directory.path().join("legacy.json"));
         old_import
             .import_accounts_with(&legacy.to_string(), &TestPasswords::default())
             .unwrap();
         assert_eq!(old_import.accounts[0].ranked_stats, None);
+        assert_eq!(old_import.accounts[0].flex, None);
         assert!(old_import.accounts[0].recent_games.is_empty());
         assert_eq!(old_import.accounts[0].password, account.password);
     }

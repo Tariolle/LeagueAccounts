@@ -22,6 +22,54 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
     assert.equal(await page.$eval(selector, el => el.scrollWidth <= el.clientWidth + 1), true, `${selector} overflows horizontally`);
   }
   try {
+    await t.test("Solo/Duo and Flex switch card ranks, ordering, filters and saved preferences independently of TFT", async () => {
+      await open("flex-ranks");
+      assert.match(await text("#accounts > .card:first-child"), /Piltover Queen/);
+      await page.select("#friend-tier", "Gold");
+      await page.select("#lol-queue", "flex");
+      await page.waitForFunction(() => document.querySelectorAll("#accounts > .card").length === 4);
+      assert.match(await text("#queue-label"), /Flex/);
+      assert.equal(await page.$eval("#friend-tier", el => el.disabled), true);
+      const flexCards = await page.$$eval("#accounts > .card", cards => cards.map(card => ({
+        name: card.querySelector(".game-name").textContent, rank: card.querySelector(".rank-name").textContent,
+        stats: card.querySelector(".ranked-stats")?.textContent ?? "",
+        stale: Boolean(card.querySelector(".flex-stale")),
+      })));
+      assert.deepEqual(flexCards.map(card => card.name), ["Kebab Enjoyer", "Hextech Fox", "Piltover Queen", "Snowball King"]);
+      assert.match(flexCards[0].rank, /Diamond IV/);
+      assert.match(flexCards[1].stats, /20W.*10L.*67%/);
+      assert.match(flexCards[2].rank, /Unranked/);
+      assert.match(flexCards[3].rank, /Unavailable/);
+      assert.equal(flexCards[0].stale, true);
+      assert.equal(flexCards[1].stale, false);
+      for (const view of ["grid", "list"]) {
+        await page.click(`[data-view="${view}"]`);
+        await page.setViewport({ width: 980, height: 640 });
+        await noHorizontalOverflow("#accounts");
+        await noHorizontalOverflow(".main");
+      }
+      await page.click('.dist-row[data-tier="Gold"]');
+      await page.waitForFunction(() => document.querySelectorAll("#accounts > .card").length === 1);
+      assert.match(await text("#accounts"), /Hextech Fox/);
+      await page.select("#lol-queue", "solo");
+      await page.waitForFunction(() => document.querySelectorAll("#accounts > .card").length === 4);
+      assert.match(await text("#accounts > .card:first-child"), /Piltover Queen/);
+      await page.select("#lol-queue", "flex");
+      await page.click('.mode-btn[data-mode="tft"]');
+      assert.equal(await page.$eval("#lol-queue", el => el.disabled), true);
+      await page.click('.mode-btn[data-mode="lol"]');
+      assert.match(await text("#queue-label"), /Flex/);
+      // demoPage clears preferences on every navigation; remove that setup before reloading.
+      await page.evaluate(() => sessionStorage.setItem("flex-test-prefs", localStorage.getItem("leagueaccounts.dev.prefs")));
+      await page.evaluateOnNewDocument(() => {
+        const prefs = sessionStorage.getItem("flex-test-prefs");
+        if (prefs) localStorage.setItem("leagueaccounts.dev.prefs", prefs);
+      });
+      await page.reload({ waitUntil: "networkidle0" });
+      await page.waitForSelector("body.ready #accounts > .card");
+      assert.equal(await page.$eval("#lol-queue", el => el.value), "flex");
+      assert.match(await text("#accounts > .card:first-child"), /Kebab Enjoyer/);
+    });
     await t.test("ranked overlays fit full and short histories in both account layouts", async () => {
       await open("ranked-cards");
       assert.equal(await page.$$eval(".recent-game img", imgs => imgs.every(img => img.complete && img.naturalWidth > 0)), true);

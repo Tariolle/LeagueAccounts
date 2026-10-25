@@ -55,8 +55,9 @@ export function normalizeTier(tier: string): string {
 
 export const palette = (tier: string): Palette => TIERS[normalizeTier(tier)];
 
-export function rankOf(account: AccountView, mode: Mode): RankLike {
-  return mode === "lol" ? account.lol : account.tft;
+export function rankOf(account: AccountView, mode: Mode, queue: "solo" | "flex" = "solo"): RankLike {
+  return mode === "tft" ? account.tft : queue === "solo" ? account.lol
+    : account.flex ?? { tier: "Error", division: "", lp: "" };
 }
 
 export function isRanked(rank: RankLike): boolean {
