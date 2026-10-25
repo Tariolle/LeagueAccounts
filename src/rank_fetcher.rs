@@ -1,6 +1,6 @@
 use crate::logging::{self, Event, Reason};
 use crate::models::{
-    Account, Freshness, RankFetchError, RankInfo, RankProvenance, RankedStats, RecentGame, TftRank,
+    Account, FlexRank, Freshness, RankFetchError, RankInfo, RankProvenance, RankedStats, RecentGame, TftRank,
 };
 use html_escape::decode_html_entities;
 use regex::Regex;
@@ -77,6 +77,7 @@ impl RankFetcher {
         // If a network request failed, provenance still describes the retained data.
         for (next, previous) in [
             (&mut info.provenance, &account.rank_provenance),
+            (&mut info.flex_provenance, &account.flex_provenance),
             (&mut info.tft_provenance, &account.tft_provenance),
         ] {
             if let (Some(next), Some(previous)) = (next.as_mut(), previous) {
@@ -236,9 +237,11 @@ impl RankFetcher {
             .map(|info| self.with_defaults(info))
             .unwrap_or_else(|reason| {
                 logging::record(Event::RankFetchFailed, reason);
+                let provenance = failed_provenance(reason);
                 RankInfo {
                     riot_id_not_found: (reason == Reason::HttpNotFound).then_some(true),
-                    provenance: Some(failed_provenance(reason)),
+                    provenance: Some(provenance.clone()),
+                    flex_provenance: Some(provenance),
                     ..RankInfo::error()
                 }
             })
@@ -353,6 +356,7 @@ impl RankFetcher {
                 Err(_) => {}
             }
         }
+        rank.flex_provenance = Some(flex_provenance(provenance.clone(), rank.flex.is_some()));
         rank.provenance = Some(provenance);
         Ok(rank)
     }
@@ -373,12 +377,58 @@ impl RankFetcher {
         let mut rank = self.parse_current_rank_from_opgg(&soup, &decoded_payload);
         rank.level = self.parse_level_from_opgg(&soup, &decoded_payload);
         rank.ranked_stats = meta_description(&soup).and_then(|text| parse_ranked_stats(&text));
+        rank.flex = self.parse_flex_rank(&soup);
         rank.recent_games = parse_recent_games(&soup, body);
         let (reached, finished) = self.parse_last_season_from_opgg(&decoded_payload);
         rank.reached_last_season = reached;
         rank.finished_last_season = finished;
         rank.riot_id_not_found = Some(false);
         Ok((rank, ProfileUpdate::parse(&decoded_payload)))
+    }
+
+    /// Read only the profile's Flex section, excluding the top tier and history.
+    /// Missing/unrecognized markup is unknown, never an invented Unranked rank.
+    fn parse_flex_rank(&self, soup: &Html) -> Option<FlexRank> {
+        let sections = Selector::parse("aside > section").ok()?;
+        let heading = Selector::parse(":scope > div:first-child span").ok()?;
+        let body_selector = Selector::parse(":scope > div:nth-child(2) > div:first-child").ok()?;
+        let strong = Selector::parse("strong").ok()?;
+        let section = soup.select(&sections).find(|section| {
+            section.select(&heading).any(|span| span.text().collect::<String>().trim() == "Ranked Flex")
+        })?;
+        let mut rank = FlexRank {
+            tier: "Unranked".into(), division: String::new(), lp: String::new(),
+            last_season: "N/A".into(), ranked_stats: None,
+        };
+        let unranked = Selector::parse(":scope > div:first-child > strong").ok()?;
+        if section.select(&unranked).any(|node| node.text().collect::<String>().trim() == "Unranked") {
+            return Some(rank);
+        }
+        let body = section.select(&body_selector).next()?;
+        let text = body.text().collect::<Vec<_>>().join(" ");
+        let current = body.select(&strong).next()?;
+        let current_block = scraper::ElementRef::wrap(current.parent()?)?;
+        let current_text = current_block.text().collect::<Vec<_>>().join(" ");
+        let (tier, division, lp) = self.parse_rank_text(&current_text)?;
+        rank.tier = tier;
+        rank.division = division;
+        rank.lp = lp;
+        // The first stats row belongs to the current rank, before Top tier.
+        static RECORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s*W\s*(\d+)\s*L\s*Win rate\s*(\d+)\s*%").expect("valid Flex record regex"));
+        if let Some(captures) = RECORD.captures(&text) {
+            let win_rate = captures[3].parse::<u8>().ok()?;
+            if win_rate <= 100 {
+                rank.ranked_stats = Some(RankedStats {
+                    wins: captures[1].parse().ok()?, losses: captures[2].parse().ok()?, win_rate,
+                });
+            }
+        }
+        let cells = Selector::parse("table tbody tr:first-child td").ok()?;
+        let history: Vec<_> = section.select(&cells).map(|cell| cell.text().collect::<String>()).collect();
+        if history.len() >= 3 {
+            rank.last_season = self.format_history_rank(&history[1], &self.clean_lp_value(&history[2]));
+        }
+        Some(rank)
     }
 
     pub fn parse_current_rank_from_opgg(&self, soup: &Html, decoded_payload: &str) -> RankInfo {
@@ -637,6 +687,7 @@ impl RankFetcher {
             lp: rank.lp,
             level: rank.level,
             ranked_stats: rank.ranked_stats,
+            flex: rank.flex,
             recent_games: rank.recent_games,
             reached_last_season: if rank.reached_last_season.is_empty() {
                 "Unranked".to_owned()
@@ -650,6 +701,7 @@ impl RankFetcher {
             },
             tft: rank.tft,
             provenance: rank.provenance,
+            flex_provenance: rank.flex_provenance,
             tft_provenance: rank.tft_provenance,
         }
     }
@@ -688,6 +740,19 @@ fn sourced_provenance(source_updated_at: Option<u64>) -> RankProvenance {
             .map(|at| at + MAX_AGE.as_millis() as u64),
         ..Default::default()
     }
+}
+
+fn flex_provenance(mut profile: RankProvenance, verified: bool) -> RankProvenance {
+    if !verified {
+        // The profile was fetched, but its Flex standing could not be verified.
+        // Do not report this request's timestamps as the age of the retained rank.
+        profile.fetched_at = None;
+        profile.source_updated_at = None;
+        profile.fresh_until = None;
+        profile.freshness = Freshness::Stale;
+        profile.error = Some(RankFetchError::ParsingFailed);
+    }
+    profile
 }
 
 fn failed_provenance(reason: Reason) -> RankProvenance {
@@ -929,6 +994,26 @@ fn title_case(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_flex_does_not_inherit_the_profile_fetch_time() {
+        let profile = RankProvenance {
+            source: "OP.GG".into(),
+            fetched_at: Some(200),
+            source_updated_at: Some(100),
+            freshness: Freshness::Fresh,
+            fresh_until: Some(500),
+            ..Default::default()
+        };
+
+        let flex = flex_provenance(profile, false);
+
+        assert_eq!(flex.fetched_at, None);
+        assert_eq!(flex.source_updated_at, None);
+        assert_eq!(flex.fresh_until, None);
+        assert_eq!(flex.freshness, Freshness::Stale);
+        assert_eq!(flex.error, Some(RankFetchError::ParsingFailed));
+    }
 
     #[test]
     fn ranked_record_does_not_use_a_champions_record() {
