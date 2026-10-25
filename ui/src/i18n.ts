@@ -42,6 +42,7 @@ const en = {
 
   "card.lastSeason": "Last season",
   "card.winRate": "Wins / losses / win rate",
+  "card.flexStale": "Flex data may be out of date",
   "card.recentGames": "Recent games",
   "card.win": "Win",
   "card.loss": "Loss",
@@ -351,6 +352,7 @@ const tr: Dict = {
 
   "card.lastSeason": "Geçen sezon",
   "card.winRate": "Galibiyet / mağlubiyet / kazanma oranı",
+  "card.flexStale": "Flex verileri güncel olmayabilir",
   "card.recentGames": "Son maçlar",
   "card.win": "Galibiyet",
   "card.loss": "Mağlubiyet",
@@ -657,6 +659,7 @@ const de: Dict = {
 
   "card.lastSeason": "Letzte Saison",
   "card.winRate": "Siege / Niederlagen / Siegesrate",
+  "card.flexStale": "Flex-Daten sind möglicherweise veraltet",
   "card.recentGames": "Letzte Spiele",
   "card.win": "Sieg",
   "card.loss": "Niederlage",
@@ -963,6 +966,7 @@ const es: Dict = {
 
   "card.lastSeason": "Temporada pasada",
   "card.winRate": "Victorias / derrotas / porcentaje de victorias",
+  "card.flexStale": "Los datos de Flex pueden estar desactualizados",
   "card.recentGames": "Partidas recientes",
   "card.win": "Victoria",
   "card.loss": "Derrota",
@@ -1269,6 +1273,7 @@ const fr: Dict = {
 
   "card.lastSeason": "Saison passée",
   "card.winRate": "Victoires / défaites / taux de victoire",
+  "card.flexStale": "Les données Flex peuvent être obsolètes",
   "card.recentGames": "Parties récentes",
   "card.win": "Victoire",
   "card.loss": "Défaite",
@@ -1575,6 +1580,7 @@ const pt: Dict = {
 
   "card.lastSeason": "Época anterior",
   "card.winRate": "Vitórias / derrotas / taxa de vitória",
+  "card.flexStale": "Os dados de Flex podem estar desatualizados",
   "card.recentGames": "Partidas recentes",
   "card.win": "Vitória",
   "card.loss": "Derrota",

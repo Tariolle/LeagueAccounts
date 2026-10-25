@@ -126,6 +126,7 @@ export interface AccountView {
   level: string;
   rankedStats?: { wins: number; losses: number; winRate: number } | null;
   flex?: { tier: string; division: string; lp: string; lastSeason: string; rankedStats: AccountView["rankedStats"] } | null;
+  flexProvenance?: RankProvenance | null;
   recentGames?: { champion: string; iconUrl: string; won: boolean }[];
   hasPassword: boolean;
   lol: LolRank;

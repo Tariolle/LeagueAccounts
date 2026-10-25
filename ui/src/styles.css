@@ -781,6 +781,13 @@ code {
   justify-content: space-between;
   gap: 10px;
 }
+.flex-stale {
+  display: block;
+  margin-top: 4px;
+  color: #e8c56d;
+  font-size: 11px;
+  line-height: 1.2;
+}
 .rank-notice {
   font-size: 13px;
   line-height: 1.4;

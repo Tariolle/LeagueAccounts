@@ -166,12 +166,23 @@ function recentGamesLine(account: AccountView): string {
   return `<div class="recent-games${full}" role="list" aria-label="${esc(t("card.recentGames"))}">${games}</div>`;
 }
 
+function flexRankMayBeOutdated(account: AccountView): boolean {
+  const provenance = account.flexProvenance;
+  return !provenance
+    || provenance.freshness !== "fresh"
+    || provenance.error !== null
+    || (provenance.freshUntil !== null && Date.now() >= provenance.freshUntil);
+}
+
 function cardInner(account: AccountView, pending: boolean): string {
   const rank = rankOf(account, state.mode, state.queue);
   const tier = normalizeTier(rank.tier);
   const [gameName, tag] = splitRiotId(accountLabel(account));
   const lp = isRanked(rank) && rank.lp ? `<span class="lp">${esc(rank.lp)} LP</span>` : "";
   const rankedStats = state.queue === "flex" ? account.flex?.rankedStats : account.rankedStats;
+  const flexStaleNotice = state.mode === "lol" && state.queue === "flex" && account.flex && flexRankMayBeOutdated(account)
+    ? `<span class="flex-stale" role="status">${esc(t("card.flexStale"))}</span>`
+    : "";
   const stats = state.mode === "lol" && rankedStats
     ? `<span class="ranked-stats" data-tooltip="${esc(t("card.winRate"))}"><span class="ranked-stat-win">${rankedStats.wins}W</span> <span class="ranked-stat-loss">${rankedStats.losses}L</span> · <span class="ranked-stat-rate${rankedStats.winRate > 50 ? " is-positive" : rankedStats.winRate < 50 ? " is-negative" : ""}">${rankedStats.winRate}%</span></span>`
     : "";
@@ -197,6 +208,7 @@ function cardInner(account: AccountView, pending: boolean): string {
       <div class="rank-notice${account.riotIdNotFound ? " rank-not-found" : ""}">${esc(t(account.name ? "card.riotIdNotFound" : "card.noRiotId"))}</div>
       <button class="rank-edit" data-act="edit">${esc(t(account.name ? "card.updateRiotId" : "card.addRiotId"))}</button>` : `
       <div class="rank-line"><span class="rank-name">${esc(rankLabel(rank))}</span></div>
+      ${flexStaleNotice}
       ${lp}
       <div class="lp-bar${APEX.has(tier) ? " apex" : ""}"><span style="--p:${lpProgress(rank)}"></span></div>
       `}
