@@ -54,7 +54,7 @@ body {
   overflow: hidden;
   background: var(--bg);
   color: var(--text);
-  font-family: Spiegel, "Segoe UI", system-ui, sans-serif;
+  font-family: Spiegel, "Segoe UI", system-ui, WenKai, sans-serif;
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
   user-select: none;
@@ -221,7 +221,7 @@ code {
   filter: drop-shadow(0 0 8px color-mix(in srgb, var(--accent) 60%, transparent));
 }
 .brand-name {
-  font-family: Beaufort, serif;
+  font-family: Beaufort, WenKai, NotoCJK, serif;
   font-weight: 600;
   font-size: 14px;
   letter-spacing: 0.08em;
@@ -1174,7 +1174,7 @@ code {
 }
 .drawer-head h2 {
   margin: 0;
-  font-family: Beaufort, serif;
+  font-family: Beaufort, WenKai, NotoCJK, serif;
   font-weight: 600;
   font-size: 22px;
   letter-spacing: 0.04em;

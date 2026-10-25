@@ -22,6 +22,57 @@ npx tauri build --no-bundle  # build target/release/LeagueAccounts.exe
 
 `?scene=` opens a specific screen: `tft`, `list`, `settings`, `add`, `menu`, `login`, `update`, `updating` (update found at launch), `restart` (update installed in the background) and `loading` (holds the startup screen).
 
+## Translations
+
+Every dictionary lives in `ui/src/i18n.ts`. English (`en`) is the reference:
+`MessageKey` is derived from it, and each other dictionary is typed `Dict`, so
+a missing, misspelled or extra key fails `tsc` instead of showing a raw key at
+runtime.
+
+To add a language:
+
+1. Copy the `en` object to `const <lang>: Dict = { … }` and translate every
+   value. Keep the `{placeholders}` exactly as they are.
+2. Add it to `LANGUAGES`, to `DICTS`, and to `HTML_LANG` (a real BCP-47 tag —
+   `zh-TW`, not `zhTw`).
+3. Run `npx tsc --noEmit`.
+
+Chinese also needs the fallback glyphs: `node scripts/cjk-font.mjs` regenerates
+the bundled subsets from the characters the interface can render. Run it after
+changing any string.
+
+Chinese needs two entries: `zh` (`zh-CN`) and `zhTw` (`zh-TW`). The browser
+language is matched in `fromBrowser`, where `zh-HK`/`zh-MO`/`zh-Hant` map to
+Traditional.
+
+### Terminology
+
+Agreed wording, so the same concept reads the same everywhere:
+
+| English | 简体中文 | 繁體中文 |
+|---|---|---|
+| account (credentials) | 账号 | 帳號 |
+| account ID | 账号 ID | 帳號 ID |
+| Riot ID | Riot ID | Riot ID |
+| Riot Client | Riot客户端 | Riot客戶端 |
+| region | 区服 | 伺服器 |
+| rank / tier | 段位 | 階級 |
+| Iron … Challenger | 黑铁 … 王者 | 鐵牌 … 菁英 |
+| TFT | 云顶之弈 | 聯盟戰棋 |
+| ARAM | 大乱斗 | 隨機單中 |
+| Windows Credential Manager | Windows 凭据管理器 | Windows 認證管理員 |
+
+### Localization platform
+
+Not integrated, deliberately: no Crowdin, Weblate or Transifex configuration
+exists. Those platforms sync against one file per language, so adding one later
+means splitting the dictionaries back out and writing the tool's config — worth
+doing only if translations are actually delegated.
+
+Weblate is the first choice when that happens: open-source projects can be
+hosted free on `libre.weblate.org`, and its translations land as ordinary Git
+commits, which matches how this repository already works.
+
 ## Tests
 
 | Command | Covers |
