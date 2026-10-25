@@ -198,10 +198,17 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
       await page.keyboard.press("Tab");
       await page.keyboard.up("Shift");
       assert.equal(await page.$eval('[data-value="save"]', el => el === document.activeElement), true);
+      assert.equal(await page.$eval('.modal [name="uiScale"]', el => el.value), "100");
       await page.select('.modal [name="language"]', "fr");
+      await page.select('.modal [name="uiScale"]', "125");
       await page.click('.modal [data-value="save"]');
       await page.waitForSelector(".modal", { hidden: true });
       assert.equal(await text("#account-count"), "11 comptes sur 11");
+      await page.click('[data-action="settings"]');
+      await page.waitForSelector('.modal [name="uiScale"]');
+      assert.equal(await page.$eval('.modal [name="uiScale"]', el => el.value), "125");
+      // Formatted for the language: "125 %" in French.
+      assert.match(await page.$eval('.modal [name="uiScale"]', el => el.selectedOptions[0].textContent), /^125\s%$/);
     });
     await t.test("client tooltips support focus, escaping, dismissal and removed owners", async () => {
       await open();

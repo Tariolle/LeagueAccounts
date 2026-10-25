@@ -2,6 +2,7 @@
 //! scheduler.
 
 use crate::login_control::LoginControl;
+use crate::scale::{MAX_UI_SCALE, MIN_UI_SCALE};
 use crate::updater::Updater;
 use crate::views::{account_view, fail, fail_with, AppError, Key};
 use leagueaccounts::logging::{self, Event, Reason};
@@ -37,6 +38,8 @@ pub struct Settings {
     /// updates stored this as "check for updates".
     #[serde(alias = "checkUpdates")]
     pub auto_update: bool,
+    /// Interface size in percent, from Settings › Interface size.
+    pub ui_scale: u32,
     /// A release whose executable reported an older version than the release.
     /// It is never installed automatically, so it cannot update in a loop.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -62,6 +65,7 @@ impl Default for Settings {
             login_method: LoginMethod::Riot,
             launch_game: true,
             auto_update: true,
+            ui_scale: 100,
             mislabeled_release: None,
             last_full_refresh: 0,
         }
@@ -77,6 +81,7 @@ impl Settings {
         settings.interval_minutes = settings
             .interval_minutes
             .clamp(MIN_INTERVAL_MINUTES, MAX_INTERVAL_MINUTES);
+        settings.ui_scale = settings.ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
         settings
     }
 
@@ -319,5 +324,20 @@ mod tests {
         assert!(!saved.contains("mislabeledRelease"));
         let skipped: Settings = serde_json::from_str(r#"{"mislabeledRelease":"3.1.0"}"#).unwrap();
         assert_eq!(skipped.mislabeled_release.as_deref(), Some("3.1.0"));
+    }
+
+    #[test]
+    fn interface_size_defaults_to_100_percent_and_stays_in_range() {
+        let path = std::env::temp_dir().join(format!("leagueaccounts-settings-{}.json", std::process::id()));
+        for (json, expected) in [
+            ("{}", 100),
+            (r#"{"uiScale":125}"#, 125),
+            (r#"{"uiScale":1000}"#, MAX_UI_SCALE),
+            (r#"{"uiScale":0}"#, MIN_UI_SCALE),
+        ] {
+            std::fs::write(&path, json).unwrap();
+            assert_eq!(Settings::load(Some(&path)).ui_scale, expected, "{json}");
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

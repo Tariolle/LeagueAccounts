@@ -605,12 +605,21 @@ function renderSchedule(): void {
   $(".ladder-update-time", root).textContent = time;
 }
 
+/** Interface size presets in percent; the backend zooms the window and resizes it with them. */
+const UI_SCALES = [80, 90, 100, 110, 125, 150, 175, 200];
+
 async function openSettings(): Promise<void> {
   const current = await guard(() => api.getSettings(), "toast.settingsFailed");
   if (!current) return;
   const languageOptions = LANGUAGES.map(
     (language) => `<option value="${language.code}"${language.code === lang() ? " selected" : ""}>${esc(language.name)}</option>`,
   ).join("");
+  const percent = new Intl.NumberFormat(lang(), { style: "percent" });
+  // Keep a size set outside the presets (edited settings file) selectable.
+  const scaleOptions = [...new Set([...UI_SCALES, current.uiScale])]
+    .sort((a, b) => a - b)
+    .map((scale) => `<option value="${scale}"${scale === current.uiScale ? " selected" : ""}>${esc(percent.format(scale / 100))}</option>`)
+    .join("");
   const toggle = (name: string, checked: boolean, label: string, hint = "", disabled = false) => `
     <label class="toggle-row${disabled ? " disabled" : ""}">
       <span class="toggle-text"><strong>${esc(label)}</strong>${hint ? `<span>${esc(hint)}</span>` : ""}</span>
@@ -627,6 +636,8 @@ async function openSettings(): Promise<void> {
         <h3>${esc(t("settings.general"))}</h3>
         <label class="field inline"><span>${esc(t("settings.language"))}</span>
           <div class="select-wrap"><select name="language">${languageOptions}</select></div></label>
+        <label class="field inline"><span>${esc(t("settings.scale"))}</span>
+          <div class="select-wrap"><select name="uiScale">${scaleOptions}</select></div></label>
         ${toggle("launchAtStartup", current.launchAtStartup, t("settings.startup"))}
         ${toggle("startMinimized", current.startMinimized, t("settings.minimized"), t("settings.minimizedHint"))}
       </section>
@@ -702,6 +713,7 @@ async function openSettings(): Promise<void> {
             loginMethod: $<HTMLInputElement>('[name="loginMethod"]:checked', root).value as Settings["loginMethod"],
             launchGame: checked("launchGame"),
             autoUpdate: checked("autoUpdate"),
+            uiScale: Number($<HTMLSelectElement>('[name="uiScale"]', root).value),
           }),
         "toast.settingsFailed",
       );
