@@ -27,6 +27,9 @@ pub struct Account {
     /// Ranked Solo/Duo wins and losses from the OP.GG profile description.
     #[serde(default)]
     pub ranked_stats: Option<RankedStats>,
+    /// None until the Flex section has been read successfully.
+    #[serde(default)]
+    pub flex: Option<FlexRank>,
     /// Recent LoL games in source order, newest first.
     #[serde(default)]
     pub recent_games: Vec<RecentGame>,
@@ -80,6 +83,16 @@ pub struct RankedStats {
     pub wins: u32,
     pub losses: u32,
     pub win_rate: u8,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FlexRank {
+    pub tier: String,
+    pub division: String,
+    pub lp: String,
+    pub last_season: String,
+    pub ranked_stats: Option<RankedStats>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -145,6 +158,8 @@ pub struct RankInfo {
     pub lp: String,
     pub level: String,
     pub ranked_stats: Option<RankedStats>,
+    /// None preserves saved Flex data on an unreadable or missing section.
+    pub flex: Option<FlexRank>,
     /// None means history could not be read; Some(empty) is a successful empty result.
     pub recent_games: Option<Vec<RecentGame>>,
     pub reached_last_season: String,
@@ -240,6 +255,9 @@ impl RankInfo {
             // A successful profile without a ranked record (for example, an
             // unranked account after a season reset) must clear stale stats.
             account.ranked_stats = self.ranked_stats.clone();
+            if let Some(flex) = &self.flex {
+                account.flex = Some(flex.clone());
+            }
             if let Some(games) = &self.recent_games {
                 account.recent_games = games.clone();
             }

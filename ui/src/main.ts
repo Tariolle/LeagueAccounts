@@ -37,6 +37,7 @@ const state = {
   accounts: [] as AccountView[],
   regions: [] as string[],
   mode: "lol" as Mode,
+  queue: "solo" as "solo" | "flex",
   view: "grid" as View,
   sort: "rank" as Sort,
   search: "",
@@ -62,6 +63,7 @@ function loadPrefs(): void {
   try {
     const prefs = JSON.parse(localStorage.getItem(PREFS_KEY) ?? "{}");
     if (prefs.mode === "lol" || prefs.mode === "tft") state.mode = prefs.mode;
+    if (prefs.queue === "solo" || prefs.queue === "flex") state.queue = prefs.queue;
     if (prefs.view === "grid" || prefs.view === "list") state.view = prefs.view;
     if (["rank", "name", "level", "region"].includes(prefs.sort)) state.sort = prefs.sort;
   } catch {
@@ -71,7 +73,7 @@ function loadPrefs(): void {
 
 function savePrefs(): void {
   try {
-    localStorage.setItem(PREFS_KEY, JSON.stringify({ mode: state.mode, view: state.view, sort: state.sort }));
+    localStorage.setItem(PREFS_KEY, JSON.stringify({ mode: state.mode, queue: state.queue, view: state.view, sort: state.sort }));
   } catch {
     // Non-essential.
   }
@@ -89,20 +91,20 @@ function splitRiotId(name: string): [string, string] {
 function visibleAccounts(): AccountView[] {
   const query = state.search.trim().toLowerCase();
   const list = state.accounts.filter((account) => {
-    const rank = rankOf(account, state.mode);
+    const rank = rankOf(account, state.mode, state.queue);
     if (query && !`${account.name} ${account.accountId} ${account.description}`.toLowerCase().includes(query)) {
       return false;
     }
     if (state.regionFilter !== "all" && account.regionDisplay !== state.regionFilter) return false;
     if (state.tierFilter && normalizeTier(rank.tier) !== state.tierFilter) return false;
-    if (state.mode === "lol" && state.friendTier !== "all") {
+    if (state.mode === "lol" && state.queue === "solo" && state.friendTier !== "all") {
       return canPlayWith(rank, state.friendTier, state.friendDivision);
     }
     return true;
   });
   const byName = (a: AccountView, b: AccountView) => accountLabel(a).localeCompare(accountLabel(b), "tr");
   const sorters: Record<Sort, (a: AccountView, b: AccountView) => number> = {
-    rank: (a, b) => compareRanks(rankOf(a, state.mode), rankOf(b, state.mode)) || byName(a, b),
+    rank: (a, b) => compareRanks(rankOf(a, state.mode, state.queue), rankOf(b, state.mode, state.queue)) || byName(a, b),
     name: byName,
     level: (a, b) => (Number(b.level) || 0) - (Number(a.level) || 0) || byName(a, b),
     region: (a, b) => a.regionDisplay.localeCompare(b.regionDisplay) || byName(a, b),
@@ -116,12 +118,15 @@ function historyLine(account: AccountView): string {
   if (state.mode === "tft") {
     return `<span>${t("card.lastSet")}</span><b>${esc(localizeRank(account.tft.lastSet))}</b>`;
   }
+  if (state.queue === "flex") {
+    return `<span>${t("card.lastSeason")}</span><b>${esc(localizeRank(account.flex?.lastSeason || "N/A"))}</b>`;
+  }
   const reached = account.lol.reachedLastSeason || "N/A";
   return `<span>${t("card.lastSeason")}</span><b>${esc(localizeRank(reached))}</b>`;
 }
 
 function cardSignature(account: AccountView, pending: boolean): string {
-  return JSON.stringify([account, state.mode, pending, lang(), banChip(account)]);
+  return JSON.stringify([account, state.mode, state.queue, pending, lang(), banChip(account)]);
 }
 
 /** The suspension still in force; a timed one disappears once it ends. */
@@ -162,11 +167,11 @@ function recentGamesLine(account: AccountView): string {
 }
 
 function cardInner(account: AccountView, pending: boolean): string {
-  const rank = rankOf(account, state.mode);
+  const rank = rankOf(account, state.mode, state.queue);
   const tier = normalizeTier(rank.tier);
   const [gameName, tag] = splitRiotId(accountLabel(account));
   const lp = isRanked(rank) && rank.lp ? `<span class="lp">${esc(rank.lp)} LP</span>` : "";
-  const rankedStats = account.rankedStats;
+  const rankedStats = state.queue === "flex" ? account.flex?.rankedStats : account.rankedStats;
   const stats = state.mode === "lol" && rankedStats
     ? `<span class="ranked-stats" data-tooltip="${esc(t("card.winRate"))}"><span class="ranked-stat-win">${rankedStats.wins}W</span> <span class="ranked-stat-loss">${rankedStats.losses}L</span> · <span class="ranked-stat-rate${rankedStats.winRate > 50 ? " is-positive" : rankedStats.winRate < 50 ? " is-negative" : ""}">${rankedStats.winRate}%</span></span>`
     : "";
@@ -210,13 +215,13 @@ function updateCard(element: HTMLElement, account: AccountView): void {
   const id = keyId(keyOf(account));
   const pending = state.pending.has(id);
   const signature = cardSignature(account, pending);
-  const colors = palette(rankOf(account, state.mode).tier);
+  const colors = palette(rankOf(account, state.mode, state.queue).tier);
   element.style.setProperty("--tier", colors.base);
   element.style.setProperty("--tier-light", colors.light);
   element.style.setProperty("--tier-dark", colors.dark);
   element.classList.toggle("selected", state.selected === id);
   element.classList.toggle("banned", activeBan(account) !== null);
-  element.classList.toggle("apex", APEX.has(normalizeTier(rankOf(account, state.mode).tier)));
+  element.classList.toggle("apex", APEX.has(normalizeTier(rankOf(account, state.mode, state.queue).tier)));
   if (element.dataset.signature === signature) return;
   const wasPending = element.dataset.pending === "1";
   element.dataset.signature = signature;
@@ -293,7 +298,7 @@ function renderAccounts(): void {
 function renderDistribution(): void {
   const counts = new Map<string, number>();
   state.accounts.forEach((account) => {
-    const tier = normalizeTier(rankOf(account, state.mode).tier);
+    const tier = normalizeTier(rankOf(account, state.mode, state.queue).tier);
     counts.set(tier, (counts.get(tier) ?? 0) + 1);
   });
   const tiers = TIER_ORDER.filter((tier) => counts.get(tier) || (tier !== "Error" && tier !== "Unranked"));
@@ -316,7 +321,7 @@ function renderDistribution(): void {
 
 function renderControls(): void {
   document.documentElement.dataset.mode = state.mode;
-  $("#queue-label").textContent = t(state.mode === "lol" ? "page.queueLol" : "page.queueTft");
+  $("#queue-label").textContent = t(state.mode === "tft" ? "page.queueTft" : state.queue === "flex" ? "page.queueFlex" : "page.queueLol");
   document.querySelectorAll<HTMLButtonElement>(".mode-btn").forEach((button) => {
     button.setAttribute("aria-selected", String(button.dataset.mode === state.mode));
   });
@@ -326,7 +331,11 @@ function renderControls(): void {
   const accounts = $("#accounts");
   accounts.classList.toggle("grid", state.view === "grid");
   accounts.classList.toggle("list", state.view === "list");
-  $("#friend-wrap").classList.toggle("collapsed", state.mode !== "lol");
+  $("#friend-wrap").classList.toggle("collapsed", state.mode !== "lol" || state.queue !== "solo");
+  $("#queue-wrap").classList.toggle("collapsed", state.mode !== "lol");
+  $<HTMLSelectElement>("#lol-queue").disabled = state.mode !== "lol";
+  $<HTMLSelectElement>("#friend-tier").disabled = state.mode !== "lol" || state.queue !== "solo";
+  $<HTMLSelectElement>("#lol-queue").value = state.queue;
   $<HTMLSelectElement>("#sort").value = state.sort;
 }
 
@@ -437,7 +446,7 @@ async function runLogin(account: AccountView, closeRunning = false, launchBanned
   const launching = Boolean(viaRiot && state.settings?.launchGame);
   const overlay = openLoginOverlay({
     account,
-    tier: rankOf(account, state.mode).tier,
+    tier: rankOf(account, state.mode, state.queue).tier,
     viaRiot,
     closeLeague: closeRunning,
     launchGame: launching,
@@ -519,7 +528,7 @@ async function deleteAccount(account: AccountView): Promise<void> {
     title: t("delete.title"),
     body: `
       <div class="confirm-account">
-        ${emblem(rankOf(account, state.mode).tier, 44, state.mode)}
+        ${emblem(rankOf(account, state.mode, state.queue).tier, 44, state.mode)}
         <div><strong>${esc(accountLabel(account))}</strong><span>${esc(account.accountId)} · ${esc(account.regionDisplay)}</span></div>
       </div>
       <p class="hint">${t("delete.hint")}</p>`,
@@ -999,6 +1008,15 @@ function changeLanguage(next: Lang): void {
 // ---------------------------------------------------------------- wiring
 
 function wire(): void {
+  $("#lol-queue").addEventListener("change", () => {
+    state.queue = $<HTMLSelectElement>("#lol-queue").value as "solo" | "flex";
+    state.tierFilter = null;
+    state.friendTier = "all";
+    $<HTMLSelectElement>("#friend-tier").value = "all";
+    $<HTMLSelectElement>("#friend-division").disabled = true;
+    savePrefs();
+    render();
+  });
   $("#clear-filters").addEventListener("click", clearFilters);
   document.querySelectorAll<HTMLButtonElement>(".mode-btn").forEach((button) => {
     button.addEventListener("click", () => setMode(button.dataset.mode as Mode));

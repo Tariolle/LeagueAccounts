@@ -18,7 +18,7 @@ One-click login, live ranks and ban countdowns, with passwords kept in Windows C
 ## Features
 
 - **One-click login.** League Accounts opens the Riot Client, signs in and launches LoL or TFT.
-- **LoL and TFT ranks** from OP.GG, refreshed in the background (every 30 minutes by default).
+- **LoL Solo/Duo, Flex and TFT ranks** from OP.GG, refreshed in the background (every 30 minutes by default). The queue selector switches LoL card ranks, sorting and rank filters; the friend elo filter applies to Solo/Duo.
 - **Duo finder.** The *Friend elo* filter shows which accounts can play ranked with a friend.
 - **Ban check.** Each login reads the account's League ban from Riot; a banned account shows the time left instead of launching a game that would disconnect you.
 - **Safe by design.** Passwords stay in Windows Credential Manager and never reach the interface.
