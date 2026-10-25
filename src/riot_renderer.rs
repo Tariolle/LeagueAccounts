@@ -38,6 +38,16 @@ fn path_arg(name: &str, path: &Path) -> OsString {
     arg
 }
 
+/// Only the elevation category of a failed start is kept, never its text.
+fn launch_error(error: &io::Error, fallback: LoginError) -> LoginError {
+    const ERROR_ELEVATION_REQUIRED: i32 = 740;
+    if error.raw_os_error() == Some(ERROR_ELEVATION_REQUIRED) {
+        LoginError::RiotElevated
+    } else {
+        fallback
+    }
+}
+
 fn start_service(path: &Path, headless: bool) -> Result<(), LoginError> {
     let mut process = command(path);
     if headless {
@@ -46,7 +56,7 @@ fn start_service(path: &Path, headless: bool) -> Result<(), LoginError> {
     process
         .spawn()
         .map(|_| ())
-        .map_err(|_| LoginError::LaunchFailed)
+        .map_err(|error| launch_error(&error, LoginError::LaunchFailed))
 }
 
 fn wait(cancel: &AtomicBool, duration: Duration) -> Result<(), LoginError> {
@@ -77,7 +87,7 @@ fn client_processes(root: &Path) -> Result<Vec<Process>, LoginError> {
     }) {
         let Some(path) = windows::process_path(process.pid) else {
             if running_processes().iter().any(|p| p.pid == process.pid) {
-                return Err(LoginError::CloseFailed);
+                return Err(LoginError::RiotCloseFailed);
             }
             continue;
         };
@@ -100,7 +110,7 @@ fn stop_client(path: &Path, cancel: &AtomicBool) -> Result<(), LoginError> {
     let start = Instant::now();
     while !client_processes(root)?.is_empty() {
         if start.elapsed() > Duration::from_secs(10) {
-            return Err(LoginError::CloseFailed);
+            return Err(LoginError::RiotCloseFailed);
         }
         wait(cancel, Duration::from_millis(200))?;
     }
@@ -248,6 +258,19 @@ impl Renderer {
         Ok(())
     }
 
+    /// An elevated Riot Client can be neither closed nor reopened from here.
+    /// Check before closing or signing anything out, and leave it as it is.
+    pub(super) fn ensure_controllable(&self) -> Result<(), LoginError> {
+        let root = self.service.parent().ok_or(LoginError::ClientMissing)?;
+        if client_processes(root)?
+            .iter()
+            .any(|process| windows::terminate_denied(process.pid))
+        {
+            return Err(LoginError::RiotElevated);
+        }
+        Ok(())
+    }
+
     /// End the temporary debug renderer without opening a normal window yet.
     /// A later `restore` (or drop) still opens one unless `replaced_by_game`.
     pub(super) fn close_debugger(&mut self) -> Result<(), LoginError> {
@@ -309,8 +332,9 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         // Covers renderer setup, MFA, cancellation, unwinding, suspended
         // accounts and failed game launches. Successful paths restore first or are replaced by the game.
-        if self.restore().is_err() {
-            logging::record(Event::LoginFailed, Reason::RendererFailed);
+        // The login result is logged separately; this is only the cleanup.
+        if let Err(error) = self.restore() {
+            logging::record(Event::RiotRestoreFailed, error.reason());
         }
     }
 }
@@ -337,8 +361,9 @@ pub(super) fn sign_in(
     }
     check_cancelled(cancel)?;
     let service = renderer.service.clone();
-    renderer.restore_needed = true;
     progress(LoginStep::Connect);
+    renderer.ensure_controllable()?;
+    renderer.restore_needed = true;
     stop_client(&service, cancel)?;
     (renderer.service_start)(&service, true)?;
     let start = Instant::now();
@@ -422,7 +447,8 @@ pub(super) fn sign_in(
         OsString::from(format!("--remote-debugging-port={port}")),
     ]);
     renderer.child = Some(
-        OwnedProcess::spawn(&ux, &debug_args).map_err(|_| LoginError::RendererFailed)?,
+        OwnedProcess::spawn(&ux, &debug_args)
+            .map_err(|error| launch_error(&error, LoginError::RendererFailed))?,
     );
     let http = reqwest::blocking::Client::builder()
         .no_proxy()
@@ -726,6 +752,40 @@ mod tests {
         );
         drop(renderer);
         assert_eq!(starts(), vec![false]);
+    }
+
+    #[test]
+    fn a_client_that_requires_administrator_rights_is_reported_as_elevated() {
+        assert_eq!(
+            launch_error(&io::Error::from_raw_os_error(740), LoginError::LaunchFailed),
+            LoginError::RiotElevated,
+        );
+        for error in [
+            io::Error::from_raw_os_error(2),
+            io::Error::from(io::ErrorKind::Unsupported),
+        ] {
+            assert_eq!(
+                launch_error(&error, LoginError::RendererFailed),
+                LoginError::RendererFailed,
+            );
+        }
+    }
+
+    #[test]
+    fn failed_cleanup_is_logged_apart_from_the_login_result() {
+        fn elevated_start(path: &Path, headless: bool) -> Result<(), LoginError> {
+            fake_start(path, headless)?;
+            Err(LoginError::RiotElevated)
+        }
+        let log = logging::capture(|| {
+            let mut renderer = fixture();
+            renderer.service_start = elevated_start;
+            renderer.restore_needed = true;
+            drop(renderer);
+        });
+        assert_eq!(starts(), vec![false]);
+        assert!(log.contains("ERROR event=riot_restore_failed reason=riot_elevated"));
+        assert!(!log.contains("login_failed"));
     }
 
     #[test]

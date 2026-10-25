@@ -17,6 +17,8 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// Time the player has for steps Riot asks for before the game, as for
 /// confirming the sign-in.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
+/// Time for the Riot Client to apply a region change.
+const REGION_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,12 +104,19 @@ impl LoginStep {
 pub enum LoginError {
     ClientMissing,
     LaunchFailed,
+    /// The Riot Client runs, or must run, as administrator, so this app can
+    /// neither start nor close it.
+    RiotElevated,
+    /// The Riot Client did not close before the login form could be opened.
+    RiotCloseFailed,
     /// The login window or sign-in state never became observable.
     Timeout,
     /// Signing out of the current session is not available.
     SignOutFailed,
     /// The Riot session signed out before the game could be launched.
     SessionEnded,
+    /// The Riot Client did not switch to the account's League region.
+    RegionFailed,
     RendererFailed,
     AuthRejected,
     CaptchaRejected,
@@ -134,9 +143,12 @@ impl LoginError {
         match self {
             LoginError::ClientMissing => "riot_client_missing",
             LoginError::LaunchFailed => "riot_launch_failed",
+            LoginError::RiotElevated => "riot_elevated",
+            LoginError::RiotCloseFailed => "riot_close_failed",
             LoginError::Timeout => "riot_timeout",
             LoginError::SignOutFailed => "riot_sign_out_failed",
             LoginError::SessionEnded => "riot_session_ended",
+            LoginError::RegionFailed => "riot_region_failed",
             LoginError::RendererFailed => "riot_renderer_failed",
             LoginError::AuthRejected => "riot_auth_rejected",
             LoginError::CaptchaRejected => "riot_captcha_rejected",
@@ -151,9 +163,34 @@ impl LoginError {
             LoginError::WorkerPanicked => "autotype_failed",
         }
     }
+
+    /// Only fixed categories cross the logging boundary; never account identifiers.
+    fn reason(self) -> Reason {
+        match self {
+            LoginError::ClientMissing => Reason::ClientMissing,
+            LoginError::LaunchFailed => Reason::LaunchFailed,
+            LoginError::RiotElevated => Reason::RiotElevated,
+            LoginError::RiotCloseFailed => Reason::RiotCloseFailed,
+            LoginError::Timeout => Reason::Timeout,
+            LoginError::SignOutFailed => Reason::SignOutFailed,
+            LoginError::SessionEnded => Reason::SessionEnded,
+            LoginError::RegionFailed => Reason::RegionFailed,
+            LoginError::RendererFailed => Reason::RendererFailed,
+            LoginError::AuthRejected => Reason::AuthRejected,
+            LoginError::CaptchaRejected => Reason::CaptchaRejected,
+            LoginError::RateLimited => Reason::HttpRateLimited,
+            LoginError::TypingFailed => Reason::TypingFailed,
+            LoginError::Cancelled => Reason::Cancelled,
+            LoginError::LeagueRunning => Reason::LeagueRunning,
+            LoginError::CloseFailed => Reason::CloseFailed,
+            LoginError::GameLaunchFailed => Reason::GameLaunchFailed,
+            LoginError::AccountMismatch => Reason::AccountMismatch,
+            LoginError::Banned(_) => Reason::AccountBanned,
+            LoginError::WorkerPanicked => Reason::WorkerPanicked,
+        }
+    }
 }
 
-/// Only fixed categories cross the logging boundary; never account identifiers.
 pub fn record_login_result(result: &Result<LoginOutcome, LoginError>) {
     let (event, reason) = match result {
         Ok(outcome) => (
@@ -170,25 +207,7 @@ pub fn record_login_result(result: &Result<LoginOutcome, LoginError>) {
             } else {
                 Event::LoginFailed
             },
-            match error {
-                LoginError::ClientMissing => Reason::ClientMissing,
-                LoginError::LaunchFailed => Reason::LaunchFailed,
-                LoginError::Timeout => Reason::Timeout,
-                LoginError::SignOutFailed => Reason::SignOutFailed,
-                LoginError::SessionEnded => Reason::SessionEnded,
-                LoginError::RendererFailed => Reason::RendererFailed,
-                LoginError::AuthRejected => Reason::AuthRejected,
-                LoginError::CaptchaRejected => Reason::CaptchaRejected,
-                LoginError::RateLimited => Reason::HttpRateLimited,
-                LoginError::TypingFailed => Reason::TypingFailed,
-                LoginError::Cancelled => Reason::Cancelled,
-                LoginError::LeagueRunning => Reason::LeagueRunning,
-                LoginError::CloseFailed => Reason::CloseFailed,
-                LoginError::GameLaunchFailed => Reason::GameLaunchFailed,
-                LoginError::AccountMismatch => Reason::AccountMismatch,
-                LoginError::Banned(_) => Reason::AccountBanned,
-                LoginError::WorkerPanicked => Reason::WorkerPanicked,
-            },
+            error.reason(),
         ),
     };
     logging::record(event, reason);
@@ -246,6 +265,7 @@ fn launch_game(game: Game, account_id: &str, cancel: &AtomicBool) -> Result<(), 
             if !name.eq_ignore_ascii_case(account_id) {
                 return Err(LoginError::AccountMismatch);
             }
+            api.follow_league_region(REGION_TIMEOUT, cancel)?;
             Ok(api.launch(game))
         },
         || thread::sleep(Duration::from_secs(1)),
@@ -539,6 +559,56 @@ impl LocalApi {
         }
     }
 
+    /// The game signs in to the region the Riot Client is set to. Riot's
+    /// window moves it to the account's League region after each sign-in;
+    /// without that window, an account from another region would start
+    /// League in the previous account's region and fail to log in. An
+    /// unreadable state changes nothing.
+    fn follow_league_region(
+        &self,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<(), LoginError> {
+        const REGION_LOCALE: &str = "/riotclient/region-locale";
+        let (Some(info), Some((200, current)), Some((200, regions))) = (
+            self.userinfo(),
+            self.get(REGION_LOCALE),
+            self.get("/data-store/v1/system-settings/region_data"),
+        ) else {
+            return Ok(());
+        };
+        let Some(region) = current["region"]
+            .as_str()
+            .and_then(|current| league_region(&info, &regions, current))
+        else {
+            return Ok(());
+        };
+        check_cancelled(cancel)?;
+        logging::record(Event::LoginWaiting, Reason::RegionChange);
+        // The same request as Riot's window; the result is read back below.
+        let _ = self
+            .client
+            .put(format!("{}{REGION_LOCALE}", self.base))
+            .basic_auth("riot", Some(&self.password))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::json!({"region": region, "locale": current["locale"]}).to_string())
+            .send();
+        let started = Instant::now();
+        loop {
+            check_cancelled(cancel)?;
+            if self
+                .get(REGION_LOCALE)
+                .is_some_and(|(status, body)| status == 200 && body["region"] == region)
+            {
+                return Ok(());
+            }
+            if started.elapsed() >= timeout {
+                return Err(LoginError::RegionFailed);
+            }
+            thread::sleep(POLL);
+        }
+    }
+
     /// Riot account information of the signed-in account.
     fn userinfo(&self) -> Option<serde_json::Value> {
         let (status, body) = self.get("/rso-auth/v1/authorization/userinfo")?;
@@ -593,6 +663,40 @@ impl LocalApi {
             Err(LoginError::SignOutFailed)
         }
     }
+}
+
+/// The Riot Client region (a `region_data` key such as `EUW`) to switch to so
+/// that League signs in to one of the account's platforms (such as `EUW1`).
+/// Like Riot's window, keep a region the account plays on, otherwise take
+/// the account's current platform. `None` when nothing needs to change or
+/// the account has no known League platform.
+fn league_region(
+    info: &serde_json::Value,
+    regions: &serde_json::Value,
+    current: &str,
+) -> Option<String> {
+    let platforms: Vec<&str> = std::iter::once(&info["lol"])
+        .chain(info["lol_region"].as_array().into_iter().flatten())
+        .filter(|account| account["active"] != false)
+        .filter_map(|account| account["cpid"].as_str())
+        .collect();
+    let platform = *platforms.first()?;
+    let platform_of = |region: &str| regions[region]["rso_platform_id"].as_str();
+    if platform_of(current).is_some_and(|current| platforms.contains(&current)) {
+        return None;
+    }
+    // Some regions are named after their platform (KR); most are not (EUW).
+    let region = if platform_of(platform).is_some() {
+        platform.to_owned()
+    } else {
+        regions
+            .as_object()?
+            .iter()
+            .find(|(_, data)| data["rso_platform_id"] == platform)?
+            .0
+            .clone()
+    };
+    (region != current).then_some(region)
 }
 
 /// The League suspension in Riot's userinfo `ban.restrictions`, if any.
@@ -881,6 +985,9 @@ pub fn login(
                         return Ok(LoginOutcome::AlreadySignedIn);
                     }
                     Some(_) if sign_out_sent.is_none() => {
+                        // Signing in needs a client this app can restart; do
+                        // not sign the other account out without one.
+                        client.ensure_controllable()?;
                         progress(LoginStep::SignOut);
                         api.sign_out(cancel)?;
                         sign_out_sent = Some(Instant::now());
@@ -932,10 +1039,27 @@ pub fn login(
 
 #[cfg(windows)]
 mod windows {
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED};
     use windows_sys::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_TERMINATE,
     };
+
+    /// Whether Windows refuses to let this process end `pid`, as for a process
+    /// running as administrator when this one is not. An exited process is
+    /// not refused.
+    pub fn terminate_denied(pid: u32) -> bool {
+        // SAFETY: plain terminate-right probe, closed below; nothing is ended.
+        let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if process.is_null() {
+            // SAFETY: reads this thread's error from the call above.
+            return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+        }
+        // SAFETY: handle opened above.
+        unsafe { CloseHandle(process) };
+        false
+    }
+
     pub fn process_path(pid: u32) -> Option<std::path::PathBuf> {
         // SAFETY: plain query handle, closed below.
         let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
@@ -959,6 +1083,10 @@ mod windows {
 
 #[cfg(not(windows))]
 mod windows {
+    pub fn terminate_denied(_: u32) -> bool {
+        false
+    }
+
     pub fn process_path(_: u32) -> Option<std::path::PathBuf> {
         None
     }
@@ -1247,6 +1375,16 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn only_a_refused_process_counts_as_out_of_reach() {
+        assert!(!windows::terminate_denied(std::process::id()));
+        // The protected System process refuses even administrators.
+        assert!(windows::terminate_denied(4));
+        // No process has this ID; one that exited is not refused either.
+        assert!(!windows::terminate_denied(u32::MAX - 3));
+    }
+
+    #[test]
     fn only_current_league_suspensions_count_as_bans() {
         use serde_json::json;
 
@@ -1292,6 +1430,168 @@ mod tests {
             ),
             Some(Ban { until: None })
         );
+    }
+
+    #[test]
+    fn the_riot_region_follows_the_accounts_league_platform() {
+        use serde_json::json;
+
+        let regions = json!({
+            "EUNE": {"rso_platform_id": "EUN1"},
+            "EUW": {"rso_platform_id": "EUW1"},
+            "KR": {"rso_platform_id": "KR"},
+            "NA": {"rso_platform_id": "NA1"},
+        });
+        let account = |platforms: &[&str]| {
+            let entries: Vec<_> = platforms
+                .iter()
+                .map(|platform| json!({"cpid": platform, "pid": platform, "active": true}))
+                .collect();
+            json!({"lol": entries.first(), "lol_region": entries})
+        };
+        let switch = |platforms: &[&str], current: &str| {
+            league_region(&account(platforms), &regions, current)
+        };
+
+        // Issue #33: an EUW account after an EUNE one.
+        assert_eq!(switch(&["EUW1"], "EUNE").as_deref(), Some("EUW"));
+        assert_eq!(switch(&["EUW1"], "EUW"), None);
+        assert_eq!(switch(&["KR"], "EUW").as_deref(), Some("KR"));
+        // A region the account also plays on stays selected.
+        assert_eq!(switch(&["EUW1", "EUN1"], "EUNE"), None);
+        assert_eq!(switch(&["EUW1", "EUN1"], "NA").as_deref(), Some("EUW"));
+        // An unknown client region is replaced as well.
+        assert_eq!(switch(&["NA1"], "XX").as_deref(), Some("NA"));
+        let moved = json!({
+            "lol": {"cpid": "EUW1", "pid": "EUN1", "active": true},
+            "lol_region": [{"cpid": "EUN1", "active": false}, {"cpid": "EUW1", "active": true}],
+        });
+        assert_eq!(
+            league_region(&moved, &regions, "EUNE").as_deref(),
+            Some("EUW")
+        );
+
+        // Without a known League platform, the client is left alone.
+        assert_eq!(league_region(&json!({}), &regions, "EUNE"), None);
+        assert_eq!(switch(&["PBE1"], "EUNE"), None);
+        assert_eq!(league_region(&account(&["EUW1"]), &json!({}), "EUNE"), None);
+    }
+
+    /// Answers each request with the next body and returns the bodies sent.
+    fn serve_local_api(
+        exchanges: Vec<(&'static str, String)>,
+    ) -> (LocalApi, thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (request, body) in exchanges {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with(request), "{line}");
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    assert!(reader.read_line(&mut header).unwrap() > 0);
+                    if header == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = header.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                let mut sent = vec![0; length];
+                reader.read_exact(&mut sent).unwrap();
+                requests.push(String::from_utf8(sent).unwrap());
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+            requests
+        });
+        let api = LocalApi {
+            base: format!("http://{address}"),
+            password: "test".into(),
+            client: reqwest::blocking::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        };
+        (api, server)
+    }
+
+    #[test]
+    fn the_launch_waits_until_riot_reports_the_accounts_region() {
+        use serde_json::json;
+
+        let info = json!({
+            "userInfo": json!({"lol": {"cpid": "EUW1", "active": true}}).to_string()
+        })
+        .to_string();
+        let regions =
+            json!({"EUNE": {"rso_platform_id": "EUN1"}, "EUW": {"rso_platform_id": "EUW1"}})
+                .to_string();
+        let locale = |region: &str| json!({"locale": "en_GB", "region": region}).to_string();
+        let reads = |current: &str| {
+            vec![
+                ("GET /rso-auth/v1/authorization/userinfo ", info.clone()),
+                ("GET /riotclient/region-locale ", locale(current)),
+                (
+                    "GET /data-store/v1/system-settings/region_data ",
+                    regions.clone(),
+                ),
+            ]
+        };
+
+        let mut exchanges = reads("EUNE");
+        exchanges.extend([
+            ("PUT /riotclient/region-locale ", String::new()),
+            ("GET /riotclient/region-locale ", locale("EUW")),
+        ]);
+        let (api, server) = serve_local_api(exchanges);
+        let log = logging::capture(|| {
+            assert_eq!(
+                api.follow_league_region(Duration::MAX, &AtomicBool::new(false)),
+                Ok(())
+            );
+        });
+        let sent: serde_json::Value = serde_json::from_str(&server.join().unwrap()[3]).unwrap();
+        assert_eq!(sent, json!({"region": "EUW", "locale": "en_GB"}));
+        assert!(log.contains("INFO event=login_waiting reason=region_change"));
+
+        // Already in the account's region: nothing is changed.
+        let (api, server) = serve_local_api(reads("EUW"));
+        assert_eq!(
+            api.follow_league_region(Duration::MAX, &AtomicBool::new(false)),
+            Ok(())
+        );
+        assert_eq!(server.join().unwrap().len(), 3);
+
+        // A region that never applies stops the launch with its own error.
+        let mut exchanges = reads("EUNE");
+        exchanges.extend([
+            ("PUT /riotclient/region-locale ", String::new()),
+            ("GET /riotclient/region-locale ", locale("EUNE")),
+        ]);
+        let (api, server) = serve_local_api(exchanges);
+        assert_eq!(
+            api.follow_league_region(Duration::ZERO, &AtomicBool::new(false)),
+            Err(LoginError::RegionFailed)
+        );
+        server.join().unwrap();
     }
 
     #[test]
@@ -1503,6 +1803,7 @@ mod tests {
                 Reason::GameProcessPending,
                 Reason::LaunchPending,
                 Reason::LaunchRejected,
+                Reason::RegionChange,
             ] {
                 diagnostics.waiting(reason);
                 diagnostics.waiting(reason);
@@ -1512,6 +1813,10 @@ mod tests {
             record_login_result(&Err(LoginError::GameLaunchFailed));
             record_login_result(&Err(LoginError::SignOutFailed));
             record_login_result(&Err(LoginError::SessionEnded));
+            record_login_result(&Err(LoginError::RegionFailed));
+            record_login_result(&Err(LoginError::RiotElevated));
+            record_login_result(&Err(LoginError::RiotCloseFailed));
+            record_login_result(&Err(LoginError::CloseFailed));
             record_login_result(&Err(LoginError::Cancelled));
             record_login_result(&Ok(LoginOutcome::AlreadySignedIn));
         });
@@ -1528,11 +1833,16 @@ mod tests {
             "INFO event=login_waiting reason=game_process_pending",
             "INFO event=login_waiting reason=launch_pending",
             "INFO event=login_waiting reason=launch_rejected",
+            "INFO event=login_waiting reason=region_change",
             "INFO event=login_progress reason=launch_game",
             "ERROR event=login_failed reason=account_mismatch",
             "ERROR event=login_failed reason=game_launch_failed",
             "ERROR event=login_failed reason=sign_out_failed",
             "ERROR event=login_failed reason=session_ended",
+            "ERROR event=login_failed reason=region_failed",
+            "ERROR event=login_failed reason=riot_elevated",
+            "ERROR event=login_failed reason=riot_close_failed",
+            "ERROR event=login_failed reason=close_failed",
             "INFO event=login_cancelled reason=cancelled",
             "INFO event=login_completed reason=already_signed_in",
         ] {

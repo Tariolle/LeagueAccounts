@@ -7,6 +7,7 @@
 
 mod login_control;
 mod refresh;
+mod scale;
 mod updater;
 mod views;
 
@@ -52,6 +53,7 @@ struct SettingsView {
     login_method: LoginMethod,
     launch_game: bool,
     auto_update: bool,
+    ui_scale: u32,
     riot_client_found: bool,
     tft_installed: bool,
 }
@@ -66,6 +68,7 @@ struct SettingsInput {
     login_method: LoginMethod,
     launch_game: bool,
     auto_update: bool,
+    ui_scale: u32,
 }
 
 #[derive(Serialize)]
@@ -148,6 +151,7 @@ fn settings_view(app: &AppHandle, state: &Shared) -> SettingsView {
         login_method: settings.login_method,
         launch_game: settings.launch_game,
         auto_update: settings.auto_update,
+        ui_scale: settings.ui_scale,
         riot_client_found: riot_client::client_path().is_some(),
         tft_installed: riot_client::game_installed(Game::Tft),
     }
@@ -313,7 +317,8 @@ fn get_settings(app: AppHandle, state: AppState<'_>) -> SettingsView {
 
 #[tauri::command]
 fn update_settings(app: AppHandle, state: AppState<'_>, input: SettingsInput) -> CommandResult<SettingsView> {
-    {
+    let ui_scale = input.ui_scale.clamp(scale::MIN_UI_SCALE, scale::MAX_UI_SCALE);
+    let previous_scale = {
         let mut settings = state.settings.lock().map_err(|_| fail("storage_locked"))?;
         settings.auto_refresh = input.auto_refresh;
         settings.interval_minutes = input
@@ -323,7 +328,14 @@ fn update_settings(app: AppHandle, state: AppState<'_>, input: SettingsInput) ->
         settings.login_method = input.login_method;
         settings.launch_game = input.launch_game;
         settings.auto_update = input.auto_update;
+        let previous = std::mem::replace(&mut settings.ui_scale, ui_scale);
         settings.save(state.settings_path.as_ref());
+        previous
+    };
+    if previous_scale != ui_scale {
+        if let Some(window) = app.get_webview_window("main") {
+            scale::apply(&window, previous_scale, ui_scale);
+        }
     }
     let autolaunch = app.autolaunch();
     if autolaunch.is_enabled().unwrap_or(false) != input.launch_at_startup {
@@ -694,6 +706,7 @@ fn main() {
         settings.save(settings_path.as_ref());
     }
     let updater = Updater::new(&settings);
+    let ui_scale = settings.ui_scale;
     let start_minimized = (settings.start_minimized && std::env::args().any(|arg| arg == AUTOSTART_FLAG))
         || updater::start_minimized_after_restart();
 
@@ -757,6 +770,8 @@ fn main() {
         .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
                 square_corners(&window);
+                // The window opens at its configured size, which is 100%.
+                scale::apply(&window, 100, ui_scale);
                 let _ = window.show();
                 if start_minimized {
                     let _ = window.minimize();

@@ -29,6 +29,14 @@ they do not read saved credentials, contact Riot, or terminate installed games.
   Process ownership compares Windows path components: forward slashes in Riot's
   install metadata still match native process paths, while sibling directories
   and other drives are excluded.
+- `src/riot_client.rs` checks the Riot Client region chosen before a game
+  launch: the account's League platform (`lol`/`lol_region` userinfo claims)
+  must belong to the client's region in `region_data`, a region the account
+  also plays on is kept, and nothing changes without a known platform. A
+  loopback API verifies the `PUT /riotclient/region-locale` request (the one
+  Riot's own window sends after sign-in), that the launch waits until Riot
+  reports the new region, and that a region that never applies fails with
+  `riot_region_failed`.
 - `tests/riot_renderer.test.mjs` runs the production renderer helper against a
   dummy native form. It checks rejection after MFA resets the form, terminal
   errors while a CAPTCHA remains visible, pending challenges, and success.
@@ -74,6 +82,11 @@ expressions, or renderer command lines while inspecting these cases.
    disabled. With game launch disabled, exactly one normal Riot Client window
    must remain after login; with it enabled, only the game client opens. The old
    client and temporary renderer must both have exited.
+8. With game launch enabled, sign in to an account from one League region (for
+   example EUNE), then switch to an account from another (EUW) and back. League
+   must sign in each time without "An unexpected error occurred while logging
+   in", and `GET /riotclient/region-locale` must report the launched account's
+   region.
 
 The automated dummy-process tests are not a substitute for these installed-client
 checks: Riot's native renderer and authentication UI are undocumented interfaces.
