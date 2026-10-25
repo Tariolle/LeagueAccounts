@@ -2,6 +2,41 @@ use leagueaccounts::rank_fetcher::RankFetcher;
 use scraper::Html;
 
 #[test]
+fn captured_flex_section_keeps_current_rank_separate_from_solo_and_history() {
+    let fetcher = RankFetcher::default();
+    let rank = fetcher.parse_profile(include_str!("fixtures/opgg-flex-ranked.html")).unwrap();
+    let flex = rank.flex.unwrap();
+    assert_eq!((flex.tier.as_str(), flex.division.as_str(), flex.lp.as_str()), ("Diamond", "II", "75"));
+    assert_eq!(flex.last_season, "Diamond I 78LP");
+    let stats = flex.ranked_stats.unwrap();
+    assert_eq!((stats.wins, stats.losses, stats.win_rate), (29, 28, 51));
+    assert_ne!(rank.division, flex.division);
+    let unranked = fetcher.parse_profile(include_str!("fixtures/opgg-flex-unranked.html")).unwrap();
+    assert_eq!(unranked.flex.unwrap().tier, "Unranked");
+    assert!(fetcher.parse_profile(include_str!("fixtures/opgg-ranked.html")).unwrap().flex.is_none());
+}
+
+#[test]
+fn flex_cache_survives_failed_or_partial_refresh_and_explicit_unranked_clears_it() {
+    use leagueaccounts::models::{Account, RankInfo};
+    let fetcher = RankFetcher::default();
+    let ranked = fetcher.parse_profile(include_str!("fixtures/opgg-flex-ranked.html")).unwrap();
+    let mut account = Account::default();
+    ranked.apply_to(&mut account);
+    let saved = account.flex.clone();
+    RankInfo::error().apply_to(&mut account);
+    assert_eq!(account.flex, saved);
+    fetcher.parse_profile(include_str!("fixtures/opgg-ranked.html")).unwrap().apply_to(&mut account);
+    assert_eq!(account.flex, saved);
+    let restored: Account = serde_json::from_str(&serde_json::to_string(&account).unwrap()).unwrap();
+    assert_eq!(restored.flex, saved);
+    fetcher.parse_profile(include_str!("fixtures/opgg-flex-unranked.html")).unwrap().apply_to(&mut account);
+    assert_eq!(account.flex.unwrap().tier, "Unranked");
+    let legacy: Account = serde_json::from_str(r#"{"account_id":"dummy","name":"","region":"euw","region_display":"EUW"}"#).unwrap();
+    assert!(legacy.flex.is_none());
+}
+
+#[test]
 fn captured_public_profiles_parse_current_rank_history_and_level_offline() {
     let fetcher = RankFetcher::default();
     let ranked = fetcher
