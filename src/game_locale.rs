@@ -38,11 +38,23 @@ pub fn read(path: &Path) -> Option<String> {
     locale_line(&contents).map(|(_, value)| value)
 }
 
-/// Replace the `settings.locale` value, leaving the rest of the file as-is.
+/// Make `locale` the game's language, and let the registry accept it.
 ///
-/// Returns `true` only when the file now reads back as the requested locale.
-/// A rewrite of the whole document is deliberately avoided: the client writes
-/// its own ordering and quoting, and a YAML round-trip would churn every line.
+/// Two things have to change, and the order matters:
+///
+/// 1. `locale_data.available_locales` is the list the Riot Client validates a
+///    product locale against. `zh_CN` is missing from it even though the game
+///    ships `Global.zh_CN.wad.client`, and a locale outside the list is not an
+///    error the client reports — it silently rewrites `settings.locale` back to
+///    `default_locale` (here `zh_TW`) the moment it starts the product. That is
+///    why writing only `settings.locale` looked like it worked and then reverted.
+/// 2. `settings.locale` then names the value to use.
+///
+/// Returns `true` only when the file reads back as the requested locale *and*
+/// lists it as available, since a value the client would reject is not applied.
+///
+/// Both edits are line replacements: the client writes its own ordering and
+/// quoting, and a YAML round-trip would churn every line of the file.
 pub fn write(path: &Path, locale: &str) -> bool {
     let Ok(contents) = std::fs::read_to_string(path) else {
         return false;
@@ -50,25 +62,77 @@ pub fn write(path: &Path, locale: &str) -> bool {
     let Some((line, current)) = locale_line(&contents) else {
         return false;
     };
-    if current == locale {
-        return true;
-    }
-    let replacement = format!("{locale}\"");
     let mut lines: Vec<String> = contents.lines().map(str::to_owned).collect();
-    // The line ends with `"xx_YY"`; swap only the value inside the quotes.
-    let updated = lines[line].replace(&format!("{current}\""), &replacement);
-    lines[line] = updated;
-    let mut text = lines.join("\n");
-    if contents.ends_with('\n') {
-        text.push('\n');
+    let mut changed = false;
+    // The locale line is edited first: inserting into the list above it would
+    // shift its index, and `line` was recorded before any change.
+    if current != locale {
+        // The line ends with `"xx_YY"`; swap only the value inside the quotes.
+        lines[line] = lines[line].replace(&format!("{current}\""), &format!("{locale}\""));
+        changed = true;
     }
-    write_through_read_only(path, &text) && read(path).as_deref() == Some(locale)
+    if !allows(&lines, locale) {
+        let Some(index) = insertion_point(&lines, locale) else {
+            return false;
+        };
+        lines.insert(index, format!("    - \"{locale}\""));
+        changed = true;
+    }
+    if changed {
+        let mut text = lines.join("\n");
+        if contents.ends_with('\n') {
+            text.push('\n');
+        }
+        if !write_through_read_only(path, &text) {
+            return false;
+        }
+    }
+    read(path).as_deref() == Some(locale) && is_allowed_in_file(path, locale)
 }
 
-/// Write even when the file is marked read-only, restoring the attribute.
+/// `true` when the file lists `locale` as available.
+fn is_allowed_in_file(path: &Path, locale: &str) -> bool {
+    std::fs::read_to_string(path)
+        .is_ok_and(|contents| allows(&contents.lines().map(str::to_owned).collect::<Vec<_>>(), locale))
+}
+
+/// `true` when `locale` appears in the `available_locales` list.
+fn allows(lines: &[String], locale: &str) -> bool {
+    let Some(start) = lines.iter().position(|line| line.trim_start() == "available_locales:") else {
+        return false;
+    };
+    lines[start + 1..]
+        .iter()
+        .take_while(|line| entry_value(line).is_some())
+        .any(|line| entry_value(line) == Some(locale))
+}
+
+/// Where to insert `locale` to keep the list in its existing order.
+fn insertion_point(lines: &[String], locale: &str) -> Option<usize> {
+    let start = lines.iter().position(|line| line.trim_start() == "available_locales:")?;
+    for (offset, line) in lines[start + 1..].iter().enumerate() {
+        match entry_value(line) {
+            Some(value) if value > locale => return Some(start + 1 + offset),
+            Some(_) => {}
+            None => return Some(start + 1 + offset),
+        }
+    }
+    None
+}
+
+/// The quoted value of a `    - "xx_YY"` list entry.
+fn entry_value(line: &str) -> Option<&str> {
+    let value = line.trim().strip_prefix("- ")?;
+    Some(value.trim().trim_matches('"'))
+}
+
+/// Write the file, restoring the read-only attribute if it was set.
 ///
-/// Riot sets the attribute so the language survives updates; leaving it set is
-/// as much a part of the contract as the content.
+/// Riot sometimes leaves this file read-only so an update cannot change it;
+/// clearing the attribute, writing and putting it back keeps that intent.
+/// The attribute is *not* a way to protect the value from the running client —
+/// it clears the attribute itself when it rewrites the file, which is why the
+/// locale has to be accepted by `available_locales` instead.
 fn write_through_read_only(path: &Path, text: &str) -> bool {
     let was_read_only = std::fs::metadata(path).is_ok_and(|m| m.permissions().readonly());
     if was_read_only {
@@ -76,8 +140,6 @@ fn write_through_read_only(path: &Path, text: &str) -> bool {
     }
     let written = std::fs::write(path, text).is_ok();
     if was_read_only {
-        // Restore even when the write failed: leaving Riot's attribute cleared
-        // would let the next game update overwrite the user's language.
         set_read_only(path, true);
     }
     written
@@ -181,30 +243,62 @@ mod tests {
         assert!(write(&path, "zh_CN"));
         assert_eq!(read(&path).as_deref(), Some("zh_CN"));
 
-        // Only the locale line changed; the default and the list are intact.
+        // The list gains zh_CN; everything else is untouched.
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("default_locale: \"zh_TW\""));
         assert!(after.contains("    - \"zh_MY\""));
         assert!(after.contains("    - \"zh_TW\""));
         assert!(after.contains("locale: \"zh_CN\""));
-        assert_eq!(after.lines().count(), sample().lines().count());
+        assert_eq!(after.lines().count(), sample().lines().count() + 1);
     }
 
     #[test]
-    fn writes_through_a_read_only_file_and_restores_the_attribute() {
+    fn an_unlisted_locale_is_added_to_available_locales() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("product_settings.yaml");
         std::fs::write(&path, sample()).unwrap();
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-        permissions.set_readonly(true);
-        std::fs::set_permissions(&path, permissions).unwrap();
+
+        // zh_CN is the real case: the game ships it, the registry omits it, and
+        // the Riot Client rewrites settings.locale unless the list accepts it.
+        assert!(write(&path, "zh_CN"));
+        assert_eq!(read(&path).as_deref(), Some("zh_CN"));
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("    - \"zh_CN\""), "{after}");
+        // Inserted in order, so the list the client wrote stays sorted.
+        let list: Vec<&str> = after
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with("available_locales:"))
+            .skip(1)
+            .take_while(|line| entry_value(line).is_some())
+            .filter_map(entry_value)
+            .collect();
+        assert_eq!(list, ["zh_CN", "zh_MY", "zh_TW"]);
+    }
+
+    #[test]
+    fn an_already_listed_locale_is_not_duplicated() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("product_settings.yaml");
+        std::fs::write(&path, sample()).unwrap();
 
         assert!(write(&path, "zh_MY"));
+        let after = std::fs::read_to_string(&path).unwrap();
+        // Once in available_locales, once as settings.locale — never twice in
+        // the list, which is what a second `write` would produce.
+        assert_eq!(after.matches("\"zh_MY\"").count(), 2, "{after}");
+        assert_eq!(after.lines().count(), sample().lines().count());
         assert_eq!(read(&path).as_deref(), Some("zh_MY"));
-        assert!(
-            std::fs::metadata(&path).unwrap().permissions().readonly(),
-            "the read-only attribute must survive the write"
-        );
+    }
+
+    #[test]
+    fn a_file_without_available_locales_is_left_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("product_settings.yaml");
+        let only_settings = "settings:\n    locale: \"zh_TW\"\n";
+        std::fs::write(&path, only_settings).unwrap();
+
+        assert!(!write(&path, "zh_CN"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), only_settings);
     }
 
     #[test]

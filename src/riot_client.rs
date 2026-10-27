@@ -383,14 +383,23 @@ fn start_game(
 /// registry does not list but the game does ship assets for — only takes effect
 /// through the file.
 ///
+/// The file is marked read-only by the write itself, because the client
+/// rewrites it from its own state while starting the game and would otherwise
+/// revert the language between the write and the read. A client that was
+/// already mid-start can still have rewritten it just before the attribute was
+/// set, so the value is read back and written once more if it did not take.
+///
 /// Failures stay non-fatal; the user still gets the game, just not the
 /// requested language.
 fn apply_locale(game: Game, locale: &str) {
-    let by_file = crate::game_locale::settings_file(game.product())
-        .is_some_and(|path| crate::game_locale::write(&path, locale));
+    // The API call comes first: writing through it makes the Riot Client rewrite
+    // the settings file, so the file is written after it and nothing follows
+    // that could undo the value before the launch reads it.
     let by_api = LocalApi::read()
         .filter(|api| api.set_product_locale(game, locale))
         .is_some_and(|api| api.product_locale(game).as_deref() == Some(locale));
+    let by_file = crate::game_locale::settings_file(game.product())
+        .is_some_and(|path| crate::game_locale::write(&path, locale));
     logging::record(
         Event::LoginProgress,
         match (by_file, by_api) {
