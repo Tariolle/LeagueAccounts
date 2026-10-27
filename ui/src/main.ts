@@ -6,7 +6,7 @@ import "./client-controls.css";
 
 import { ApiError, accountLabel, api, events, keyId, keyOf, parseAccountLine, type AccountView, type Ban, type Key, type LocaleOption, type Schedule, type Settings, type UpdateAccount } from "./api";
 import { openLoginOverlay, type LoginOverlay } from "./login";
-import { LANGUAGES, applyStatic, en, errorText, fromBrowser, lang, localeTag, localizeRank, needsLanguageChoice, setLang, t, tierName, useLang, type Lang, type MessageKey } from "./i18n";
+import { LANGUAGES, applyStatic, asLang, en, errorText, fromBrowser, lang, localeTag, localizeRank, needsLanguageChoice, setLang, t, tierName, useLang, type Lang, type MessageKey } from "./i18n";
 import { $, closeMenu, contextMenu, esc, fragment, leave, modal, reducedMotion, toast } from "./dom";
 import { hydrateIcons, icon } from "./icons";
 import { observeSelects } from "./dropdown";
@@ -1179,7 +1179,7 @@ async function welcomeLanguage(): Promise<void> {
   // own heading, and showing it in the body read as a stray second title.
   const english = detected === "en" ? "" : `
       <p class="hint welcome-english">${esc(en["welcome.text"])}</p>`;
-  await modal({
+  const answer = await modal({
     title: t("welcome.title"),
     body: `
       <p class="hint">${esc(t("welcome.text"))}</p>${english}
@@ -1191,11 +1191,21 @@ async function welcomeLanguage(): Promise<void> {
       // Not `changeLanguage`: on first run the picked language can equal the
       // untranslated default, and skipping the write would ask again next time.
       setLang(language);
+      void api.setUiLanguage(language).catch(() => {});
       applyLanguage();
       render();
       return true;
     },
   });
+  // Closed without choosing — Escape, the X, or a click outside: keep the
+  // language the dialog was already showing rather than asking again on the
+  // next launch. Only answering used to store a choice, so a dismissal made
+  // the question repeat forever.
+  if (answer === null) {
+    setLang(lang());
+    void api.setUiLanguage(lang()).catch(() => {});
+    applyLanguage();
+  }
 }
 
 /** Translate static markup and the option lists built in code. */
@@ -1214,6 +1224,8 @@ function applyLanguage(): void {
 function changeLanguage(next: Lang): void {
   if (next === lang()) return;
   setLang(next);
+  // Durable copy: the webview's localStorage is a cache and can be rebuilt.
+  void api.setUiLanguage(next).catch(() => {});
   applyLanguage();
   render();
 }
@@ -1570,6 +1582,19 @@ async function start(): Promise<void> {
   state.locales = boot.locales;
   state.settings = boot.settings;
   state.schedule = boot.schedule;
+  // The webview cache may have been rebuilt, which would bring the welcome
+  // dialog back on a launch that is not the first. The settings file is the
+  // record of that decision, so restore from it before deciding to ask.
+  const remembered = asLang(boot.settings.uiLanguage);
+  if (needsLanguageChoice() && remembered) {
+    // The webview cache was rebuilt but the settings file kept the decision.
+    setLang(remembered);
+    applyLanguage();
+  } else if (!needsLanguageChoice() && !remembered) {
+    // Chosen before this field existed: copy the cached value into the
+    // settings file so the record survives the next cache rebuild.
+    void api.setUiLanguage(lang()).catch(() => {});
+  }
   $("#version").textContent = `v${boot.version}`;
   render();
   if (boot.loadError) toast("error", t("toast.loadFailed"), errorText(boot.loadError.code, boot.loadError.detail), 8000);

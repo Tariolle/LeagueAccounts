@@ -2625,7 +2625,7 @@ export function fromBrowser(tag: string): Lang {
     return /-(tw|hk|mo|hant)\b/.test(lower) ? "zhTw" : "zh";
   }
   const base = lower.slice(0, 2);
-  return (base in DICTS ? base : "en") as Lang;
+  return asLang(base) ?? "en";
 }
 
 function detect(): Lang | null {
@@ -2644,6 +2644,10 @@ function detect(): Lang | null {
 let current: Lang = detect() ?? "en";
 
 export const lang = (): Lang => current;
+
+/** The code as a `Lang`, or null when no dictionary exists for it. */
+export const asLang = (value: string): Lang | null =>
+  (value in DICTS ? (value as Lang) : null);
 
 /** True until the user picks a language in the welcome dialog. */
 export const needsLanguageChoice = (): boolean => localStorage.getItem(STORAGE_KEY) === null;

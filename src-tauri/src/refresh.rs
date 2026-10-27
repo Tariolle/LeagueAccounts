@@ -40,6 +40,13 @@ pub struct Settings {
     pub auto_update: bool,
     /// Interface size in percent, from Settings › Interface size.
     pub ui_scale: u32,
+    /// Interface language code, and the record that the choice was made.
+    /// Empty means "never chosen", which is what the welcome dialog keys off.
+    /// It lives here as well as in the webview's storage because that storage
+    /// is a cache: a rebuilt WebView2 profile loses it and the dialog would
+    /// reappear on a launch that is not the first.
+    #[serde(default)]
+    pub ui_language: String,
     /// A release whose executable reported an older version than the release.
     /// It is never installed automatically, so it cannot update in a loop.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -66,6 +73,7 @@ impl Default for Settings {
             launch_game: true,
             auto_update: true,
             ui_scale: 100,
+            ui_language: String::new(),
             mislabeled_release: None,
             last_full_refresh: 0,
         }

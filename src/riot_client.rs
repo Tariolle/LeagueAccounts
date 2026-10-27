@@ -363,7 +363,7 @@ fn start_game(
     if let Some(locale) = locale {
         apply_locale(game, locale);
     }
-    match launch_game(game, account_id, cancel) {
+    let launched = match launch_game(game, account_id, cancel) {
         Err(LoginError::GameLaunchFailed) if game == Game::Tft => {
             if let Some(locale) = locale {
                 apply_locale(Game::League, locale);
@@ -371,7 +371,13 @@ fn start_game(
             launch_game(Game::League, account_id, cancel)
         }
         result => result,
+    };
+    // Only once the game is actually running: the Riot window is the only way
+    // back if the launch failed, so it must not be hidden before that.
+    if launched.is_ok() {
+        windows::hide_riot_client();
     }
+    launched
 }
 
 /// Set the game's language and record the outcome.
@@ -1257,6 +1263,52 @@ mod windows {
         let path = String::from_utf16_lossy(&buffer[..length as usize]);
         Some(std::path::PathBuf::from(path))
     }
+
+    /// Hide the Riot Client's own window, as its Play button does.
+    ///
+    /// Riot's renderer calls `UxService.minimize()` once the launch request is
+    /// accepted. We launch through the local API instead, so the window stays
+    /// in front until it is dealt with here. `Minimize` is used rather than
+    /// hiding: it is what the client itself does, it stays reversible from the
+    /// taskbar, and a window that vanishes with no way back is worse than one
+    /// that is merely out of the way.
+    pub fn hide_riot_client() {
+        use windows_sys::Win32::Foundation::LPARAM;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GetWindowThreadProcessId, IsWindowVisible, ShowWindow, SW_MINIMIZE,
+        };
+
+        let targets: Vec<u32> = crate::riot_client::running_processes()
+            .into_iter()
+            .filter(|process| process.name == "riot client.exe")
+            .map(|process| process.pid)
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+
+        struct Search<'a> {
+            targets: &'a [u32],
+        }
+        unsafe extern "system" fn callback(window: *mut core::ffi::c_void, param: LPARAM) -> i32 {
+            // SAFETY: `param` is the `&mut Search` passed to `EnumWindows`.
+            let search = unsafe { &mut *(param as *mut Search) };
+            let mut pid = 0u32;
+            // SAFETY: plain query of the window's owning process.
+            unsafe { GetWindowThreadProcessId(window, &mut pid) };
+            if search.targets.contains(&pid) && unsafe { IsWindowVisible(window) } != 0 {
+                // SAFETY: `window` came from the enumeration.
+                unsafe { ShowWindow(window, SW_MINIMIZE) };
+            }
+            1
+        }
+
+        let mut search = Search { targets: &targets };
+        // SAFETY: the callback only reads `search`, which outlives the call.
+        unsafe {
+            EnumWindows(Some(callback), &mut search as *mut Search as LPARAM);
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -1264,6 +1316,8 @@ mod windows {
     pub fn terminate_denied(_: u32) -> bool {
         false
     }
+
+    pub fn hide_riot_client() {}
 
     pub fn process_path(_: u32) -> Option<std::path::PathBuf> {
         None

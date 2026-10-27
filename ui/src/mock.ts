@@ -62,6 +62,7 @@ const settings: Settings = {
   launchGame: true,
   autoUpdate: true,
   uiScale: 100,
+  uiLanguage: "en",
   riotClientFound: true,
   tftInstalled: true,
 };
@@ -224,6 +225,7 @@ export function installMock(): void {
     openProfile: async () => {},
     openLogsFolder: async () => {},
     openHomeFixAuthor: async () => {},
+    setUiLanguage: async () => {},
     openPenguLoader: async () => {},
   } satisfies typeof api);
   Object.assign(events, {

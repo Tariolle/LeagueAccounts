@@ -34,11 +34,15 @@ export interface Settings {
   autoUpdate: boolean;
   /** Interface size in percent; the window zooms and resizes with it. */
   uiScale: number;
+  /** Empty until the welcome dialog has been answered once. */
+  uiLanguage: string;
   riotClientFound: boolean;
   tftInstalled: boolean;
 }
 
-export type SettingsInput = Omit<Settings, "riotClientFound" | "tftInstalled">;
+// `uiLanguage` is set through its own command, not the Settings form, so it is
+// not part of what the form submits.
+export type SettingsInput = Omit<Settings, "riotClientFound" | "tftInstalled" | "uiLanguage">;
 
 export interface Schedule {
   enabled: boolean;
@@ -277,6 +281,8 @@ export const api = {
   openRelease: (url: string) => call<void>("open_release", { url }),
   getSettings: () => call<Settings>("get_settings"),
   updateSettings: (input: SettingsInput) => call<Settings>("update_settings", { input }),
+  /** Durable copy of the interface language, for when the webview cache is lost. */
+  setUiLanguage: (language: string) => call<void>("set_ui_language", { language }),
   exportData: (title: string) => call<string | null>("export_data", { title }),
   importData: (title: string) => call<BatchResult | null>("import_data", { title }),
   openProfile: (key: Key, tft: boolean) => call<void>("open_profile", { key, tft }),

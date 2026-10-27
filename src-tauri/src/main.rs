@@ -55,6 +55,8 @@ struct SettingsView {
     launch_game: bool,
     auto_update: bool,
     ui_scale: u32,
+    /// Empty until the welcome dialog has been answered once.
+    ui_language: String,
     riot_client_found: bool,
     tft_installed: bool,
 }
@@ -197,6 +199,7 @@ fn settings_view(app: &AppHandle, state: &Shared) -> SettingsView {
         launch_game: settings.launch_game,
         auto_update: settings.auto_update,
         ui_scale: settings.ui_scale,
+        ui_language: settings.ui_language.clone(),
         riot_client_found: riot_client::client_path().is_some(),
         tft_installed: riot_client::game_installed(Game::Tft),
     }
@@ -394,6 +397,26 @@ fn refresh_ranks(app: AppHandle, state: AppState<'_>, force: Option<bool>) -> Co
 #[tauri::command]
 fn get_settings(app: AppHandle, state: AppState<'_>) -> SettingsView {
     settings_view(&app, &state)
+}
+
+/// Record the interface language the user picked.
+///
+/// The webview's localStorage already holds it, but that storage is a cache: a
+/// rebuilt WebView2 profile loses it, and the welcome dialog then reappeared on
+/// launches that were not the first. This is the durable copy.
+#[tauri::command]
+fn set_ui_language(state: AppState<'_>, language: String) -> CommandResult<()> {
+    // A short ASCII code; the webview rejects anything it has no dictionary for.
+    if language.len() > 8 || !language.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(fail("invalid_language"));
+    }
+    let mut settings = state.settings.lock().map_err(|_| fail("storage_locked"))?;
+    if settings.ui_language == language {
+        return Ok(());
+    }
+    settings.ui_language = language;
+    settings.save(state.settings_path.as_ref());
+    Ok(())
 }
 
 #[tauri::command]
@@ -924,6 +947,7 @@ fn main() {
             refresh_ranks,
             get_settings,
             update_settings,
+            set_ui_language,
             copy_account_id,
             copy_password,
             login,
