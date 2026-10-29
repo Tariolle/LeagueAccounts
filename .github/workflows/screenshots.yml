@@ -50,7 +50,7 @@ jobs:
             echo "Screenshots are unchanged."
             exit 0
           fi
-          branch="screenshots/${GITHUB_REF_NAME//\//-}-$GITHUB_RUN_ID"
+          branch="screenshots/${GITHUB_REF_NAME//\//-}-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
