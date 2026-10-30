@@ -19,6 +19,13 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(120);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 /// Time for the Riot Client to apply a region change.
 const REGION_TIMEOUT: Duration = Duration::from_secs(10);
+/// Time the client gets to accept the account's game language. A client that
+/// has just been started still answers the request before its product session
+/// is up, then ignores it; only once its metadata has loaded does the value
+/// stick. Polling until it does costs nothing on a warm client, which accepts
+/// the first request.
+const LOCALE_TIMEOUT: Duration = Duration::from_secs(30);
+const LOCALE_POLL: Duration = Duration::from_millis(300);
 const POLL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,16 +57,17 @@ pub enum LoginOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoginStep {
     CloseLeague,
+    /// Starting the client and waiting until its session is readable.
     OpenClient,
-    WaitAuth,
     SignOut,
-    Connect,
-    FindWindow,
+    /// Finding the login form, typing the credentials and confirming them.
+    SignIn,
     Verification,
     Focus,
     Type,
-    Confirm,
     LaunchGame,
+    /// The game has an update to download or install before it can start.
+    Updating,
     Done,
 }
 
@@ -68,15 +76,13 @@ impl LoginStep {
         let reason = match self {
             Self::CloseLeague => Reason::CloseLeague,
             Self::OpenClient => Reason::OpenClient,
-            Self::WaitAuth => Reason::WaitAuth,
             Self::SignOut => Reason::SignOut,
-            Self::Connect => Reason::ConnectRenderer,
+            Self::SignIn => Reason::SignIn,
             Self::Verification => Reason::AuthInteraction,
-            Self::FindWindow => Reason::FindWindow,
             Self::Focus => Reason::Focus,
             Self::Type => Reason::Type,
-            Self::Confirm => Reason::Confirm,
             Self::LaunchGame => Reason::LaunchGame,
+            Self::Updating => Reason::Updating,
             Self::Done => Reason::Done,
         };
         logging::record(Event::LoginProgress, reason);
@@ -86,15 +92,13 @@ impl LoginStep {
         match self {
             LoginStep::CloseLeague => "closeLeague",
             LoginStep::OpenClient => "openClient",
-            LoginStep::WaitAuth => "waitAuth",
             LoginStep::SignOut => "signOut",
-            LoginStep::Connect => "connect",
+            LoginStep::SignIn => "signIn",
             LoginStep::Verification => "verification",
-            LoginStep::FindWindow => "findWindow",
             LoginStep::Focus => "focus",
             LoginStep::Type => "type",
-            LoginStep::Confirm => "confirm",
             LoginStep::LaunchGame => "launchGame",
+            LoginStep::Updating => "updating",
             LoginStep::Done => "done",
         }
     }
@@ -245,6 +249,30 @@ pub fn game_installed(game: Game) -> bool {
         .exists()
 }
 
+/// Whether the client has an update for the product that it must download or
+/// install before the game can start.
+///
+/// The client writes this file for the game's integration (it passes the path
+/// as `app-update-status`), so it also describes what the Play button waits
+/// for. A missing or unreadable file is not an update.
+pub fn update_pending(game: Game) -> bool {
+    let path = program_data()
+        .join(r"Riot Games\Metadata")
+        .join(format!("{}.live.update-status.json", game.product()));
+    std::fs::read_to_string(path).is_ok_and(|text| update_reported(&text))
+}
+
+/// `true` when the update-status document reports work the client has to do
+/// before the game can start.
+fn update_reported(text: &str) -> bool {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    ["updateAvailable", "updateRequired"]
+        .iter()
+        .any(|key| json["status"][*key].as_bool() == Some(true))
+}
+
 /// Riot's per-product locale resource for the live patchline.
 fn product_locale_path(game: Game) -> String {
     format!(
@@ -256,7 +284,13 @@ fn product_locale_path(game: Game) -> String {
 /// Start `game` for the signed-in account and wait until its client process
 /// confirms the same account. Requests go through the local API, after
 /// rechecking the Riot session immediately before each launch request.
-fn launch_game(game: Game, account_id: &str, cancel: &AtomicBool) -> Result<(), LoginError> {
+fn launch_game(
+    game: Game,
+    account_id: &str,
+    progress: &mut dyn FnMut(LoginStep),
+    cancel: &AtomicBool,
+) -> Result<(), LoginError> {
+    let mut reported_update: Option<bool> = None;
     launch_game_with(
         account_id,
         cancel,
@@ -276,7 +310,20 @@ fn launch_game(game: Game, account_id: &str, cancel: &AtomicBool) -> Result<(), 
             api.follow_league_region(REGION_TIMEOUT, cancel)?;
             Ok(api.launch(game))
         },
-        || thread::sleep(Duration::from_secs(1)),
+        || {
+            // A game that is being patched is not launched yet; say so instead
+            // of leaving the last step on "launching" for minutes.
+            let updating = update_pending(game);
+            if reported_update != Some(updating) {
+                progress(if updating {
+                    LoginStep::Updating
+                } else {
+                    LoginStep::LaunchGame
+                });
+                reported_update = Some(updating);
+            }
+            thread::sleep(Duration::from_secs(1));
+        },
     )
 }
 
@@ -358,17 +405,18 @@ fn start_game(
     game: Game,
     account_id: &str,
     locale: Option<&str>,
+    progress: &mut dyn FnMut(LoginStep),
     cancel: &AtomicBool,
 ) -> Result<(), LoginError> {
     if let Some(locale) = locale {
-        apply_locale(game, locale);
+        apply_locale(game, locale, cancel);
     }
-    let launched = match launch_game(game, account_id, cancel) {
+    let launched = match launch_game(game, account_id, progress, cancel) {
         Err(LoginError::GameLaunchFailed) if game == Game::Tft => {
             if let Some(locale) = locale {
-                apply_locale(Game::League, locale);
+                apply_locale(Game::League, locale, cancel);
             }
-            launch_game(Game::League, account_id, cancel)
+            launch_game(Game::League, account_id, progress, cancel)
         }
         result => result,
     };
@@ -382,35 +430,41 @@ fn start_game(
 
 /// Set the game's language and record the outcome.
 ///
-/// The Riot Client's local API accepts any locale and reads it back, but it
-/// builds the game's `--locale=` argument from the product settings file, so
-/// that file is what decides. Both are written: the API keeps the client's own
-/// UI in step, and the file is what the game starts with. `zh_CN` — which the
-/// registry does not list but the game does ship assets for — only takes effect
-/// through the file.
+/// The Riot Client's local API is what the launcher reads when it starts the
+/// game, and it is also what makes the client rewrite the product settings
+/// file. A freshly started client answers the request before that state is up
+/// and then discards it, which is how the game could start in the region's
+/// default language even though the write reported success — so the locale is
+/// read back and the request repeated until the client agrees or time runs out.
 ///
-/// The file is marked read-only by the write itself, because the client
-/// rewrites it from its own state while starting the game and would otherwise
-/// revert the language between the write and the read. A client that was
-/// already mid-start can still have rewritten it just before the attribute was
-/// set, so the value is read back and written once more if it did not take.
+/// The file is written afterwards, for the cold start and for `zh_CN`, which it
+/// lists as available even though Riot's registry does not.
 ///
 /// Failures stay non-fatal; the user still gets the game, just not the
 /// requested language.
-fn apply_locale(game: Game, locale: &str) {
-    // The API call comes first: writing through it makes the Riot Client rewrite
-    // the settings file, so the file is written after it and nothing follows
-    // that could undo the value before the launch reads it.
-    let by_api = LocalApi::read()
-        .filter(|api| api.set_product_locale(game, locale))
-        .is_some_and(|api| api.product_locale(game).as_deref() == Some(locale));
+fn apply_locale(game: Game, locale: &str, cancel: &AtomicBool) {
+    let started = Instant::now();
+    let mut by_api = false;
+    while !by_api && started.elapsed() < LOCALE_TIMEOUT && !cancel.load(Ordering::SeqCst) {
+        by_api = LocalApi::read().is_some_and(|api| {
+            api.set_product_locale(game, locale)
+                && api.product_locale(game).as_deref() == Some(locale)
+        });
+        if !by_api {
+            thread::sleep(LOCALE_POLL);
+        }
+    }
+    // Written after the request settled: the client rewrites this file from
+    // its own state when it accepts a locale, and a write made before that
+    // rewrite is what used to be lost.
     let by_file = crate::game_locale::settings_file(game.product())
         .is_some_and(|path| crate::game_locale::write(&path, locale));
     logging::record(
         Event::LoginProgress,
-        match (by_file, by_api) {
+        match (by_api, by_file) {
             (true, _) => Reason::LocaleApplied,
-            // The file is authoritative, so an API-only result is not enough.
+            // Without the client's own state, a later rewrite can still undo
+            // the file, so a file-only result is not "applied".
             (false, true) => Reason::LocaleRejected,
             (false, false) => Reason::LocaleUnavailable,
         },
@@ -1136,10 +1190,9 @@ pub fn login(
     let mut client = renderer::Renderer::new(&path);
     progress(LoginStep::OpenClient);
     client.ensure_service(cancel)?;
-    progress(LoginStep::WaitAuth);
     let started = Instant::now();
     let mut sign_out_sent: Option<Instant> = None;
-    let mut waiting_step = LoginStep::WaitAuth;
+    let mut verification_shown = false;
     let mut diagnostics = LoginDiagnostics::default();
     loop {
         check_cancelled(cancel)?;
@@ -1158,7 +1211,7 @@ pub fn login(
                                 await_product_context(&mut client, progress, cancel)?;
                             }
                             progress(LoginStep::LaunchGame);
-                            start_game(game, account_id, locale, cancel)?;
+                            start_game(game, account_id, locale, progress, cancel)?;
                         }
                         progress(LoginStep::Done);
                         return Ok(LoginOutcome::AlreadySignedIn);
@@ -1181,14 +1234,9 @@ pub fn login(
                 },
                 Session::SignedOut => break,
                 Session::Unknown(reason) => {
-                    let step = if reason == Reason::AuthInteraction {
-                        LoginStep::Verification
-                    } else {
-                        LoginStep::WaitAuth
-                    };
-                    if step != waiting_step {
-                        progress(step);
-                        waiting_step = step;
+                    if reason == Reason::AuthInteraction && !verification_shown {
+                        progress(LoginStep::Verification);
+                        verification_shown = true;
                     }
                     diagnostics.waiting(reason);
                 }
@@ -1206,13 +1254,13 @@ pub fn login(
         client.close_debugger()?;
         check_cancelled(cancel)?;
         progress(LoginStep::LaunchGame);
-        start_game(game, account_id, locale, cancel)?;
+        start_game(game, account_id, locale, progress, cancel)?;
         client.replaced_by_game();
     } else {
         // No launch now, but the next manual start should already be in the
         // account's language, so apply it to the product the user plays.
         if let Some(locale) = locale {
-            apply_locale(game.unwrap_or(Game::League), locale);
+            apply_locale(game.unwrap_or(Game::League), locale, cancel);
         }
         client.restore()?;
         check_cancelled(cancel)?;
@@ -2061,7 +2109,6 @@ mod tests {
                 Reason::AuthIdentityPending,
                 Reason::SessionPending,
                 Reason::SessionActionRequired,
-                Reason::FindWindow,
                 Reason::LoginFormReady,
                 Reason::GameIdentityPending,
                 Reason::GameProcessPending,
@@ -2072,7 +2119,9 @@ mod tests {
                 diagnostics.waiting(reason);
                 diagnostics.waiting(reason);
             }
+            LoginStep::SignIn.record();
             LoginStep::LaunchGame.record();
+            LoginStep::Updating.record();
             record_login_result(&Err(LoginError::AccountMismatch));
             record_login_result(&Err(LoginError::GameLaunchFailed));
             record_login_result(&Err(LoginError::SignOutFailed));
@@ -2091,14 +2140,15 @@ mod tests {
             "INFO event=login_waiting reason=auth_identity_pending",
             "INFO event=login_waiting reason=session_pending",
             "INFO event=login_waiting reason=session_action_required",
-            "INFO event=login_waiting reason=find_window",
             "INFO event=login_waiting reason=login_form_ready",
             "INFO event=login_waiting reason=game_identity_pending",
             "INFO event=login_waiting reason=game_process_pending",
             "INFO event=login_waiting reason=launch_pending",
             "INFO event=login_waiting reason=launch_rejected",
             "INFO event=login_waiting reason=region_change",
+            "INFO event=login_progress reason=sign_in",
             "INFO event=login_progress reason=launch_game",
+            "INFO event=login_progress reason=updating",
             "ERROR event=login_failed reason=account_mismatch",
             "ERROR event=login_failed reason=game_launch_failed",
             "ERROR event=login_failed reason=sign_out_failed",
@@ -2112,6 +2162,20 @@ mod tests {
         ] {
             assert_eq!(log.matches(entry).count(), 1, "{entry}");
         }
+    }
+
+    #[test]
+    fn update_status_reports_only_work_the_client_must_finish_first() {
+        assert!(!update_reported(
+            r#"{"productSessionId":"x","status":{"updateAvailable":false,"updateRequired":false}}"#
+        ));
+        assert!(update_reported(r#"{"status":{"updateAvailable":true}}"#));
+        assert!(update_reported(r#"{"status":{"updateRequired":true}}"#));
+        // Missing, malformed or foreign documents are not an update.
+        assert!(!update_reported(""));
+        assert!(!update_reported("not json"));
+        assert!(!update_reported(r#"{"status":{}}"#));
+        assert!(!update_reported(r#"{"status":{"updateAvailable":"true"}}"#));
     }
 
     #[test]

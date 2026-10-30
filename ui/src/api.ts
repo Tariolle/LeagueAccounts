@@ -55,15 +55,13 @@ export interface Schedule {
 export type LoginStep =
   | "closeLeague"
   | "openClient"
-  | "waitAuth"
   | "signOut"
-  | "connect"
+  | "signIn"
   | "verification"
-  | "findWindow"
   | "focus"
   | "type"
-  | "confirm"
   | "launchGame"
+  | "updating"
   | "done";
 
 export interface GameStatus {

@@ -126,7 +126,6 @@ impl Event {
 /// Safe categories, deliberately excluding raw messages and arbitrary codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
-    ConnectRenderer,
     RendererFailed,
     AuthRejected,
     CaptchaRejected,
@@ -134,7 +133,6 @@ pub enum Reason {
     PreviousWindow,
     CloseLeague,
     OpenClient,
-    WaitAuth,
     AuthUnavailable,
     AuthStarting,
     AuthInteraction,
@@ -149,11 +147,11 @@ pub enum Reason {
     LaunchRejected,
     RegionChange,
     SignOut,
-    FindWindow,
     Focus,
     Type,
-    Confirm,
+    SignIn,
     LaunchGame,
+    Updating,
     Done,
     SignedIn,
     Typed,
@@ -204,7 +202,6 @@ pub enum Reason {
 impl Reason {
     fn code(self) -> &'static str {
         match self {
-            Self::ConnectRenderer => "connect_renderer",
             Self::RendererFailed => "renderer_failed",
             Self::AuthRejected => "auth_rejected",
             Self::CaptchaRejected => "captcha_rejected",
@@ -212,7 +209,6 @@ impl Reason {
             Self::PreviousWindow => "previous_window",
             Self::CloseLeague => "close_league",
             Self::OpenClient => "open_client",
-            Self::WaitAuth => "wait_auth",
             Self::AuthUnavailable => "auth_unavailable",
             Self::AuthStarting => "auth_starting",
             Self::AuthInteraction => "auth_interaction",
@@ -227,11 +223,11 @@ impl Reason {
             Self::LaunchRejected => "launch_rejected",
             Self::RegionChange => "region_change",
             Self::SignOut => "sign_out",
-            Self::FindWindow => "find_window",
             Self::Focus => "focus",
             Self::Type => "type",
-            Self::Confirm => "confirm",
+            Self::SignIn => "sign_in",
             Self::LaunchGame => "launch_game",
+            Self::Updating => "updating",
             Self::Done => "done",
             Self::SignedIn => "signed_in",
             Self::Typed => "typed",

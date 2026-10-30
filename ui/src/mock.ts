@@ -138,11 +138,11 @@ export function installMock(): void {
     updateSettings: async (input: object) => Object.assign(settings, input),
     login: async (key: Key, _tft: boolean, _closeRunning: boolean, launchBanned: boolean) => {
       const ban = accounts.find((account) => keyId(account) === keyId(key))?.ban;
-      const steps: LoginStep[] = ["openClient", "waitAuth", "connect", "findWindow", "type", "confirm", "launchGame", "done"];
+      const steps: LoginStep[] = ["openClient", "signOut", "signIn", "launchGame", "updating", "launchGame", "done"];
       for (const step of steps) {
         if (ban && settings.launchGame && !launchBanned && step === "launchGame") throw new ApiError("account_banned", ban.until == null ? "" : String(ban.until));
         listeners.step.forEach((handler) => handler(step));
-        await wait(step === "waitAuth" || step === "confirm" ? 1400 : 700);
+        await wait(step === "signIn" ? 1400 : 700);
       }
       return "signedIn";
     },

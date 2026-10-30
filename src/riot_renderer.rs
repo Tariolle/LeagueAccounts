@@ -409,7 +409,7 @@ pub(super) fn sign_in(
     }
     check_cancelled(cancel)?;
     let service = renderer.service.clone();
-    progress(LoginStep::Connect);
+    progress(LoginStep::SignIn);
     renderer.ensure_controllable()?;
     renderer.restore_needed = true;
     stop_client(&service, cancel)?;
@@ -544,7 +544,6 @@ pub(super) fn sign_in(
     renderer.cdp = Some(Cdp::connect(&endpoint, port)?);
     let cdp = renderer.cdp.as_mut().ok_or(LoginError::RendererFailed)?;
     cdp.eval(include_str!("riot_renderer.js"), cancel)?;
-    progress(LoginStep::FindWindow);
     let start = Instant::now();
     while cdp.eval("globalThis.__leagueAccountsLogin.ready()", cancel)? != true {
         if start.elapsed() > Duration::from_secs(30) {
@@ -558,7 +557,6 @@ pub(super) fn sign_in(
     if current.base != api.base || current.session() != Session::SignedOut {
         return Err(LoginError::AccountMismatch);
     }
-    progress(LoginStep::Type);
     let mut expression = format!(
         "globalThis.__leagueAccountsLogin.fill(...{})",
         json!([username, password])
@@ -571,7 +569,6 @@ pub(super) fn sign_in(
     if cdp.eval("globalThis.__leagueAccountsLogin.submit()", cancel)? != true {
         return Err(LoginError::RendererFailed);
     }
-    progress(LoginStep::Confirm);
     let start = Instant::now();
     let mut verification = false;
     loop {
