@@ -203,7 +203,12 @@ export function installMock(): void {
       const account = find(key)!;
       const name = input.name.trim();
       const renamed = account.name !== name;
-      Object.assign(account, { name, description: input.description, locale: input.locale });
+      Object.assign(account, {
+        name,
+        description: input.description,
+        locale: input.locale,
+        skipProfileUpdate: input.skipProfileUpdate ?? false,
+      });
       if (renamed) {
         Object.assign(account, { riotIdNotFound: false, level: "", lol: lol("Unranked", "", "", "N/A"), tft: tft("Unranked", "", "", "N/A") });
         const updated = name ? { ...account, level: "30", lol: lol("Silver", "II", "45", "Bronze I") } : { ...account };

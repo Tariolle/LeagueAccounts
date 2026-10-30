@@ -135,6 +135,10 @@ export function modal(options: {
       close(value);
     };
     const onKey = (event: KeyboardEvent) => {
+      // A child dialog owns the keyboard until it closes. Ignore its exit
+      // animation too, so the editor becomes active as soon as it is dismissed.
+      const top = [...document.querySelectorAll("#modal-root > .overlay:not(.overlay-out)")].at(-1);
+      if (closed || top !== overlay) return;
       if (event.key === "Tab") {
         const controls = [...overlay.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex='0']")]
           .filter(control => control.getClientRects().length > 0);
@@ -144,7 +148,8 @@ export function modal(options: {
         else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
       }
       if (event.key === "Escape") {
-        event.stopPropagation();
+        event.preventDefault();
+        event.stopImmediatePropagation();
         close(null);
       }
     };
