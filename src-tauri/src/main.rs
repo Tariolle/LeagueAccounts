@@ -578,9 +578,9 @@ async fn login(
             &mut on_ban,
             &shared.login.cancel,
         );
-        // Bulk-imported accounts usually have no Riot ID. The client now knows
-        // it, so record it instead of making the user look it up.
-        if outcome.is_ok() {
+        // Only a launched game has a League session to supply the Riot ID.
+        // A client-only sign-in must not wait for a process we did not start.
+        if outcome.is_ok() && game.is_some() {
             adopt_riot_id(&app, &shared, &account_key);
         }
         outcome
@@ -637,18 +637,11 @@ fn adopt_riot_id(app: &AppHandle, shared: &Arc<Shared>, key: &AccountKey) {
     if !needs_riot_id(shared, key) {
         return;
     }
-    // The client needs a few more seconds after the Riot sign-in finishes.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let mut riot_id = None;
-    while std::time::Instant::now() < deadline {
-        if let Some(found) = riot_client::signed_in_riot_id() {
-            riot_id = Some(found);
-            break;
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
-    let Some(riot_id) = riot_id else { return };
+    let Some(riot_id) = riot_client::wait_for_riot_id(&shared.login.cancel) else { return };
     let Ok(mut manager) = manager(shared) else { return };
+    if shared.login.cancel.load(Ordering::SeqCst) {
+        return;
+    }
     let Some(stored) = manager.account_mut(key) else { return };
     // Re-checked against the stored value: an edit may have landed meanwhile.
     if !stored.name.trim().is_empty() {

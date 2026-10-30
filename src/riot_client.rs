@@ -1019,10 +1019,39 @@ impl GameStatus {
 /// path as [`game_username`]: the League client process, its install directory,
 /// and a lockfile whose PID matches that process.
 ///
-/// Returns `None` while the game client is still starting, when it has no
-/// session yet, or for an account that has not picked a name.
-pub fn signed_in_riot_id() -> Option<String> {
-    riot_id_from_processes(&running_processes())
+/// Wait up to a minute for the launched client's summoner record. Cancellation
+/// stops discovery without changing the result of the completed sign-in.
+pub fn wait_for_riot_id(cancel: &AtomicBool) -> Option<String> {
+    wait_for_riot_id_with(
+        cancel,
+        Duration::from_secs(60),
+        || riot_id_from_processes(&running_processes()),
+        || thread::sleep(POLL),
+    )
+}
+
+fn wait_for_riot_id_with(
+    cancel: &AtomicBool,
+    timeout: Duration,
+    mut read: impl FnMut() -> Option<String>,
+    mut wait: impl FnMut(),
+) -> Option<String> {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        let riot_id = read();
+        // Cancellation can arrive during a local API request too.
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        if riot_id.is_some() {
+            return riot_id;
+        }
+        wait();
+    }
+    None
 }
 
 fn riot_id_from_processes(processes: &[Process]) -> Option<String> {
@@ -1375,6 +1404,58 @@ mod windows {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn riot_id_discovery_stops_when_cancelled_before_or_during_a_read() {
+        let cancel = AtomicBool::new(true);
+        let result = wait_for_riot_id_with(
+            &cancel,
+            Duration::from_secs(60),
+            || panic!("cancelled discovery must not query the client"),
+            || panic!("cancelled discovery must not wait"),
+        );
+        assert_eq!(result, None);
+
+        cancel.store(false, Ordering::SeqCst);
+        let result = wait_for_riot_id_with(
+            &cancel,
+            Duration::from_secs(60),
+            || {
+                cancel.store(true, Ordering::SeqCst);
+                Some("Player#EUW".into())
+            },
+            || panic!("cancelled discovery must not wait"),
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn riot_id_discovery_retries_a_starting_client_and_obeys_its_deadline() {
+        let cancel = AtomicBool::new(false);
+        let reads = Cell::new(0);
+        let waits = Cell::new(0);
+        let result = wait_for_riot_id_with(
+            &cancel,
+            Duration::from_secs(60),
+            || {
+                reads.set(reads.get() + 1);
+                (reads.get() == 2).then(|| "Player#EUW".into())
+            },
+            || waits.set(waits.get() + 1),
+        );
+        assert_eq!(result.as_deref(), Some("Player#EUW"));
+        assert_eq!(reads.get(), 2);
+        assert_eq!(waits.get(), 1);
+        assert_eq!(
+            wait_for_riot_id_with(
+                &cancel,
+                Duration::ZERO,
+                || panic!("expired discovery must not query the client"),
+                || panic!("expired discovery must not wait"),
+            ),
+            None
+        );
+    }
 
     #[test]
     fn summoner_riot_id_joins_name_and_uppercased_tag() {
