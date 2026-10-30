@@ -256,6 +256,27 @@ impl AccountManager {
             .find(|account| account.key() == *key)
     }
 
+    /// Replace the credential and the cached password together. A failed
+    /// credential write must leave login, copy and export using the old value.
+    pub fn set_password(&mut self, key: &AccountKey, password: &str) -> ManagerResult<()> {
+        self.set_password_with(key, password, &NativePasswords(KEYRING_SERVICE))
+    }
+
+    fn set_password_with(
+        &mut self,
+        key: &AccountKey,
+        password: &str,
+        passwords: &impl PasswordStore,
+    ) -> ManagerResult<()> {
+        let account = self.account_mut(key).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "account not found")
+        })?;
+        let credential_key = format!("{}:{}", account.region, account.account_id);
+        passwords.set(&credential_key, password)?;
+        account.password = password.to_owned();
+        Ok(())
+    }
+
     pub fn apply_rank_info(&mut self, fetched: &Account, info: &RankInfo) -> bool {
         if let Some(account) = self
             .account_mut(&fetched.key())
@@ -421,6 +442,8 @@ struct ExportAccount {
     region_display: String,
     password: String,
     description: String,
+    locale: Option<String>,
+    skip_profile_update: bool,
     tier: String,
     division: String,
     lp: String,
@@ -442,6 +465,8 @@ impl From<&Account> for ExportAccount {
             region_display: account.region_display.clone(),
             password: account.password.clone(),
             description: account.description.clone(),
+            locale: account.locale.clone(),
+            skip_profile_update: account.skip_profile_update,
             tier: account.tier.clone(),
             division: account.division.clone(),
             lp: account.lp.clone(),
@@ -500,18 +525,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn export_round_trips_rank_provenance() {
+    fn export_round_trips_account_settings_and_rank_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manager = test_manager(directory.path().join("accounts.json"));
         let account = Account {
+            locale: Some("zh_CN".into()),
+            skip_profile_update: true,
             rank_provenance: Some(RankProvenance {
                 source: "OP.GG".into(),
                 source_updated_at: Some(42),
                 ..Default::default()
             }),
             tft_provenance: Some(RankProvenance::default()),
-            ..Default::default()
+            ..test_account("exported")
         };
-        let json = serde_json::to_string(&ExportAccount::from(&account)).unwrap();
-        let imported: ImportAccount = serde_json::from_str(&json).unwrap();
+        manager.accounts.push(account.clone());
+        let json = manager.export_accounts().unwrap();
+        let mut restored = test_manager(directory.path().join("restored.json"));
+        let passwords = TestPasswords::default();
+        assert_eq!(restored.import_accounts_with(&json, &passwords).unwrap(), (1, 0));
+        let imported = &restored.accounts[0];
+        assert_eq!(imported.locale, account.locale);
+        assert_eq!(imported.skip_profile_update, account.skip_profile_update);
         assert_eq!(imported.rank_provenance, account.rank_provenance);
         assert_eq!(imported.tft_provenance, account.tft_provenance);
     }
@@ -560,6 +595,37 @@ mod tests {
 
     fn test_manager(path: impl Into<PathBuf>) -> AccountManager {
         AccountManager::with_path(path, Arc::new(crate::rank_fetcher::RankFetcher::default()))
+    }
+
+    #[test]
+    fn password_edits_update_the_cache_only_after_the_credential_write_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manager = test_manager(directory.path().join("accounts.json"));
+        let mut passwords = TestPasswords::default();
+        let edited = test_account("edited");
+        let key = edited.key();
+        let other = test_account("other");
+        manager
+            .add_accounts_with(vec![edited, other.clone()], &passwords)
+            .unwrap();
+        manager.set_password_with(&key, "new-password", &passwords).unwrap();
+        assert_eq!(manager.account(&key).unwrap().password, "new-password");
+        let credential_key = format!("{}:{}", key.region, key.account_id);
+        assert_eq!(passwords.get(&credential_key).unwrap().as_deref(), Some("new-password"));
+        let exported: Vec<ImportAccount> =
+            serde_json::from_str(&manager.export_accounts().unwrap()).unwrap();
+        let exported = exported.iter().find(|account| account.account_id == key.account_id).unwrap();
+        assert_eq!(exported.password, "new-password");
+        assert_eq!(manager.account(&other.key()).unwrap(), &other);
+
+        passwords.fail_set = Some(credential_key.clone());
+        assert!(manager.set_password_with(&key, "refused-password", &passwords).is_err());
+        assert_eq!(manager.account(&key).unwrap().password, "new-password");
+        assert_eq!(passwords.get(&credential_key).unwrap().as_deref(), Some("new-password"));
+        manager.save_accounts().unwrap();
+        let saved = std::fs::read_to_string(&manager.accounts_file).unwrap();
+        assert!(!saved.contains("new-password"));
+        assert!(!saved.contains("refused-password"));
     }
 
     struct SlowProvider {

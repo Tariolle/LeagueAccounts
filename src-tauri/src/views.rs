@@ -81,6 +81,7 @@ pub struct AccountView {
     has_password: bool,
     /// Product locale this account starts the game in; `None` = Riot's choice.
     locale: Option<String>,
+    skip_profile_update: bool,
     lol: LolView,
     tft: TftView,
     rank_provenance: Option<RankProvenance>,
@@ -99,6 +100,7 @@ pub fn account_view(account: &Account) -> AccountView {
         level: account.level.clone(),
         has_password: !account.password.is_empty(),
         locale: account.locale.clone(),
+        skip_profile_update: account.skip_profile_update,
         rank_provenance: account.rank_provenance.clone(),
         tft_provenance: account.tft_provenance.clone(),
         ban: account.ban,
@@ -115,5 +117,25 @@ pub fn account_view(account: &Account) -> AccountView {
             lp: account.tft.lp.clone(),
             last_set: account.tft.last_set.clone(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_responses_preserve_language_and_vn_preferences_without_passwords() {
+        let account = Account {
+            locale: Some("zh_MY".into()),
+            skip_profile_update: true,
+            password: "dummy-password".into(),
+            ..Account::default()
+        };
+        let json = serde_json::to_value(account_view(&account)).unwrap();
+        assert_eq!(json["locale"], "zh_MY");
+        assert_eq!(json["skipProfileUpdate"], true);
+        assert_eq!(json["hasPassword"], true);
+        assert!(json.get("password").is_none());
     }
 }

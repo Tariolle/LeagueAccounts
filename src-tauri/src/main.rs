@@ -355,17 +355,17 @@ fn update_account(
         account.description = input.description.trim().to_owned();
         account.locale = locale;
         account.skip_profile_update = skip_profile_update;
-        let updated = account.clone();
         manager
             .save_accounts()
             .map_err(|error| fail_with("save_failed", error))?;
+        if let Some(password) = new_password {
+            manager
+                .set_password(&key, &password)
+                .map_err(|error| fail_with("password_save", error))?;
+        }
+        let updated = manager.account(&key).ok_or_else(|| fail("not_found"))?.clone();
         (updated, renamed)
     };
-    if let Some(password) = new_password {
-        let credential_key = format!("{}:{}", key.region, key.account_id);
-        credentials::set_password(KEYRING_SERVICE, &credential_key, &password)
-            .map_err(|error| fail_with("password_save", error))?;
-    }
     let view = account_view(&updated);
     if renamed {
         start_refresh(app, Arc::clone(&state), vec![updated], RefreshKind::Partial);
