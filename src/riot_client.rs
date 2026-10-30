@@ -1312,18 +1312,17 @@ mod windows {
         Some(std::path::PathBuf::from(path))
     }
 
-    /// Hide the Riot Client's own window, as its Play button does.
+    /// Hide the Riot Client's window, leaving it running in the tray.
     ///
     /// Riot's renderer calls `UxService.minimize()` once the launch request is
-    /// accepted. We launch through the local API instead, so the window stays
-    /// in front until it is dealt with here. `Minimize` is used rather than
-    /// hiding: it is what the client itself does, it stays reversible from the
-    /// taskbar, and a window that vanishes with no way back is worse than one
-    /// that is merely out of the way.
+    /// accepted, which keeps a taskbar button around. The client owns a tray
+    /// icon for as long as it runs, so the window is hidden instead: it leaves
+    /// the taskbar entirely and comes back from that icon, the same way its
+    /// own "run in background" mode behaves.
     pub fn hide_riot_client() {
         use windows_sys::Win32::Foundation::LPARAM;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            EnumWindows, GetWindowThreadProcessId, IsWindowVisible, ShowWindow, SW_MINIMIZE,
+            EnumWindows, GetWindowThreadProcessId, IsWindowVisible, ShowWindow, SW_HIDE,
         };
 
         let targets: Vec<u32> = crate::riot_client::running_processes()
@@ -1346,7 +1345,7 @@ mod windows {
             unsafe { GetWindowThreadProcessId(window, &mut pid) };
             if search.targets.contains(&pid) && unsafe { IsWindowVisible(window) } != 0 {
                 // SAFETY: `window` came from the enumeration.
-                unsafe { ShowWindow(window, SW_MINIMIZE) };
+                unsafe { ShowWindow(window, SW_HIDE) };
             }
             1
         }

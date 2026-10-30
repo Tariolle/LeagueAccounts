@@ -1110,8 +1110,10 @@ async function exportData(): Promise<void> {
     title: t("export.title"),
     body: `<div class="warning">${icon("alert", 18)}<p>${t("export.warning")}</p></div>`,
     actions: [
-      { label: t("common.cancel"), value: "cancel" },
-      { label: t("export.confirm"), value: "export", kind: "primary" },
+      // The warning is about exporting plaintext passwords, so the highlighted
+      // choice is the one that keeps them on the machine.
+      { label: t("common.cancel"), value: "cancel", kind: "primary" },
+      { label: t("export.confirm"), value: "export" },
     ],
   });
   if (answer !== "export") return;
