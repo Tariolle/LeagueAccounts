@@ -101,6 +101,8 @@ export function installMock(): void {
   let accounts = structuredClone(sample);
   if (scene === "flex-ranks") {
     accounts = accounts.slice(0, 4);
+    accounts[0].recentGames = [{ champion: "Solo Test", iconUrl: "/league/ranks/iron.png", won: true }];
+    accounts[0].flexRecentGames = [{ champion: "Flex Test", iconUrl: "/league/ranks/diamond.png", won: false }];
     accounts[0].flex = { tier: "Gold", division: "II", lp: "40", lastSeason: "Silver I", rankedStats: { wins: 20, losses: 10, winRate: 67 } };
     accounts[1].flex = { tier: "Diamond", division: "IV", lp: "1", lastSeason: "Platinum II", rankedStats: { wins: 15, losses: 15, winRate: 50 } };
     accounts[2].flex = { tier: "Unranked", division: "", lp: "", lastSeason: "N/A", rankedStats: null };

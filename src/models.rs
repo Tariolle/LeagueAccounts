@@ -37,6 +37,9 @@ pub struct Account {
     /// Recent LoL games in source order, newest first.
     #[serde(default)]
     pub recent_games: Vec<RecentGame>,
+    /// Recent Ranked Flex games, separate from the default Solo/Duo history.
+    #[serde(default)]
+    pub flex_recent_games: Vec<RecentGame>,
     #[serde(default = "default_history")]
     pub reached_last_season: String,
     #[serde(default = "default_history")]
@@ -168,6 +171,8 @@ pub struct RankInfo {
     pub flex_provenance: Option<RankProvenance>,
     /// None means history could not be read; Some(empty) is a successful empty result.
     pub recent_games: Option<Vec<RecentGame>>,
+    /// None preserves saved Flex history when its queue lookup fails.
+    pub flex_recent_games: Option<Vec<RecentGame>>,
     pub reached_last_season: String,
     pub finished_last_season: String,
     /// `None` when the TFT profile could not be fetched.
@@ -267,6 +272,9 @@ impl RankInfo {
             if let Some(games) = &self.recent_games {
                 account.recent_games = games.clone();
             }
+            if let Some(games) = &self.flex_recent_games {
+                account.flex_recent_games = games.clone();
+            }
             account.reached_last_season = if self.reached_last_season.is_empty() {
                 "N/A".to_owned()
             } else {
@@ -331,6 +339,11 @@ mod tests {
                 icon_url: "https://example.test/Zeri.png".into(),
                 won: true,
             }],
+            flex_recent_games: vec![RecentGame {
+                champion: "Varus".into(),
+                icon_url: "https://example.test/Varus.png".into(),
+                won: false,
+            }],
             ..Default::default()
         };
         let mut account = saved.clone();
@@ -341,6 +354,7 @@ mod tests {
         .apply_to(&mut account);
         assert_eq!(account.ranked_stats, None);
         assert_eq!(account.recent_games, saved.recent_games);
+        assert_eq!(account.flex_recent_games, saved.flex_recent_games);
     }
 
     #[test]

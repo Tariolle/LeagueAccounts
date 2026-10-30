@@ -156,13 +156,14 @@ function banChip(account: AccountView): string {
 }
 
 function recentGamesLine(account: AccountView): string {
-  if (state.mode !== "lol" || !account.recentGames?.length) return "";
-  const games = account.recentGames.slice(0, 10).map((game) => {
+  const recentGames = state.queue === "flex" ? account.flexRecentGames : account.recentGames;
+  if (state.mode !== "lol" || !recentGames?.length) return "";
+  const games = recentGames.slice(0, 10).map((game) => {
     const result = game.won ? t("card.win") : t("card.loss");
     const label = `${game.champion} · ${result}`;
     return `<span class="recent-game${game.won ? " is-win" : " is-loss"}" role="img" aria-label="${esc(label)}" data-tooltip="${esc(label)}"><img src="${esc(game.iconUrl)}" alt="" loading="lazy" draggable="false"></span>`;
   }).join("");
-  const full = account.recentGames.length >= 10 ? " is-full" : "";
+  const full = recentGames.length >= 10 ? " is-full" : "";
   return `<div class="recent-games${full}" role="list" aria-label="${esc(t("card.recentGames"))}">${games}</div>`;
 }
 

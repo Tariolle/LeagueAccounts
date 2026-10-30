@@ -341,20 +341,18 @@ impl RankFetcher {
                 }
             }
         }
-        if rank
-            .recent_games
-            .as_ref()
-            .is_none_or(|games| games.len() < 10)
-        {
-            match self.fetch_recent_games_from_opgg(&body, url, region) {
-                Ok(games) => rank.recent_games = Some(games),
-                Err(_) if rank.recent_games.as_ref().is_some_and(Vec::is_empty) => {
-                    // The profile may omit the server-action contract while still
-                    // emitting an empty JSON-LD list; keep cached account history.
-                    rank.recent_games = None;
-                }
-                Err(_) => {}
+        let (solo_games, flex_games) = self.fetch_recent_game_queues_from_opgg(&body, url, region);
+        match solo_games {
+            Ok(games) => rank.recent_games = Some(games),
+            Err(_) if rank.recent_games.as_ref().is_some_and(Vec::is_empty) => {
+                // An empty inline list is only a placeholder when history could
+                // not be fetched; retain the account's previously saved games.
+                rank.recent_games = None;
             }
+            Err(_) => {}
+        }
+        if let Ok(games) = flex_games {
+            rank.flex_recent_games = Some(games);
         }
         rank.flex_provenance = Some(flex_provenance(provenance.clone(), rank.flex.is_some()));
         rank.provenance = Some(provenance);
@@ -689,6 +687,7 @@ impl RankFetcher {
             ranked_stats: rank.ranked_stats,
             flex: rank.flex,
             recent_games: rank.recent_games,
+            flex_recent_games: rank.flex_recent_games,
             reached_last_season: if rank.reached_last_season.is_empty() {
                 "Unranked".to_owned()
             } else {

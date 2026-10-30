@@ -42,6 +42,10 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
       assert.match(flexCards[3].rank, /Unavailable/);
       assert.equal(flexCards[0].stale, true);
       assert.equal(flexCards[1].stale, false);
+      const hextechHistory = () => page.$$eval("#accounts > .card", cards => cards
+        .find(card => card.querySelector(".game-name")?.textContent === "Hextech Fox")
+        ?.querySelector(".recent-game")?.getAttribute("aria-label") ?? "");
+      assert.match(await hextechHistory(), /Flex Test/);
       for (const view of ["grid", "list"]) {
         await page.click(`[data-view="${view}"]`);
         await page.setViewport({ width: 980, height: 640 });
@@ -54,7 +58,9 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
       await page.select("#lol-queue", "solo");
       await page.waitForFunction(() => document.querySelectorAll("#accounts > .card").length === 4);
       assert.match(await text("#accounts > .card:first-child"), /Piltover Queen/);
+      assert.match(await hextechHistory(), /Solo Test/);
       await page.select("#lol-queue", "flex");
+      assert.match(await hextechHistory(), /Flex Test/);
       await page.click('.mode-btn[data-mode="tft"]');
       assert.equal(await page.$eval("#lol-queue", el => el.disabled), true);
       await page.click('.mode-btn[data-mode="lol"]');

@@ -351,6 +351,7 @@ impl AccountManager {
                 flex: item.flex,
                 flex_provenance: item.flex_provenance,
                 recent_games: item.recent_games,
+                flex_recent_games: item.flex_recent_games,
                 reached_last_season: if item.reached_last_season.is_empty() {
                     "N/A".to_owned()
                 } else {
@@ -433,6 +434,7 @@ struct ExportAccount {
     flex: Option<FlexRank>,
     flex_provenance: Option<RankProvenance>,
     recent_games: Vec<RecentGame>,
+    flex_recent_games: Vec<RecentGame>,
     reached_last_season: String,
     finished_last_season: String,
     tft: TftRank,
@@ -458,6 +460,7 @@ impl From<&Account> for ExportAccount {
             flex: account.flex.clone(),
             flex_provenance: account.flex_provenance.clone(),
             recent_games: account.recent_games.clone(),
+            flex_recent_games: account.flex_recent_games.clone(),
             reached_last_season: account.reached_last_season.clone(),
             finished_last_season: account.finished_last_season.clone(),
             tft: account.tft.clone(),
@@ -499,6 +502,8 @@ struct ImportAccount {
     flex_provenance: Option<RankProvenance>,
     #[serde(default)]
     recent_games: Vec<RecentGame>,
+    #[serde(default)]
+    flex_recent_games: Vec<RecentGame>,
     #[serde(default)]
     reached_last_season: String,
     #[serde(default)]
@@ -556,6 +561,11 @@ mod tests {
                 icon_url: "https://example.test/Zeri.png".into(),
                 won: true,
             }],
+            flex_recent_games: vec![RecentGame {
+                champion: "Varus".into(),
+                icon_url: "https://example.test/Varus.png".into(),
+                won: false,
+            }],
             ..Default::default()
         };
         let json = serde_json::to_string(&ExportAccount::from(&account)).unwrap();
@@ -563,6 +573,7 @@ mod tests {
         assert_eq!(imported.ranked_stats, account.ranked_stats);
         assert_eq!(imported.flex, account.flex);
         assert_eq!(imported.recent_games, account.recent_games);
+        assert_eq!(imported.flex_recent_games, account.flex_recent_games);
     }
     use std::cell::RefCell;
     use std::collections::HashMap;
