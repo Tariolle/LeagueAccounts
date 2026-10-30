@@ -15,6 +15,15 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
   }
   const text = selector => page.$eval(selector, el => el.textContent);
   const count = () => page.$$eval("#accounts > .card", elements => elements.length);
+  async function menuAction(label) {
+    for (const item of await page.$$(".menu-item")) {
+      if (await item.evaluate(el => el.textContent.trim()) === label) {
+        await item.click();
+        return;
+      }
+    }
+    assert.fail(`Missing menu action: ${label}`);
+  }
   async function noHorizontalOverflow(selector) {
     assert.equal(await page.$eval(selector, el => el.scrollWidth <= el.clientWidth + 1), true, `${selector} overflows horizontally`);
   }
@@ -30,7 +39,7 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
         assert.deepEqual(distribution, expected.map(tier => [tier, "1"]));
       }
       await page.click('#accounts > .card:first-child [data-act="menu"]');
-      await page.click('.menu-item[data-index="1"]');
+      await menuAction("Edit");
       await page.waitForSelector('.modal [name="name"]');
       await page.$eval('.modal [name="name"]', el => { el.value = "Edited#DEV"; });
       await page.click('.modal [data-value="save"]');
@@ -44,6 +53,28 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
       assert.equal(await count(), 11);
       assert.doesNotMatch(await text("#accounts"), /Edited/);
       assert.equal(await page.$eval("html", el => el.dataset.mode), "lol");
+    });
+    await t.test("dismissing the Chinese language warning keeps the account editor and its draft", async () => {
+      await open();
+      await page.click('#accounts > .card:first-child [data-act="menu"]');
+      await menuAction("Edit");
+      await page.waitForSelector('.modal [name="description"]');
+      await page.$eval('.modal [name="description"]', el => { el.value = "unsaved description"; });
+      const previous = await page.$eval('.modal [name="locale"]', el => el.value);
+      for (const motion of ["no-preference", "reduce"]) {
+        await page.emulateMediaFeatures([{ name: "prefers-reduced-motion", value: motion }]);
+        await page.select('.modal [name="locale"]', "zh_CN");
+        await page.waitForSelector('.modal[aria-label="Choose a game language"]');
+        assert.equal(await page.$$eval(".modal", elements => elements.length), 2);
+        await page.keyboard.press("Escape");
+        await page.waitForSelector('.modal[aria-label="Choose a game language"]', { hidden: true });
+        assert.equal(await page.$$eval(".modal", elements => elements.length), 1);
+        assert.equal(await page.$eval('.modal [name="description"]', el => el.value), "unsaved description");
+        assert.equal(await page.$eval('.modal [name="locale"]', el => el.value), previous);
+      }
+      await page.click('.modal [data-value="save"]');
+      await page.waitForSelector(".modal", { hidden: true });
+      assert.match(await text("#accounts > .card:first-child"), /unsaved description/);
     });
     await t.test("rank, region and search filters keep counts and reset in sync", async () => {
       await open();
@@ -155,10 +186,10 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
     });
     await t.test("client tooltips support focus, escaping, dismissal and removed owners", async () => {
       await open();
-      const selector = '#accounts > .card:first-child [data-act="copy-pass"]';
+      const selector = '#accounts > .card:first-child [data-act="copy-riot-id"]';
       await page.focus(selector);
       await page.waitForSelector('[role="tooltip"]');
-      assert.equal(await text('[role="tooltip"]'), "Copy password");
+      assert.equal(await text('[role="tooltip"]'), "Copy Riot ID");
       assert.equal(await page.$eval(selector, el => el.getAttribute("aria-describedby")), "client-tooltip");
       await page.keyboard.press("Escape");
       assert.equal(await page.$('[role="tooltip"]'), null);
@@ -186,6 +217,34 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
       assert.match(await text("#accounts"), /No Riot ID associated/);
       assert.ok(await page.$("#accounts .rank-edit"));
       assert.equal(await page.$eval("#accounts .btn-play", el => el.disabled), false);
+    });
+    await t.test("the Vietnamese profile preference survives reopening and saving the editor", async () => {
+      await open("add");
+      await page.waitForSelector(".drawer");
+      await page.type('.drawer [name="accountId"]', "ui_vn_preference");
+      await page.type('.drawer [name="password"]', "synthetic-test-password");
+      await page.select('.drawer [data-panel="single"] [name="region"]', "VN");
+      const toggle = '.drawer [name="skipProfileUpdate"]';
+      assert.equal(await page.$eval(toggle, el => el.getClientRects().length > 0), true);
+      await page.click(toggle);
+      await page.select('.drawer [data-panel="single"] [name="locale"]', "zh_MY");
+      await page.click('.drawer [data-panel="single"] button[type="submit"]');
+      await page.waitForFunction(() => document.querySelectorAll("#accounts > .card").length === 12);
+      await page.click(".drawer [data-close]");
+      await page.waitForSelector(".drawer", { hidden: true });
+      await page.type("#search", "ui_vn_preference");
+      await page.click("#accounts .rank-edit");
+      await page.waitForSelector('.modal [name="skipProfileUpdate"]');
+      assert.equal(await page.$eval('.modal [name="skipProfileUpdate"]', el => el.checked), true);
+      await page.$eval('.modal [name="description"]', el => { el.value = "updated note"; });
+      await page.click('.modal [data-value="save"]');
+      await page.waitForSelector(".modal", { hidden: true });
+      await page.click("#accounts .rank-edit");
+      await page.waitForSelector('.modal [name="skipProfileUpdate"]');
+      assert.equal(await page.$eval('.modal [name="skipProfileUpdate"]', el => el.checked), true);
+      assert.equal(await page.$eval('.modal [name="locale"]', el => el.value), "zh_MY");
+      await page.keyboard.press("Escape");
+      await page.waitForSelector(".modal", { hidden: true });
     });
     await t.test("rank crests stay static on hover and focus; login respects reduced motion", async () => {
       await open();

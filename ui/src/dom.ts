@@ -88,6 +88,9 @@ export function modal(options: {
   body: string;
   actions: ModalAction[];
   wide?: boolean;
+  /// Stack the footer actions vertically; for dialogs whose labels are long
+  /// enough that a single row would overflow the modal width.
+  stacked?: boolean;
   onOpen?: (root: HTMLElement) => void;
   onSubmit?: (value: string, root: HTMLElement) => boolean | Promise<boolean>;
 }): Promise<string | null> {
@@ -102,7 +105,7 @@ export function modal(options: {
             <button class="modal-close" data-value="__close" aria-label="${esc(t("common.close"))}"><span></span></button>
           </div>
           <form class="modal-body" novalidate>${options.body}</form>
-          <footer class="modal-foot">
+          <footer class="modal-foot${options.stacked ? " is-stacked" : ""}">
             ${options.actions
               .map(
                 (action) =>
@@ -132,6 +135,10 @@ export function modal(options: {
       close(value);
     };
     const onKey = (event: KeyboardEvent) => {
+      // A child dialog owns the keyboard until it closes. Ignore its exit
+      // animation too, so the editor becomes active as soon as it is dismissed.
+      const top = [...document.querySelectorAll("#modal-root > .overlay:not(.overlay-out)")].at(-1);
+      if (closed || top !== overlay) return;
       if (event.key === "Tab") {
         const controls = [...overlay.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex='0']")]
           .filter(control => control.getClientRects().length > 0);
@@ -141,7 +148,8 @@ export function modal(options: {
         else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
       }
       if (event.key === "Escape") {
-        event.stopPropagation();
+        event.preventDefault();
+        event.stopImmediatePropagation();
         close(null);
       }
     };

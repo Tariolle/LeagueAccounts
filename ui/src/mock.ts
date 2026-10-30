@@ -1,7 +1,7 @@
 // Development-only stand-in for the Tauri backend, used when the UI is opened
 // in a plain browser (`npm run dev`).
 // Never bundled into release builds. Everything lives only in memory.
-import { ApiError, api, events, keyId, parseAccountLine, type AccountView, type BulkAddResult, type Key, type LoginStep, type NewAccount, type RefreshDone, type Settings, type UpdateStatus } from "./api";
+import { ApiError, api, events, keyId, parseAccountLine, type AccountView, type BulkAddResult, type Key, type LoginStep, type NewAccount, type RefreshDone, type Settings, type UpdateAccount, type UpdateStatus } from "./api";
 
 const lol = (tier: string, division: string, lp: string, finished = "Gold II", reached = finished) => ({
   tier,
@@ -33,6 +33,10 @@ const sample: AccountView[] = [
   level: level as string,
   description: description as string,
   hasPassword: true,
+  // Demo data: half the accounts pin a language, the rest follow the client.
+  locale: (regionDisplay as string) === "TW" ? "zh_MY" : null,
+  // Demo data: the Vietnamese-region account shows the skip flag.
+  skipProfileUpdate: (regionDisplay as string) === "VN2",
   lol: lolRank as AccountView["lol"],
   tft: tftRank as AccountView["tft"],
   ban: accountId === "smurfy_tr" ? { until: Date.now() + (6 * 24 + 13) * 3_600_000 } : null,
@@ -58,6 +62,7 @@ const settings: Settings = {
   launchGame: true,
   autoUpdate: true,
   uiScale: 100,
+  uiLanguage: "en",
   riotClientFound: true,
   tftInstalled: true,
 };
@@ -114,7 +119,15 @@ export function installMock(): void {
   Object.assign(api, {
     bootstrap: async () => ({
       accounts,
-      regions: ["EUW", "EUNE", "NA", "KR", "TR", "BR"],
+      regions: ["EUW", "EUNE", "NA", "KR", "TR", "BR", "JP", "OCE", "RU", "LAN", "LAS", "ME", "SEA", "TW", "VN"],
+      locales: [
+        { code: "en_US", name: "English (United States)", homePageWorks: true, launchable: true },
+        { code: "zh_CN", name: "简体中文（中国大陆）", homePageWorks: false, launchable: false },
+        { code: "zh_MY", name: "简体中文（马来西亚）", homePageWorks: true, launchable: true },
+        { code: "zh_TW", name: "繁體中文（中國台灣）", homePageWorks: true, launchable: true },
+        { code: "ja_JP", name: "日本語", homePageWorks: true, launchable: true },
+        { code: "ko_KR", name: "한국어", homePageWorks: true, launchable: true },
+      ],
       version: "3.0.3-dev",
       loggingAvailable: true,
       loadError: null,
@@ -125,11 +138,11 @@ export function installMock(): void {
     updateSettings: async (input: object) => Object.assign(settings, input),
     login: async (key: Key, _tft: boolean, _closeRunning: boolean, launchBanned: boolean) => {
       const ban = accounts.find((account) => keyId(account) === keyId(key))?.ban;
-      const steps: LoginStep[] = ["openClient", "waitAuth", "connect", "findWindow", "type", "confirm", "launchGame", "done"];
+      const steps: LoginStep[] = ["openClient", "signOut", "signIn", "launchGame", "updating", "launchGame", "done"];
       for (const step of steps) {
         if (ban && settings.launchGame && !launchBanned && step === "launchGame") throw new ApiError("account_banned", ban.until == null ? "" : String(ban.until));
         listeners.step.forEach((handler) => handler(step));
-        await wait(step === "waitAuth" || step === "confirm" ? 1400 : 700);
+        await wait(step === "signIn" ? 1400 : 700);
       }
       return "signedIn";
     },
@@ -162,6 +175,8 @@ export function installMock(): void {
         description: input.description,
         level: "",
         hasPassword: true,
+        locale: input.locale ?? null,
+        skipProfileUpdate: input.skipProfileUpdate ?? false,
         lol: lol("Unranked", "", "", "N/A"),
         tft: tft("Unranked", "", "", "N/A"),
       };
@@ -169,7 +184,7 @@ export function installMock(): void {
       if (account.name) setTimeout(() => fakeFetch([{ ...account, level: "30", lol: lol("Silver", "II", "45", "Bronze I") }]), 50);
       return account;
     },
-    multiAdd: async (text: string, region: string): Promise<BulkAddResult> => {
+    multiAdd: async (text: string, region: string, locale: string | null): Promise<BulkAddResult> => {
       let added = 0;
       const skippedLines: number[] = [];
       for (const [index, line] of text.split("\n").entries()) {
@@ -179,16 +194,21 @@ export function installMock(): void {
           skippedLines.push(index);
           continue;
         }
-        await api.addAccount({ ...input, region, description: "" });
+        await api.addAccount({ ...input, region, description: "", locale });
         added++;
       }
       return { added, skippedLines };
     },
-    updateAccount: async (key: Key, name: string, description: string) => {
+    updateAccount: async (key: Key, input: UpdateAccount) => {
       const account = find(key)!;
-      name = name.trim();
+      const name = input.name.trim();
       const renamed = account.name !== name;
-      Object.assign(account, { name, description });
+      Object.assign(account, {
+        name,
+        description: input.description,
+        locale: input.locale,
+        skipProfileUpdate: input.skipProfileUpdate ?? false,
+      });
       if (renamed) {
         Object.assign(account, { riotIdNotFound: false, level: "", lol: lol("Unranked", "", "", "N/A"), tft: tft("Unranked", "", "", "N/A") });
         const updated = name ? { ...account, level: "30", lol: lol("Silver", "II", "45", "Bronze I") } : { ...account };
@@ -209,6 +229,9 @@ export function installMock(): void {
     importData: async () => null,
     openProfile: async () => {},
     openLogsFolder: async () => {},
+    openHomeFixAuthor: async () => {},
+    setUiLanguage: async () => {},
+    openPenguLoader: async () => {},
   } satisfies typeof api);
   Object.assign(events, {
     onLoginStep: async (handler: Handler<LoginStep>) => (listeners.step.push(handler), unlisten()),

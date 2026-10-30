@@ -9,12 +9,15 @@ pub mod account_manager;
 pub mod autotype;
 pub mod clipboard;
 pub mod credentials;
+pub mod game_locale;
+pub mod locales;
 pub mod logging;
 pub mod models;
 pub mod rank_fetcher;
 pub mod riot_client;
 pub mod self_update;
 pub mod updates;
+pub mod vn_hosts;
 pub mod utils;
 
 pub use account_manager::AccountManager;

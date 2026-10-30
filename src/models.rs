@@ -36,6 +36,17 @@ pub struct Account {
     pub rank_provenance: Option<RankProvenance>,
     #[serde(default)]
     pub tft_provenance: Option<RankProvenance>,
+    /// Product locale the game should start in, independent of `region`.
+    /// `None` leaves Riot's own choice untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
+    /// Skip Riot's "update your profile" flow at sign-in. VN accounts are
+    /// blocked by the region's identity provider: Riot waits for a domain the
+    /// tool patches out of `hosts`, retries until its internal limit, then
+    /// continues. With the patch in place this flag makes the wait worthwhile
+    /// instead of showing a login that never completes.
+    #[serde(default)]
+    pub skip_profile_update: bool,
     /// League suspension Riot reported at the last sign-in through the app.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ban: Option<Ban>,

@@ -47,6 +47,12 @@
   box-sizing: border-box;
 }
 
+/* `hidden` must win over the layout rules that set `display`, or a toggled-off
+   row stays visible (`.toggle-row` is `display: flex`). */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   margin: 0;
@@ -54,7 +60,7 @@ body {
   overflow: hidden;
   background: var(--bg);
   color: var(--text);
-  font-family: Spiegel, "Segoe UI", system-ui, sans-serif;
+  font-family: Spiegel, "Segoe UI", system-ui, WenKai, sans-serif;
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
   user-select: none;
@@ -221,7 +227,7 @@ code {
   filter: drop-shadow(0 0 8px color-mix(in srgb, var(--accent) 60%, transparent));
 }
 .brand-name {
-  font-family: Beaufort, serif;
+  font-family: Beaufort, WenKai, NotoCJK, serif;
   font-weight: 600;
   font-size: 14px;
   letter-spacing: 0.08em;
@@ -952,7 +958,6 @@ code {
   height: 34px;
   border: 1px solid var(--line);
 }
-
 /* List view */
 .accounts.list .card {
   display: grid;
@@ -1133,9 +1138,37 @@ code {
 }
 .modal-foot {
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: 10px;
   padding: 0 22px 20px;
+}
+/* The client frame docks its actions absolutely centred on the bottom rail,
+   so a wide label set cannot widen the footer. Stacking keeps long locale
+   names inside the frame instead of overflowing both edges. */
+.modal-foot.is-stacked {
+  position: static;
+  transform: none;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+  padding: 4px 22px 20px;
+}
+.modal-foot.is-stacked::before,
+.modal-foot.is-stacked::after {
+  content: none;
+}
+/* Three stacked choices read as a list, not as three wide bars: cap the width
+   and centre them, and keep a clear gap between rows. */
+.modal-foot.is-stacked .btn {
+  min-width: 0;
+  width: 100%;
+  max-width: 240px;
+  height: 34px;
+  margin: 0 auto;
+  align-self: center;
+  padding: 0 20px;
+  font-size: 12px;
 }
 
 .drawer-overlay {
@@ -1174,7 +1207,7 @@ code {
 }
 .drawer-head h2 {
   margin: 0;
-  font-family: Beaufort, serif;
+  font-family: Beaufort, WenKai, NotoCJK, serif;
   font-weight: 600;
   font-size: 22px;
   letter-spacing: 0.04em;
@@ -1304,6 +1337,35 @@ code {
   font-size: 12px;
   line-height: 1.55;
   color: var(--faint);
+}
+/* The welcome dialog repeats itself in English for a reader whose language is
+   not known yet; dimmer and set apart so it reads as a gloss, not a second
+   instruction. */
+.welcome-english {
+  margin-top: -6px;
+  padding-left: 9px;
+  border-left: 2px solid var(--line-2);
+  opacity: .8;
+}
+.welcome-english strong {
+  font-weight: 600;
+  color: var(--muted);
+}
+/* Reference buttons under a hint paragraph: they point at what the third
+   paragraph describes, so they share one row and stay out of the action row. */
+.fix-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.fix-links .btn {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 30px;
+  padding: 0 10px;
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
 }
 .multi-count {
   color: var(--accent);

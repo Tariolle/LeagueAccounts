@@ -68,7 +68,7 @@
 
 .login-title {
   margin: 0;
-  font-family: Beaufort, serif;
+  font-family: Beaufort, WenKai, NotoCJK, serif;
   font-weight: 600;
   font-size: 26px;
   letter-spacing: 0.06em;
@@ -298,7 +298,7 @@
 }
 .update-screen-title {
   margin: 0;
-  font-family: Beaufort, serif;
+  font-family: Beaufort, WenKai, NotoCJK, serif;
   font-size: 18px;
   font-weight: 700;
   letter-spacing: 0.1em;

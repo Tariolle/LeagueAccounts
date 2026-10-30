@@ -5,6 +5,17 @@
 @font-face { font-family: Beaufort; src: url('/league/fonts/beaufort-bold.otf') format('opentype'); font-weight: 600 900; font-display: swap; }
 @font-face { font-family: Spiegel; src: url('/league/fonts/spiegel-regular.otf') format('opentype'); font-weight: 400 500; font-display: swap; }
 @font-face { font-family: Spiegel; src: url('/league/fonts/spiegel-semibold.otf') format('opentype'); font-weight: 600 900; font-display: swap; }
+/* CJK fallback: the League fonts carry no Chinese glyphs, so the browser used
+   to pick whatever the OS offered, and that changed per machine. Both families
+   below are open-source (SIL OFL 1.1) and subset to the characters the UI ships
+   (see scripts/cjk-font.mjs), so neither the bundle nor the license is a
+   problem. Noto Sans SC is the UI face: WenKai's handwritten strokes read too
+   thin at 12–13px against the dark background, and it ships no Bold. */
+@font-face { font-family: WenKai; src: url('/league/fonts/lxgw-wenkai-regular.ttf') format('truetype'); font-weight: 400 500; font-display: swap; }
+@font-face { font-family: WenKai; src: url('/league/fonts/lxgw-wenkai-medium.ttf') format('truetype'); font-weight: 600 900; font-display: swap; }
+@font-face { font-family: NotoCJK; src: url('/league/fonts/noto-sans-sc-regular.otf') format('opentype'); font-weight: 400; font-display: swap; }
+@font-face { font-family: NotoCJK; src: url('/league/fonts/noto-sans-sc-medium.otf') format('opentype'); font-weight: 500 600; font-display: swap; }
+@font-face { font-family: NotoCJK; src: url('/league/fonts/noto-sans-sc-bold.otf') format('opentype'); font-weight: 700 900; font-display: swap; }
 
 :root {
   --bg: #060e17;
@@ -25,7 +36,7 @@
   --spring: cubic-bezier(.22,.61,.36,1);
 }
 :root[data-mode='tft'] { --accent: #c8aa6e; --accent-2: #baa4e8; --on-accent: #17120a; }
-html, body { font-family: Spiegel, 'Segoe UI', sans-serif; font-size: 14px; }
+html, body { font-family: Spiegel, 'Segoe UI', NotoCJK, sans-serif; font-size: 14px; }
 button, input, select, textarea { font-family: inherit; }
 button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: none; }
 button:focus-visible, a:focus-visible { color: #f0e6d2; }
@@ -34,17 +45,17 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .titlebar { background: #07121bee; backdrop-filter: none; border-bottom-color: #695b38; padding-left: 24px; }
 .brand { gap: 12px; }
 .brand-icon { width: 28px; height: 28px; filter: none; }
-.brand-name { font-family: Beaufort, serif; font-size: 15px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: var(--text); }
+.brand-name { font-family: Beaufort, WenKai, NotoCJK, serif; font-size: 15px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: var(--text); }
 .mode-switch { align-self: stretch; padding: 0; gap: 0; border: 0; border-radius: 0; background: none; }
 .mode-pill { top: auto; bottom: -1px; left: 0; height: 2px; width: 50%; border-radius: 0; background: linear-gradient(90deg, transparent, #c8aa6e 25%, #c8aa6e 75%, transparent); box-shadow: none; }
-.mode-btn { display: flex; align-items: center; justify-content: center; gap: 9px; padding: 0 22px; font-family: Beaufort, serif; font-weight: 700; font-size: 13px; letter-spacing: .065em; text-transform: uppercase; }
+.mode-btn { display: flex; align-items: center; justify-content: center; gap: 9px; padding: 0 22px; font-family: Beaufort, WenKai, NotoCJK, serif; font-weight: 700; font-size: 13px; letter-spacing: .065em; text-transform: uppercase; }
 .mode-btn img { width: 23px; height: 23px; object-fit: contain; opacity: .5; transition: opacity .2s; }
 .mode-btn[aria-selected='true'] { color: #f0e6d2; background: linear-gradient(0deg, #c8aa6e12, transparent 75%); }
 .mode-btn[aria-selected='true'] img { opacity: 1; }
 .shell { grid-template-columns: 228px minmax(0,1fr); }
 .sidebar { background: #071119db; backdrop-filter: none; padding: 25px 17px 16px; gap: 25px; border-right: 1px solid #29302e; scrollbar-gutter: stable; }
 .sidebar > * { flex-shrink: 0; }
-.side-title { font-family: Beaufort, serif; color: #b8a882; font-weight: 700; font-size: 11px; margin-bottom: 12px; letter-spacing: .12em; }
+.side-title { font-family: Beaufort, WenKai, NotoCJK, serif; color: #b8a882; font-weight: 700; font-size: 11px; margin-bottom: 12px; letter-spacing: .12em; }
 .side-link { padding: 8px 10px; font-size: 13px; border-radius: 0; }
 .side-link:is(:hover, :focus-visible) { transform: none; background: #c8aa6e0b; color: #f0e6d2; }
 .side-link > [data-icon] { display: grid; place-items: center; width: 20px; height: 20px; flex: none; }
@@ -64,13 +75,13 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .main { position: relative; padding: 0 28px 32px; isolation: isolate; scrollbar-gutter: stable; }
 .main::before { content: ''; position: absolute; z-index: -1; left: 0; right: 0; top: 0; height: 330px; pointer-events: none; background: linear-gradient(90deg, #08121b 10%, #08121b40 80%), linear-gradient(0deg, #07111b, #07111b30 80%), url('/league/backgrounds/collection.jpg') right 40% / cover; opacity: .55; }
 .collection-header { display: flex; justify-content: space-between; align-items: flex-end; gap: 24px; padding: 29px 0 25px; }
-.collection-eyebrow { margin: 0 0 8px; color: #bca874; font-family: Beaufort, serif; font-size: 11px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; }
+.collection-eyebrow { margin: 0 0 8px; color: #bca874; font-family: Beaufort, WenKai, NotoCJK, serif; font-size: 11px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; }
 /* Client headings (lol-uikit content-block h2): Beaufort 700 caps, .05em. */
-.collection-header h1 { font-family: Beaufort, serif; font-size: 30px; line-height: 32px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: #f0e6d2; margin: 0; }
+.collection-header h1 { font-family: Beaufort, WenKai, NotoCJK, serif; font-size: 30px; line-height: 32px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: #f0e6d2; margin: 0; }
 .collection-summary { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; color: #acb9bc; font-size: 12px; padding-bottom: 3px; }
 /* The client's ranked "Next ladder update" countdown (Beaufort 14/18 700 caps, gold time).
    Clicking it refreshes now; while running, the client's spinner replaces the glyph. */
-.ladder-update { display: inline-flex; align-items: center; padding: 0; border: 0; background: none; font: 700 14px/18px Beaufort, serif; letter-spacing: .075em; text-transform: uppercase; color: #f0e6d2; white-space: nowrap; cursor: pointer; }
+.ladder-update { display: inline-flex; align-items: center; padding: 0; border: 0; background: none; font: 700 14px/18px Beaufort, WenKai, NotoCJK, serif; letter-spacing: .075em; text-transform: uppercase; color: #f0e6d2; white-space: nowrap; cursor: pointer; }
 .ladder-update-time { margin-left: 5px; color: #c8aa6e; font-variant-numeric: tabular-nums; }
 .ladder-update-time:empty { display: none; }
 .ladder-update-icon { order: -1; display: grid; place-items: center; width: 18px; height: 18px; margin-right: 8px; }
@@ -96,7 +107,7 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 /* Stretch to the 32px box's inner height; a fixed 30px overflowed it by 4px. */
 .view-toggle button { height: auto; width: 28px; border-radius: 0; }
 .view-toggle button.active { color: #dfc690; background: #c8aa6e19; }
-.btn { border-radius: 0; font-family: Beaufort, serif; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; font-size: 12px; }
+.btn { border-radius: 0; font-family: Beaufort, WenKai, NotoCJK, serif; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; font-size: 12px; }
 .btn-primary { color: #e6d4a9; border: 1px solid #a68b53; background: linear-gradient(180deg, #31332a, #171e20); box-shadow: inset 0 0 0 1px #050c14; }
 .btn-primary:hover:not(:disabled) { color: #fff0c6; background: linear-gradient(180deg, #484430, #212d2c); box-shadow: inset 0 0 0 1px #08111a, 0 0 14px #c8aa6e14; filter: none; }
 .btn kbd { display: none; }
@@ -115,7 +126,7 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .card:focus-visible { outline: none; }
 .card-top { gap: 8px; }
 /* Identity as in the client hover card: Beaufort 18/700 name, dim bold Spiegel tag. */
-.game-name { font-family: Beaufort, serif; font-size: 18px; font-weight: 700; letter-spacing: .025em; color: #f0e6d2; }
+.game-name { font-family: Beaufort, WenKai, NotoCJK, serif; font-size: 18px; font-weight: 700; letter-spacing: .025em; color: #f0e6d2; }
 .tag { font-size: 12px; font-weight: 700; letter-spacing: .05em; color: #5b5a56; margin-left: 3px; }
 .meta { gap: 8px; margin-top: 7px; }
 .chip { font-size: 10px; font-weight: 400; letter-spacing: .04em; border-radius: 0; background: none; padding: 0; }
@@ -128,6 +139,11 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .acc-id { color: #738891; font-size: 10px; margin-left: auto; }
 .acc-id .icon { display: none; }
 .card-more { margin: -6px -9px 0 0; width: 25px; height: 28px; opacity: .65; color: #9eacb1; }
+/* Sits beside the Name#TAG in the title row: quiet until hovered so it does not
+   compete with the name it copies. */
+.copy-riot-id { width: 20px; height: 20px; padding: 0; border: 0; background: none; color: #7c8d98; opacity: 0; transition: opacity 160ms, color 160ms; }
+.card:hover .copy-riot-id, .copy-riot-id:focus-visible { opacity: 1; }
+.copy-riot-id:hover { color: #f0e6d2; }
 .card-rank { display: grid; grid-template-columns: 118px minmax(0,1fr); align-items: center; min-height: 114px; margin: 4px -4px 0; gap: 10px; }
 .emblem-wrap { display: grid; place-items: center; filter: none; }
 .card:hover .emblem-wrap { transform: none; }
@@ -143,10 +159,10 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 /* Ranked banner typography: tier 20px 700 caps .05em, LP 14/18 700 caps grey. Long tier
    names ("GRANDMASTER", "HERAUSFORDERER") shrink to their column in fit.ts; multi-word
    names wrap instead of getting too small. */
-.rank-name { display: block; flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; font-family: Beaufort, serif; font-size: 20px; line-height: 1.15; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: #f0e6d2; }
+.rank-name { display: block; flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; font-family: Beaufort, WenKai, NotoCJK, serif; font-size: 20px; line-height: 1.15; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: #f0e6d2; }
 .rank-name.is-wrapped { white-space: normal; }
 .rank-line { gap: 0; min-width: 0; }
-.lp { display: block; margin-top: 4px; font-family: Beaufort, serif; font-size: 14px; line-height: 18px; font-weight: 700; letter-spacing: .075em; text-transform: uppercase; color: #a09b8c; }
+.lp { display: block; margin-top: 4px; font-family: Beaufort, WenKai, NotoCJK, serif; font-size: 14px; line-height: 18px; font-weight: 700; letter-spacing: .075em; text-transform: uppercase; color: #a09b8c; }
 .lp-bar { margin: 10px 0 0; height: 2px; border-radius: 0; background: #ffffff0f; }
 .lp-bar span { border-radius: 0; box-shadow: none; background: linear-gradient(90deg, var(--tier-dark), var(--tier-light)); }
 .lp-bar span::after { display: none; }
@@ -155,6 +171,10 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .desc { margin: 5px 0 10px; min-height: 14px; height: 14px; font-size: 11px; font-style: normal; color: #a09b8c; }
 .card-actions { gap: 7px; }
 .btn-play { height: 33px; border: 1px solid #517274; border-radius: 0; background: linear-gradient(180deg, #17333a, #10232c); color: #bfe1db; font-size: 11px; letter-spacing: .12em; }
+/* A single Chinese character at 11px with .12em tracking reads as a stray mark
+   next to the Latin "Log in" it replaces. Chinese has no uppercase, so the wide
+   tracking buys nothing either: drop it, and give the label size and weight. */
+:lang(zh) .btn-play { font-size: 14px; font-weight: 700; letter-spacing: .04em; }
 .btn-play:hover { background: linear-gradient(180deg, #23525a, #173740); color: #e3f9f5; border-color: #7fbbb5; box-shadow: 0 0 15px #5ccbc012; }
 .btn-play .icon { width: 14px; height: 14px; }
 .card-actions .icon-btn { width: 32px; height: 32px; border: 0; color: #899da5; background: #ffffff03; }
@@ -172,14 +192,14 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .accounts.list .lp-bar { margin: 5px 0 0; }
 .accounts.list .game-name { font-size: 17px; }
 .accounts.list .meta { gap: 7px; flex-wrap: wrap; }
-.accounts.list .acc-id { display: none; }
+/* The account ID is what the copy button copies, so the row must show it. */
+.accounts.list .acc-id { display: inline-flex; font-size: 10.5px; margin-left: 0; max-width: 190px; }
 .accounts.list .history { border: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
 .accounts.list .desc { display: none; }
-.accounts.list .card-actions { gap: 3px; }
+.accounts.list .card-actions { gap: 5px; }
 .accounts.list .btn-play { padding: 0 11px; }
-.accounts.list .card-actions .icon-btn { width: 27px; }
 .empty-art { filter: none; animation: none; opacity: .7; }
-.empty h2, .drawer-head h2, .modal-head h2, .login-title { font-family: Beaufort, serif; letter-spacing: .04em; }
+.empty h2, .drawer-head h2, .modal-head h2, .login-title { font-family: Beaufort, WenKai, NotoCJK, serif; letter-spacing: .04em; }
 .empty h2 { text-transform: uppercase; font-size: 24px; }
 .overlay, .drawer-overlay { backdrop-filter: blur(5px); background: #020911ab; }
 .modal, .drawer { background: #010a13; border: 2px solid transparent; border-image: linear-gradient(to top, #785a28, #463714 50%) 1; box-shadow: 0 0 0 1px #010a137a, 0 0 10px 1px #0008, 0 24px 90px #0009; border-radius: 0; }
@@ -195,11 +215,11 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .modal-body { min-height: 0; max-height: none; padding: 20px 30px 12px; }
 /* Actions dock centered on the bottom rail with the button-group ticks
    (lol-uikit-flat-button-group[type=dialog-frame]: bottom -2px, 2px #614a1f). */
-.modal-foot { position: absolute; z-index: 3; bottom: -2px; left: 50%; transform: translateX(-50%); display: flex; gap: 2px; padding: 0 4px; border: 0; background: none; }
+.modal-foot { position: absolute; z-index: 3; bottom: -2px; left: 0; right: 0; width: fit-content; margin-inline: auto; display: flex; flex-wrap: nowrap; gap: 2px; padding: 0 4px; border: 0; background: none; }
 .modal-foot::before, .modal-foot::after { content: ''; position: absolute; bottom: 0; height: 10px; border-top: 2px solid transparent; }
 .modal-foot::before { left: 0; border-right: 2px solid #614a1f; }
 .modal-foot::after { right: 0; border-left: 2px solid #614a1f; }
-.modal-foot .btn { min-width: 100px; height: 32px; font-family: Beaufort, serif; font-size: 14px; font-weight: 700; letter-spacing: .075em; text-transform: uppercase; }
+.modal-foot .btn { min-width: 0; height: 32px; padding: 0 14px; white-space: nowrap; font-family: Beaufort, WenKai, NotoCJK, serif; font-size: 14px; font-weight: 700; letter-spacing: .075em; text-transform: uppercase; }
 .modal-foot .btn-ghost { border-width: 2px; }
 .modal-close-mount { position: absolute; z-index: 2; top: -22px; right: -22px; width: 38px; height: 68px; background: url('/league/frame/frame-button-close-top-down.png') center / 38px 68px no-repeat; pointer-events: none; }
 .modal-close { display: grid; place-items: center; width: 28px; height: 28px; margin: 5px; padding: 2px; border-radius: 50%; background: linear-gradient(to top,#463714 4%,#785a28 23%,#c89b3c 90%,#c8aa6e); pointer-events: auto; }
@@ -219,7 +239,7 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .modal-head { border-color: #c8aa6e26; }
 .tabs, .tab-pill { border-radius: 0; }
 .tab-pill { background: #c8aa6e18; box-shadow: inset 0 -2px #a18a55; }
-.tab { font-family: Beaufort, serif; letter-spacing: .08em; text-transform: uppercase; }
+.tab { font-family: Beaufort, WenKai, NotoCJK, serif; letter-spacing: .08em; text-transform: uppercase; }
 .field input, .field select, .field textarea, .interval-input input { border-radius: 0; background: #050e16; border-color: #455159; }
 .field > span, .field > label { color: #c7c4b8; }
 .bulk-preview, .notice, .update-note { border-radius: 0; }
@@ -231,9 +251,9 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
 .interval-presets button { border-radius: 0; }
 /* Client settings: section titles 14/18 700 caps; selects stacked under their label
    ("Window Size": 232px framed dropdown). */
-.settings-section h3 { font-family: Beaufort, serif; font-size: 14px; line-height: 18px; font-weight: 700; letter-spacing: .075em; text-transform: uppercase; color: #f0e6d2; }
+.settings-section h3 { font-family: Beaufort, WenKai, NotoCJK, serif; font-size: 14px; line-height: 18px; font-weight: 700; letter-spacing: .075em; text-transform: uppercase; color: #f0e6d2; }
 .settings-section .field.inline { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; padding: 4px 0; }
-.settings-section .field.inline > span { font: 12px/16px Spiegel, sans-serif; letter-spacing: .025em; color: #a09b8c; }
+.settings-section .field.inline > span { font: 12px/16px Spiegel, NotoCJK, sans-serif; letter-spacing: .025em; color: #a09b8c; }
 .settings-section .field.inline .select-wrap { width: 180px; height: 32px; }
 .interval-row > span { font-size: 12px; font-weight: 400; letter-spacing: .1em; color: #a09b8c; }
 .settings-section .hint { font-size: 11px; letter-spacing: .025em; color: #7d786c; }
@@ -271,7 +291,6 @@ button:focus-visible, a:focus-visible { color: #f0e6d2; }
   .select-label { display: none; }
   .accounts.list .card { grid-template-columns: minmax(155px,1fr) minmax(185px,1fr) auto; gap: 14px; }
   .accounts.list .history { display: none; }
-  .accounts.list .card-actions .icon-btn { display: none; }
   .accounts.list .card-more { display: flex; }
 }
 @media (max-height: 730px) {

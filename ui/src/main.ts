@@ -4,9 +4,9 @@ import "./login.css";
 import "./league.css";
 import "./client-controls.css";
 
-import { ApiError, accountLabel, api, events, keyId, keyOf, parseAccountLine, type AccountView, type Ban, type Key, type Schedule, type Settings } from "./api";
+import { ApiError, accountLabel, api, events, keyId, keyOf, parseAccountLine, type AccountView, type Ban, type Key, type LocaleOption, type Schedule, type Settings, type UpdateAccount } from "./api";
 import { openLoginOverlay, type LoginOverlay } from "./login";
-import { LANGUAGES, applyStatic, errorText, lang, localizeRank, setLang, t, tierName, type Lang, type MessageKey } from "./i18n";
+import { LANGUAGES, applyStatic, asLang, en, errorText, fromBrowser, lang, localeTag, localizeRank, needsLanguageChoice, setLang, t, tierName, useLang, type Lang, type MessageKey } from "./i18n";
 import { $, closeMenu, contextMenu, esc, fragment, leave, modal, reducedMotion, toast } from "./dom";
 import { hydrateIcons, icon } from "./icons";
 import { observeSelects } from "./dropdown";
@@ -36,6 +36,7 @@ type Sort = "rank" | "name" | "level" | "region";
 const state = {
   accounts: [] as AccountView[],
   regions: [] as string[],
+  locales: [] as LocaleOption[],
   mode: "lol" as Mode,
   view: "grid" as View,
   sort: "rank" as Sort,
@@ -140,7 +141,7 @@ function banRemaining(until: number): string {
 }
 
 const banEnd = (until: number): string =>
-  new Date(until).toLocaleString(lang(), { dateStyle: "medium", timeStyle: "short" });
+  new Date(until).toLocaleString(localeTag(), { dateStyle: "medium", timeStyle: "short" });
 
 function banChip(account: AccountView): string {
   const ban = activeBan(account);
@@ -160,6 +161,7 @@ function cardInner(account: AccountView, pending: boolean): string {
       <div class="identity">
         <div class="name" data-tooltip="${esc(accountLabel(account))}">
           <span class="game-name">${esc(gameName)}</span>${tag ? `<span class="tag">#${esc(tag)}</span>` : ""}
+          ${account.name ? `<button class="icon-btn copy-riot-id" data-act="copy-riot-id" aria-label="${esc(t("card.copyRiotId"))}" data-tooltip="${esc(t("card.copyRiotId"))}">${icon("copy", 13)}</button>` : ""}
         </div>
         <div class="meta">
           <span class="chip chip-region">${esc(account.regionDisplay)}</span>
@@ -186,8 +188,6 @@ function cardInner(account: AccountView, pending: boolean): string {
     ${account.description ? `<p class="desc" data-tooltip="${esc(account.description)}">${esc(account.description)}</p>` : `<p class="desc desc-empty"></p>`}
     <div class="card-actions">
       <button class="btn btn-play" data-act="login" data-tooltip="${esc(t("card.loginTitle"))}">${icon("login", 15)}${esc(t("card.login"))}</button>
-      <button class="icon-btn" data-act="copy-id" aria-label="${esc(t("card.copyId"))}" data-tooltip="${esc(t("card.copyId"))}">${icon("copy", 15)}</button>
-      <button class="icon-btn" data-act="copy-pass" aria-label="${esc(t("card.copyPassword"))}" data-tooltip="${esc(t("card.copyPassword"))}">${icon("key", 15)}</button>
     </div>`;
 }
 
@@ -350,6 +350,31 @@ async function copyId(account: AccountView): Promise<void> {
   }
 }
 
+/// Copy the login username. Unlike the password it is not a secret, so it goes
+/// straight to the clipboard without the app's private-write handling.
+async function copyUsername(account: AccountView): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(account.accountId);
+  } catch {
+    toast("error", t("toast.copyFailed"));
+    return;
+  }
+  toast("success", t("toast.usernameCopied"), account.accountId);
+}
+
+/// Copy the account's `Name#TAG`. A Riot ID is public information, so like the
+/// username it goes straight to the clipboard.
+async function copyRiotId(account: AccountView): Promise<void> {
+  const riotId = accountLabel(account);
+  try {
+    await navigator.clipboard.writeText(riotId);
+  } catch {
+    toast("error", t("toast.copyFailed"));
+    return;
+  }
+  toast("success", t("toast.riotIdCopied"), riotId);
+}
+
 async function copyPassword(account: AccountView): Promise<void> {
   const ttl = await guard(() => api.copyPassword(keyOf(account)), "toast.passFailed");
   if (ttl !== undefined) toast("success", t("toast.passCopied"), t("toast.passCopiedText", { seconds: ttl }));
@@ -472,7 +497,115 @@ function select(id: string | null, focus = false): void {
   });
 }
 
+/** Toggle a password field between masked and readable. */
+function wireReveal(root: ParentNode): void {
+  const reveal = root.querySelector<HTMLElement>("[data-reveal]");
+  const input = root.querySelector<HTMLInputElement>('[name="password"]');
+  if (!reveal || !input) return;
+  reveal.addEventListener("click", () => {
+    const hidden = input.type === "password";
+    input.type = hidden ? "text" : "password";
+    reveal.innerHTML = icon(hidden ? "eye-off" : "eye", 15);
+  });
+}
+
+/** `<option>` list for the per-account game language, including "Riot's choice". */
+function localeOptionsHtml(selected: string | null): string {
+  const auto = `<option value=""${selected ? "" : " selected"}>${esc(t("locale.auto"))}</option>`;
+  return auto + state.locales
+    .map((locale) => {
+      const mark = locale.homePageWorks ? "" : ` — ${esc(t("locale.homeBroken"))}`;
+      return `<option value="${esc(locale.code)}"${locale.code === selected ? " selected" : ""}>${esc(locale.name)}${mark}</option>`;
+    })
+    .join("");
+}
+
+/**
+ * Picking `zh_CN` silently costs the user the client's home page, so ask
+ * before it is kept. The dialog offers the two locales that render it and,
+ * for anyone who insists on `zh_CN`, the external plugin that repairs it.
+ * Resolves with the locale to use, or null when the pick is unchanged.
+ */
+async function askHomeFix(select: HTMLSelectElement, chosen: string): Promise<void> {
+  const locale = state.locales.find((entry) => entry.code === chosen);
+  if (!locale || locale.homePageWorks) return;
+  const previous = select.dataset.previous ?? "";
+  const choice = await modal({
+    title: t("locale.fixTitle"),
+    body: `
+      <p class="hint">${t("locale.fixBody")}</p>
+      <p class="hint">${t("locale.fixPartial")}</p>
+      <p class="hint">${t("locale.fixPlugin")}</p>
+      <div class="fix-links">
+        <button type="button" class="btn btn-ghost" data-pengu-link>${t("locale.fixPengu")}</button>
+        <button type="button" class="btn btn-ghost" data-author-link>${t("locale.fixAuthor")}</button>
+      </div>`,
+    actions: [
+      { label: t("locale.fixZhMy"), value: "zh_MY", kind: "primary" },
+      { label: t("locale.fixZhTw"), value: "zh_TW" },
+      { label: t("locale.keepZhCn"), value: "keep" },
+    ],
+    stacked: true,
+    onOpen: (root) => {
+      // Both open a page and leave the dialog open: they are references for
+      // the third paragraph, not the dialog's decision.
+      root.querySelectorAll<HTMLElement>("[data-pengu-link], [data-author-link]").forEach((link) => {
+        link.addEventListener("click", () => {
+          const pengu = link.hasAttribute("data-pengu-link");
+          void guard(
+            () => (pengu ? api.openPenguLoader() : api.openHomeFixAuthor()),
+            "toast.browserFailed",
+          );
+        });
+      });
+    },
+  });
+  if (choice === null) {
+    select.value = previous;
+    return;
+  }
+  select.value = choice === "keep" ? chosen : choice;
+  select.dataset.previous = select.value;
+}
+
+/// Ask before a broken-home-page language is kept, and remember the last
+/// good pick so dismissing the dialog can put it back.
+function wireHomeFix(select: HTMLSelectElement): void {
+  select.dataset.previous = select.value;
+  select.addEventListener("change", () => {
+    const chosen = select.value;
+    const locale = state.locales.find((entry) => entry.code === chosen);
+    if (!locale || locale.homePageWorks) {
+      // A good pick is remembered immediately; the prompt would have no
+      // earlier value to fall back to otherwise.
+      select.dataset.previous = chosen;
+      return;
+    }
+    void askHomeFix(select, chosen);
+  });
+}
+
+/// The profile-update skip only means anything for a Vietnamese account, so
+/// the toggle appears once that region is chosen instead of sitting there for
+/// every account as a flag the user has to reason about.
+function wireVnToggle(root: ParentNode): void {
+  const region = root.querySelector<HTMLSelectElement>('select[name="region"]');
+  const toggle = root.querySelector<HTMLElement>("[data-vn-only]");
+  if (!region || !toggle) return;
+  const update = () => {
+    const vietnamese = region.value.toLowerCase() === "vn";
+    toggle.hidden = !vietnamese;
+    if (!vietnamese) {
+      const box = toggle.querySelector<HTMLInputElement>('input[name="skipProfileUpdate"]');
+      if (box) box.checked = false;
+    }
+  };
+  region.addEventListener("change", update);
+  update();
+}
+
 async function editAccount(account: AccountView): Promise<void> {
+  const localeOptions = localeOptionsHtml(account.locale);
   await modal({
     title: t("edit.title"),
     body: `
@@ -480,16 +613,44 @@ async function editAccount(account: AccountView): Promise<void> {
         <input name="name" value="${esc(account.name)}" placeholder="${esc(t("add.riotIdPh"))}" spellcheck="false" /></label>
       <label class="field"><span>${t("edit.description")}</span>
         <input name="description" value="${esc(account.description)}" placeholder="${esc(t("edit.descriptionPh"))}" /></label>
-      <p class="hint">${t("edit.hint")}</p>`,
+      <div class="field-row">
+        <label class="field"><span>${t("edit.locale")}</span>
+          <div class="select-wrap full"><select name="locale">${localeOptions}</select></div></label>
+      </div>
+      <label class="field"><span>${t("edit.password")}</span>
+        <div class="password">
+          <input name="password" type="password" autocomplete="new-password" placeholder="${esc(t("edit.passwordPh"))}" />
+          <button type="button" class="icon-btn" data-reveal aria-label="${esc(t("add.show"))}" data-tooltip="${esc(t("add.show"))}">${icon("eye", 15)}</button>
+        </div></label>
+      <label class="toggle-row" data-vn-only${account.region === "vn" ? "" : " hidden"}>
+        <span class="toggle-text"><strong>${esc(t("vn.skip"))}</strong><span>${esc(t("vn.skipHint"))}</span></span>
+        <input type="checkbox" name="skipProfileUpdate" ${account.skipProfileUpdate ? "checked" : ""}/>
+        <span class="switch"></span>
+      </label>
+      <p class="hint">${t("edit.hint")}</p>
+      <p class="hint">${t("edit.localeHint")}</p>`,
     actions: [
       { label: t("common.cancel"), value: "cancel" },
       { label: t("common.save"), value: "save", kind: "primary" },
     ],
+    onOpen: (root) => { wireReveal(root); wireHomeFix($<HTMLSelectElement>('[name="locale"]', root)); },
     onSubmit: async (value, root) => {
       if (value !== "save") return true;
       const name = $<HTMLInputElement>('[name="name"]', root).value;
       const description = $<HTMLInputElement>('[name="description"]', root).value;
-      const updated = await guard(() => api.updateAccount(keyOf(account), name, description), "toast.saveFailed");
+      const locale = $<HTMLSelectElement>('[name="locale"]', root).value || null;
+      const password = $<HTMLInputElement>('[name="password"]', root).value;
+      const skipProfileUpdate = $<HTMLInputElement>('[name="skipProfileUpdate"]', root).checked;
+      const input: UpdateAccount = {
+        name,
+        description,
+        locale,
+        password: password.trim() || undefined,
+        skipProfileUpdate,
+      };
+      const updated = await guard(() => api.updateAccount(keyOf(account), input),
+        "toast.saveFailed",
+      );
       if (!updated) return false;
       upsert(updated);
       render();
@@ -532,6 +693,9 @@ function openMenu(account: AccountView, x: number, y: number): void {
       icon: "external-link",
       run: () => void guard(() => api.openProfile(keyOf(account), state.mode === "tft"), "toast.openFailed"),
     }] : []),
+    { label: t("menu.copyUsername"), icon: "copy", run: () => void copyUsername(account) },
+    { label: t("card.copyId"), icon: "copy", run: () => void copyId(account) },
+    { label: t("card.copyPassword"), icon: "key", run: () => void copyPassword(account) },
     { label: t("menu.edit"), icon: "pencil", run: () => void editAccount(account) },
     { label: t("menu.delete"), icon: "trash", danger: true, run: () => void deleteAccount(account) },
   ]);
@@ -750,13 +914,22 @@ function openAddDrawer(tab: "single" | "multi" = "single"): void {
               </div></label>
             <label class="field"><span>${t("edit.description")} <em>${t("add.optional")}</em></span>
               <input name="description" autocomplete="off" placeholder="${esc(t("edit.descriptionPh"))}" /></label>
+            <label class="field"><span>${t("edit.locale")}</span>
+              <div class="select-wrap full"><select name="locale">${localeOptionsHtml(lastLocale())}</select></div></label>
+            <label class="toggle-row" data-vn-only hidden>
+              <span class="toggle-text"><strong>${esc(t("vn.skip"))}</strong><span>${esc(t("vn.skipHint"))}</span></span>
+              <input type="checkbox" name="skipProfileUpdate"/>
+              <span class="switch"></span>
+            </label>
             <button class="btn btn-primary btn-block" type="submit">${icon("plus")} ${t("add.submit")}</button>
           </form>
           <form class="tab-panel" data-panel="multi" novalidate>
             <label class="field"><span>${t("add.multiLabel")}</span>
-              <textarea name="text" rows="9" spellcheck="false" placeholder="${esc(t("add.multiPh"))}"></textarea></label>
-            <p class="hint">${t("add.multiHint", { format: "<code>AccountID--Name#TAG--password</code>", alt: "<code>---</code>" })} <span class="multi-count"></span></p>
+              <textarea name="text" rows="9" spellcheck="false" placeholder="${esc(t("add.multiPh")).replace(/\n/g, "&#10;")}"></textarea></label>
+            <p class="hint">${t("add.multiHint", { format: "<code>AccountID--Name#TAG--password</code>", short: "<code>AccountID--password</code>", dash: "<code>--</code>", one: "<code>-</code>" })} <span class="multi-count"></span></p>
             <label class="field"><span>${t("add.multiRegion")}</span><div class="select-wrap full"><select name="region">${regionOptions}</select></div></label>
+            <label class="field"><span>${t("edit.locale")}</span>
+              <div class="select-wrap full"><select name="locale">${localeOptionsHtml(lastLocale())}</select></div></label>
             <button class="btn btn-primary btn-block" type="submit">${icon("users")} ${t("add.multiSubmit")}</button>
           </form>
         </div>
@@ -782,7 +955,9 @@ function openAddDrawer(tab: "single" | "multi" = "single"): void {
     void leave(overlay, "drawer-out");
   };
   const onKey = (event: KeyboardEvent) => {
-    if (event.key === "Escape") {
+    // A modal opened from the drawer (the zh_CN language prompt) owns Escape
+    // while it is up; closing the drawer underneath it would discard the form.
+    if (event.key === "Escape" && !document.querySelector("#modal-root .modal")) {
       event.stopPropagation();
       close();
     }
@@ -793,13 +968,10 @@ function openAddDrawer(tab: "single" | "multi" = "single"): void {
   });
   $("[data-close]", overlay).addEventListener("click", close);
 
-  const reveal = $("[data-reveal]", overlay);
-  reveal.addEventListener("click", () => {
-    const input = $<HTMLInputElement>('[name="password"]', overlay);
-    const hidden = input.type === "password";
-    input.type = hidden ? "text" : "password";
-    reveal.innerHTML = icon(hidden ? "eye-off" : "eye", 15);
-  });
+  wireReveal(overlay);
+  // Both panels carry their own language select; each needs its own listener.
+  overlay.querySelectorAll<HTMLSelectElement>('select[name="locale"]').forEach(wireHomeFix);
+  wireVnToggle(overlay);
 
   const textarea = $<HTMLTextAreaElement>("textarea", overlay);
   const counter = $(".multi-count", overlay);
@@ -824,6 +996,7 @@ function openAddDrawer(tab: "single" | "multi" = "single"): void {
     const button = $<HTMLButtonElement>('button[type="submit"]', single);
     button.disabled = true;
     rememberRegion(value("region"));
+    rememberLocale(value("locale"));
     const added = await guard(
       () =>
         api.addAccount({
@@ -832,6 +1005,8 @@ function openAddDrawer(tab: "single" | "multi" = "single"): void {
           region: value("region"),
           password: value("password"),
           description: value("description"),
+          locale: value("locale") || null,
+          skipProfileUpdate: single.querySelector<HTMLInputElement>('[name="skipProfileUpdate"]')?.checked ?? false,
         }),
       "toast.addFailed",
     );
@@ -854,6 +1029,7 @@ function openAddDrawer(tab: "single" | "multi" = "single"): void {
     const data = new FormData(multi);
     const text = String(data.get("text") ?? "");
     const region = String(data.get("region") ?? "");
+    const locale = String(data.get("locale") ?? "");
     if (!text.trim()) {
       shake(drawer);
       return;
@@ -864,7 +1040,7 @@ function openAddDrawer(tab: "single" | "multi" = "single"): void {
     textarea.readOnly = true;
     regionSelect.disabled = true;
     try {
-      const result = await guard(() => api.multiAdd(text, region), "toast.multiFailed");
+      const result = await guard(() => api.multiAdd(text, region, locale || null), "toast.multiFailed");
       if (!result) return;
       const lines = text.split("\n");
       textarea.value = result.skippedLines.map((index) => lines[index]).join("\n");
@@ -909,6 +1085,24 @@ function rememberRegion(region: string): void {
   }
 }
 
+/** Last language picked in the add drawer, so adding several accounts is quick. */
+function lastLocale(): string | null {
+  try {
+    return localStorage.getItem("leagueaccounts.locale") || null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberLocale(locale: string): void {
+  try {
+    if (locale) localStorage.setItem("leagueaccounts.locale", locale);
+    else localStorage.removeItem("leagueaccounts.locale");
+  } catch {
+    // Non-essential.
+  }
+}
+
 // ---------------------------------------------------------------- side actions
 
 async function exportData(): Promise<void> {
@@ -916,8 +1110,10 @@ async function exportData(): Promise<void> {
     title: t("export.title"),
     body: `<div class="warning">${icon("alert", 18)}<p>${t("export.warning")}</p></div>`,
     actions: [
-      { label: t("common.cancel"), value: "cancel" },
-      { label: t("export.confirm"), value: "export", kind: "primary" },
+      // The warning is about exporting plaintext passwords, so the highlighted
+      // choice is the one that keeps them on the machine.
+      { label: t("common.cancel"), value: "cancel", kind: "primary" },
+      { label: t("export.confirm"), value: "export" },
     ],
   });
   if (answer !== "export") return;
@@ -961,6 +1157,59 @@ function showShortcuts(): void {
 
 // ---------------------------------------------------------------- language
 
+
+/** First run: pick the interface language before using the app.
+ *
+ * The dialog is rendered in the language the OS is set to, so a Chinese player
+ * reads Chinese before choosing anything — the app previously greeted everyone
+ * in English while only preselecting their language in the dropdown. The
+ * English text is repeated under it, because the reader is by definition
+ * someone whose language preference is not known yet.
+ */
+async function welcomeLanguage(): Promise<void> {
+  const detected = fromBrowser(navigator.language);
+  // Applied without being stored: `needsLanguageChoice` must still see an empty
+  // slot until the user answers.
+  useLang(detected);
+  applyLanguage();
+  const options = LANGUAGES.map(
+    (language) =>
+      `<option value="${language.code}"${language.code === detected ? " selected" : ""}>${esc(language.name)}</option>`,
+  ).join("");
+  // English is the reference dictionary, so it is the one translation always
+  // available. Only the sentence is repeated: the English title is the dialog's
+  // own heading, and showing it in the body read as a stray second title.
+  const english = detected === "en" ? "" : `
+      <p class="hint welcome-english">${esc(en["welcome.text"])}</p>`;
+  const answer = await modal({
+    title: t("welcome.title"),
+    body: `
+      <p class="hint">${esc(t("welcome.text"))}</p>${english}
+      <label class="field"><span>${esc(t("settings.language"))}</span>
+        <div class="select-wrap full"><select name="language">${options}</select></div></label>`,
+    actions: [{ label: t("common.ok"), value: "ok", kind: "primary" }],
+    onSubmit: async (_value, root) => {
+      const language = $<HTMLSelectElement>('[name="language"]', root).value as Lang;
+      // Not `changeLanguage`: on first run the picked language can equal the
+      // untranslated default, and skipping the write would ask again next time.
+      setLang(language);
+      void api.setUiLanguage(language).catch(() => {});
+      applyLanguage();
+      render();
+      return true;
+    },
+  });
+  // Closed without choosing — Escape, the X, or a click outside: keep the
+  // language the dialog was already showing rather than asking again on the
+  // next launch. Only answering used to store a choice, so a dismissal made
+  // the question repeat forever.
+  if (answer === null) {
+    setLang(lang());
+    void api.setUiLanguage(lang()).catch(() => {});
+    applyLanguage();
+  }
+}
+
 /** Translate static markup and the option lists built in code. */
 function applyLanguage(): void {
   applyStatic();
@@ -977,6 +1226,8 @@ function applyLanguage(): void {
 function changeLanguage(next: Lang): void {
   if (next === lang()) return;
   setLang(next);
+  // Durable copy: the webview's localStorage is a cache and can be rebuilt.
+  void api.setUiLanguage(next).catch(() => {});
   applyLanguage();
   render();
 }
@@ -1064,8 +1315,7 @@ function wire(): void {
     select(card.dataset.key ?? null);
     const action = (event.target as HTMLElement).closest<HTMLElement>("[data-act]")?.dataset.act;
     if (action === "login") void login(account);
-    if (action === "copy-id") void copyId(account);
-    if (action === "copy-pass") void copyPassword(account);
+    if (action === "copy-riot-id") void copyRiotId(account);
     if (action === "menu") {
       const rect = (event.target as HTMLElement).closest("button")!.getBoundingClientRect();
       openMenu(account, rect.left, rect.bottom + 6);
@@ -1322,7 +1572,7 @@ async function start(): Promise<void> {
     });
   }
   loadPrefs();
-  setLang(lang());
+  useLang(lang());
   applyLanguage();
   hydrateIcons();
   wireTooltips();
@@ -1331,8 +1581,22 @@ async function start(): Promise<void> {
   const boot = await api.bootstrap();
   state.accounts = boot.accounts;
   state.regions = boot.regions;
+  state.locales = boot.locales;
   state.settings = boot.settings;
   state.schedule = boot.schedule;
+  // The webview cache may have been rebuilt, which would bring the welcome
+  // dialog back on a launch that is not the first. The settings file is the
+  // record of that decision, so restore from it before deciding to ask.
+  const remembered = asLang(boot.settings.uiLanguage);
+  if (needsLanguageChoice() && remembered) {
+    // The webview cache was rebuilt but the settings file kept the decision.
+    setLang(remembered);
+    applyLanguage();
+  } else if (!needsLanguageChoice() && !remembered) {
+    // Chosen before this field existed: copy the cached value into the
+    // settings file so the record survives the next cache rebuild.
+    void api.setUiLanguage(lang()).catch(() => {});
+  }
   $("#version").textContent = `v${boot.version}`;
   render();
   if (boot.loadError) toast("error", t("toast.loadFailed"), errorText(boot.loadError.code, boot.loadError.detail), 8000);
@@ -1344,6 +1608,8 @@ async function start(): Promise<void> {
   setInterval(renderAccounts, 30_000);
   // An update found at launch shows the update screen instead of the app.
   if (!(await launchUpdate(revealApp))) await revealApp();
+  // First run: ask the user before anything else, in a language they chose.
+  if (needsLanguageChoice()) await welcomeLanguage();
   if (!IN_TAURI && import.meta.env.DEV) runDemoScene();
 }
 

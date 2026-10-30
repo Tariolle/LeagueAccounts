@@ -34,11 +34,15 @@ export interface Settings {
   autoUpdate: boolean;
   /** Interface size in percent; the window zooms and resizes with it. */
   uiScale: number;
+  /** Empty until the welcome dialog has been answered once. */
+  uiLanguage: string;
   riotClientFound: boolean;
   tftInstalled: boolean;
 }
 
-export type SettingsInput = Omit<Settings, "riotClientFound" | "tftInstalled">;
+// `uiLanguage` is set through its own command, not the Settings form, so it is
+// not part of what the form submits.
+export type SettingsInput = Omit<Settings, "riotClientFound" | "tftInstalled" | "uiLanguage">;
 
 export interface Schedule {
   enabled: boolean;
@@ -51,15 +55,13 @@ export interface Schedule {
 export type LoginStep =
   | "closeLeague"
   | "openClient"
-  | "waitAuth"
   | "signOut"
-  | "connect"
+  | "signIn"
   | "verification"
-  | "findWindow"
   | "focus"
   | "type"
-  | "confirm"
   | "launchGame"
+  | "updating"
   | "done";
 
 export interface GameStatus {
@@ -125,6 +127,10 @@ export interface AccountView {
   description: string;
   level: string;
   hasPassword: boolean;
+  /** Skip Riot's profile-update flow at sign-in (VN accounts). */
+  skipProfileUpdate: boolean;
+  /** Product locale this account starts the game in; null = Riot's choice. */
+  locale: string | null;
   lol: LolRank;
   tft: TftRank;
   /** League suspension reported at the last Riot sign-in; `until` is null when permanent. */
@@ -164,9 +170,19 @@ export interface RefreshStarted {
   auto: boolean;
 }
 
+export interface LocaleOption {
+  code: string;
+  name: string;
+  /// False when the client home page does not render in this locale.
+  homePageWorks: boolean;
+  /// False when the Riot Client substitutes another locale at launch.
+  launchable: boolean;
+}
+
 export interface Bootstrap {
   accounts: AccountView[];
   regions: string[];
+  locales: LocaleOption[];
   version: string;
   loggingAvailable: boolean;
   loadError: ErrorPayload | null;
@@ -184,21 +200,37 @@ export interface BulkAddResult {
   skippedLines: number[];
 }
 
+export interface UpdateAccount {
+  name: string;
+  description: string;
+  locale: string | null;
+  password?: string;
+  skipProfileUpdate?: boolean;
+}
+
 export interface NewAccount {
   accountId: string;
   name: string;
   region: string;
   password: string;
   description: string;
+  locale?: string | null;
+  skipProfileUpdate?: boolean;
 }
 
 export function parseAccountLine(line: string): Pick<NewAccount, "accountId" | "name" | "password"> | undefined {
-  for (const separator of ["---", "--"]) {
-    const parts = line.split(separator).map((part) => part.trim());
-    if (parts.length === 3 && parts[0] && parts[2]) {
-      return { accountId: parts[0], name: parts[1], password: parts[2] };
-    }
+  // Mirrors `parse_account_line` in Rust: `--` separates fields, two fields
+  // mean no Riot ID yet, and a three-field line needs all three filled. A
+  // password that starts with `--` therefore fails to parse rather than
+  // silently losing its dashes.
+  const parts = line.split("--").map((part) => part.trim());
+  if (parts.length === 2 && parts[0] && parts[1]) {
+    return { accountId: parts[0], name: "", password: parts[1] };
   }
+  if (parts.length === 3 && parts[0] && parts[1] && parts[2]) {
+    return { accountId: parts[0], name: parts[1], password: parts[2] };
+  }
+  return undefined;
 }
 
 export const keyOf = (account: AccountView): Key => ({
@@ -225,9 +257,11 @@ export const api = {
   bootstrap: () => call<Bootstrap>("bootstrap"),
   listAccounts: () => call<AccountView[]>("list_accounts"),
   addAccount: (input: NewAccount) => call<AccountView>("add_account", { input }),
-  multiAdd: (text: string, region: string) => call<BulkAddResult>("multi_add", { text, region }),
-  updateAccount: (key: Key, name: string, description: string) =>
-    call<AccountView>("update_account", { key, name, description }),
+  multiAdd: (text: string, region: string, locale: string | null) =>
+    call<BulkAddResult>("multi_add", { text, region, locale }),
+  /** `input.password` left undefined keeps the stored credential. */
+  updateAccount: (key: Key, input: UpdateAccount) =>
+    call<AccountView>("update_account", { key, input }),
   deleteAccount: (key: Key) => call<void>("delete_account", { key }),
   refreshRanks: (force = false) => call<number>("refresh_ranks", { force }),
   copyAccountId: (key: Key) => call<void>("copy_account_id", { key }),
@@ -245,10 +279,16 @@ export const api = {
   openRelease: (url: string) => call<void>("open_release", { url }),
   getSettings: () => call<Settings>("get_settings"),
   updateSettings: (input: SettingsInput) => call<Settings>("update_settings", { input }),
+  /** Durable copy of the interface language, for when the webview cache is lost. */
+  setUiLanguage: (language: string) => call<void>("set_ui_language", { language }),
   exportData: (title: string) => call<string | null>("export_data", { title }),
   importData: (title: string) => call<BatchResult | null>("import_data", { title }),
   openProfile: (key: Key, tft: boolean) => call<void>("open_profile", { key, tft }),
   openLogsFolder: () => call<void>("open_logs_folder"),
+  /** Opens ABC's Bilibili page, where the zh-cn-home-locale plugin lives. */
+  openHomeFixAuthor: () => call<void>("open_home_fix_author"),
+  /** Opens Pengu Loader's site; the plugin needs it installed. */
+  openPenguLoader: () => call<void>("open_pengu_loader"),
 };
 
 export const events = {

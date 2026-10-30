@@ -40,14 +40,31 @@ pub fn region_from_display(display: &str) -> Option<&'static str> {
         .map(|(_, value)| *value)
 }
 
-/// Bulk input keeps the Riot ID column even when the name is unknown.
+/// Split one bulk line into `(account, name, password)`.
+///
+/// `--` separates fields. Two fields are `account--password` — no Riot ID yet,
+/// which is what a bulk import usually has — and three are
+/// `account--name--password`.
+///
+/// The separator is the literal `--`, not a *run* of dashes, so a password
+/// that starts with one dash survives: `user---abc` is `user` / `-abc`. A
+/// password that starts with `--` cannot be written at all, because those two
+/// dashes read as a field boundary and leave an empty field. Every empty field
+/// is rejected, so such a password fails to import instead of silently losing
+/// its dashes. Keep it that way: trimming dashes "to be forgiving" is exactly
+/// how a password gets corrupted without anyone noticing.
 pub fn parse_account_line(line: &str) -> Option<(&str, &str, &str)> {
-    ["---", "--"].into_iter().find_map(|separator| {
-        let mut parts = line.split(separator).map(str::trim);
-        let (account_id, name, password) = (parts.next()?, parts.next()?, parts.next()?);
-        (parts.next().is_none() && !account_id.is_empty() && !password.is_empty())
-            .then_some((account_id, name, password))
-    })
+    let parts: Vec<&str> = line.split("--").map(str::trim).collect();
+    let (account_id, name, password) = match parts[..] {
+        // Two fields: no Riot ID column at all.
+        [account_id, password] => (account_id, "", password),
+        // Three fields: the middle one must actually carry a name. An empty
+        // middle field means the line had a stray separator (`user----secret`),
+        // and guessing which side lost a character is worse than refusing it.
+        [account_id, name, password] if !name.is_empty() => (account_id, name, password),
+        _ => return None,
+    };
+    (!account_id.is_empty() && !password.is_empty()).then_some((account_id, name, password))
 }
 
 pub fn region_display(region: &str) -> String {
@@ -110,33 +127,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bulk_input_allows_an_empty_riot_id_but_requires_credentials() {
-        for separator in ["--", "---"] {
-            assert_eq!(
-                parse_account_line(&format!(" user{separator} {separator}secret ")),
-                Some(("user", "", "secret"))
-            );
-            assert_eq!(
-                parse_account_line(&format!("user{separator}Player#TAG{separator}secret")),
-                Some(("user", "Player#TAG", "secret"))
-            );
-        }
+    fn bulk_input_reads_two_and_three_field_lines() {
+        // Two fields: no Riot ID yet, which is what a bulk import usually has.
+        assert_eq!(parse_account_line("user2--password2"), Some(("user2", "", "password2")));
         assert_eq!(
-            parse_account_line("user----secret"),
-            Some(("user", "", "secret"))
+            parse_account_line("  user2 -- password2  "),
+            Some(("user2", "", "password2"))
         );
+        // Three fields, with the Riot ID.
         assert_eq!(
-            parse_account_line("user------secret"),
-            Some(("user", "", "secret"))
+            parse_account_line("user1--Name1#TAG1--password1"),
+            Some(("user1", "Name1#TAG1", "password1"))
         );
+        // Six dashes split into four fields: ambiguous, so rejected.
+        assert_eq!(parse_account_line("user------secret"), None);
+    }
+
+    #[test]
+    fn bulk_input_rejects_lines_that_would_lose_characters() {
         for invalid in [
-            "----secret",
-            "user----",
-            "user--secret",
-            "user--name--secret--extra",
+            "",                      // no separator
+            "user",                  // no separator
+            "--secret",              // no account
+            "user--",                // no password
+            "user----",              // two separators, still no password
+            "user----secret",        // empty middle field
+            "user--name--pass--x",   // too many fields
+            "user----password",      // password begins with `--`, so empty field
         ] {
-            assert_eq!(parse_account_line(invalid), None);
+            assert_eq!(parse_account_line(invalid), None, "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn a_password_may_start_with_a_single_dash() {
+        // The separator is literally `--`, so one leading dash stays in the
+        // password instead of being swallowed with the separator.
+        assert_eq!(parse_account_line("user---abc"), Some(("user", "", "-abc")));
+        assert_eq!(
+            parse_account_line("user--Name#TAG---abc"),
+            Some(("user", "Name#TAG", "-abc"))
+        );
     }
 
     #[test]
