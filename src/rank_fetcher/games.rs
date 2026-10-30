@@ -141,20 +141,80 @@ impl RankFetcher {
 }
 
 impl RankFetcher {
+    #[cfg(test)]
     pub(super) fn fetch_recent_games_from_opgg(
         &self,
         body: &str,
         url: &str,
         region: &str,
     ) -> Result<Vec<RecentGame>, Reason> {
+        self.fetch_recent_games_from_opgg_for_queue(body, url, region, "TOTAL")
+    }
+
+    #[cfg(test)]
+    pub(super) fn fetch_recent_games_from_opgg_for_queue(
+        &self,
+        body: &str,
+        url: &str,
+        region: &str,
+        game_type: &str,
+    ) -> Result<Vec<RecentGame>, Reason> {
         let deadline = Instant::now() + HISTORY_TIMEOUT;
         let soup = Html::parse_document(body);
         let puuid = opgg_puuid(&soup).ok_or(Reason::ProfileMissing)?;
+        let action = self
+            .discover_get_games_action(body, deadline)
+            .map_err(|_| Reason::ResponseBody)?;
+        self.fetch_recent_games_for_queue_with_action(url, region, &puuid, game_type, &action)
+    }
+
+    pub(super) fn fetch_recent_game_queues_from_opgg(
+        &self,
+        body: &str,
+        url: &str,
+        region: &str,
+    ) -> (Result<Vec<RecentGame>, Reason>, Result<Vec<RecentGame>, Reason>) {
+        let deadline = Instant::now() + HISTORY_TIMEOUT;
+        let soup = Html::parse_document(body);
+        let Some(puuid) = opgg_puuid(&soup) else {
+            return (Err(Reason::ProfileMissing), Err(Reason::ProfileMissing));
+        };
+        let action = match self.discover_get_games_action(body, deadline) {
+            Ok(action) => action,
+            Err(_) => return (Err(Reason::ResponseBody), Err(Reason::ResponseBody)),
+        };
+        std::thread::scope(|scope| {
+            let solo = scope.spawn(|| {
+                self.fetch_recent_games_for_queue_with_action(
+                    url, region, &puuid, "RANKED_SOLO", &action,
+                )
+            });
+            let flex = scope.spawn(|| {
+                self.fetch_recent_games_for_queue_with_action(
+                    url, region, &puuid, "RANKED_FLEX", &action,
+                )
+            });
+            (
+                solo.join().unwrap_or(Err(Reason::ResponseBody)),
+                flex.join().unwrap_or(Err(Reason::ResponseBody)),
+            )
+        })
+    }
+
+    fn fetch_recent_games_for_queue_with_action(
+        &self,
+        url: &str,
+        region: &str,
+        puuid: &str,
+        game_type: &str,
+        action: &str,
+    ) -> Result<Vec<RecentGame>, Reason> {
+        let deadline = Instant::now() + HISTORY_TIMEOUT;
         let mut payload = serde_json::json!([{
             "locale": "en", "region": region, "puuid": puuid,
-            "gameType": "TOTAL", "endedAt": "", "champion": serde_json::Value::Null,
+            "gameType": game_type, "endedAt": "", "champion": serde_json::Value::Null,
         }]);
-        let mut page = self.request_opgg_games(body, url, &payload, deadline)?;
+        let mut page = self.request_opgg_games_with_action(url, &payload, deadline, action)?;
         if page.data.is_empty() {
             if let Some(cursor) = page
                 .meta
@@ -162,7 +222,7 @@ impl RankFetcher {
                 .and_then(serde_json::Value::as_str)
             {
                 payload[0]["endedAt"] = cursor.into();
-                page = self.request_opgg_games(body, url, &payload, deadline)?;
+                page = self.request_opgg_games_with_action(url, &payload, deadline, action)?;
             }
         }
         let games = parse_opgg_action_games(&page.data);
@@ -174,6 +234,7 @@ impl RankFetcher {
         Ok(games)
     }
 
+    #[cfg(test)]
     fn request_opgg_games(
         &self,
         body: &str,
@@ -184,10 +245,20 @@ impl RankFetcher {
         let action = self
             .discover_get_games_action(body, deadline)
             .map_err(|_| Reason::ResponseBody)?;
+        self.request_opgg_games_with_action(url, payload, deadline, &action)
+    }
+
+    fn request_opgg_games_with_action(
+        &self,
+        url: &str,
+        payload: &serde_json::Value,
+        deadline: Instant,
+        action: &str,
+    ) -> Result<OpggGamesPage, Reason> {
         let request = self
             .client
             .post(url)
-            .header("Next-Action", &action)
+            .header("Next-Action", action)
             .header(reqwest::header::ACCEPT, "text/x-component")
             .header(reqwest::header::CONTENT_TYPE, "text/plain;charset=UTF-8")
             .header(reqwest::header::ORIGIN, "https://op.gg")
@@ -196,13 +267,13 @@ impl RankFetcher {
             .timeout(remaining(deadline).map_err(|_| Reason::Timeout)?);
         let response = self.request_text(request).inspect_err(|reason| {
             if *reason == Reason::HttpNotFound {
-                self.invalidate_get_games_action(&action);
+                self.invalidate_get_games_action(action);
             }
         })?;
         match parse_opgg_action_page(&response) {
             Some(page) => Ok(page),
             None => {
-                self.invalidate_get_games_action(&action);
+                self.invalidate_get_games_action(action);
                 Err(Reason::ResponseBody)
             }
         }
@@ -297,7 +368,10 @@ mod tests {
                     let args: serde_json::Value = serde_json::from_slice(&payload).unwrap();
                     assert_eq!(args[0]["puuid"], "fixture-puuid");
                     assert_eq!(args[0]["region"], "kr");
-                    assert_eq!(args[0]["gameType"], "TOTAL");
+                    assert!(matches!(
+                        args[0]["gameType"].as_str(),
+                        Some("TOTAL" | "RANKED_SOLO" | "RANKED_FLEX")
+                    ));
                     received.lock().unwrap().push(args);
                 }
                 std::thread::sleep(delay);
@@ -470,6 +544,7 @@ mod tests {
                 vec![
                     ("GET", 200, profile(false)),
                     ("POST", status, body.into()),
+                    ("POST", status, body.into()),
                     ("GET", 200, "profile_icons/profileIcon6.jpg".into()),
                 ],
                 Duration::ZERO,
@@ -501,7 +576,11 @@ mod tests {
         for (status, response, expected) in [(200, page(20), 10), (503, "unavailable".into(), 1)] {
             let fetcher = cached_fetcher();
             let (url, _, server) = server(
-                vec![("GET", 200, profile(true)), ("POST", status, response)],
+                vec![
+                    ("GET", 200, profile(true)),
+                    ("POST", status, response.clone()),
+                    ("POST", status, response),
+                ],
                 Duration::ZERO,
             );
             let info = fetcher

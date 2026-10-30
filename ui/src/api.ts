@@ -128,6 +128,7 @@ export interface AccountView {
   flex?: { tier: string; division: string; lp: string; lastSeason: string; rankedStats: AccountView["rankedStats"] } | null;
   flexProvenance?: RankProvenance | null;
   recentGames?: { champion: string; iconUrl: string; won: boolean }[];
+  flexRecentGames?: { champion: string; iconUrl: string; won: boolean }[];
   hasPassword: boolean;
   lol: LolRank;
   tft: TftRank;
