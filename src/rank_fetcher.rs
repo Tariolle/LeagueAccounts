@@ -144,7 +144,9 @@ impl RankFetcher {
         let mut current_set = None;
         let mut last_set: Option<serde_json::Value> = None;
         let mut malformed = false;
+        let mut saw_entry = false;
         for found in ENTRY.find_iter(decoded_payload) {
+            saw_entry = true;
             let Some(Ok(value)) =
                 serde_json::Deserializer::from_str(&decoded_payload[found.end()..])
                     .into_iter::<serde_json::Value>()
@@ -153,7 +155,11 @@ impl RankFetcher {
                 malformed = true;
                 continue;
             };
+            if value.is_null() {
+                continue;
+            }
             if !value.is_object() {
+                malformed = true;
                 continue;
             }
             let mut prefix_start = found.start().saturating_sub(80);
@@ -184,24 +190,32 @@ impl RankFetcher {
             }
         }
 
-        // No entry (or `"entry":null`) is a player without TFT history: Unranked.
-        // Only a truncated or unreadable entry is a parsing failure.
-        if current.is_none() && malformed {
+        // No entry (or `"entry":null`) is a player without ranked TFT history:
+        // Unranked. A truncated entry, or a page that has no entry token at
+        // all, cannot prove that and must not be reported as Unranked.
+        if current.is_none() && (malformed || !saw_entry) {
             return Err(Reason::ProfileMissing);
         }
         let mut rank = TftRank::default();
-        if let Some(ranked) = current.as_ref().map(|entry| &entry["RANKED_TFT"]) {
-            if let Some(tier) = ranked["tier"].as_str() {
-                let lp = ranked["leaguePoints"]
-                    .as_i64()
-                    .map(|lp| lp.to_string())
-                    .unwrap_or_default();
-                let (tier, division, lp) =
-                    self.normalize_rank(tier, ranked["rank"].as_str().unwrap_or_default(), &lp);
-                rank.tier = tier;
-                rank.division = division;
-                rank.lp = lp;
-            }
+        if let Some(ranked) = current
+            .as_ref()
+            .and_then(|entry| entry.get("RANKED_TFT"))
+            .filter(|ranked| !ranked.is_null())
+        {
+            let Some(tier) = ranked["tier"].as_str() else {
+                // An entry we cannot map to a standing is a parsing mismatch,
+                // not an unranked player.
+                return Err(Reason::ProfileMissing);
+            };
+            let lp = ranked["leaguePoints"]
+                .as_i64()
+                .map(|lp| lp.to_string())
+                .unwrap_or_default();
+            let (tier, division, lp) =
+                self.normalize_rank(tier, ranked["rank"].as_str().unwrap_or_default(), &lp);
+            rank.tier = tier;
+            rank.division = division;
+            rank.lp = lp;
         }
         rank.last_set = last_set
             .as_ref()
@@ -348,7 +362,7 @@ impl RankFetcher {
         }
 
         let soup = Html::parse_document(body);
-        let mut rank = self.parse_current_rank_from_opgg(&soup, &decoded_payload);
+        let mut rank = self.parse_current_rank_from_opgg(&soup, &decoded_payload)?;
         rank.level = self.parse_level_from_opgg(&soup, &decoded_payload);
         let (reached, finished) = self.parse_last_season_from_opgg(&decoded_payload);
         rank.reached_last_season = reached;
@@ -357,26 +371,35 @@ impl RankFetcher {
         Ok((rank, ProfileUpdate::parse(&decoded_payload)))
     }
 
-    pub fn parse_current_rank_from_opgg(&self, soup: &Html, decoded_payload: &str) -> RankInfo {
-        let mut tier = "Unranked".to_owned();
+    /// Read the current standing from the profile's own summary or `tier_info`.
+    ///
+    /// Three outcomes, deliberately kept apart: a ranked tier, an explicitly
+    /// unranked profile, and a payload we cannot read. The profile icon alone
+    /// only proves that the profile exists, so an unreadable payload is an
+    /// error that makes the caller keep the last known standing instead of
+    /// reporting an invented `Unranked`.
+    pub fn parse_current_rank_from_opgg(
+        &self,
+        soup: &Html,
+        decoded_payload: &str,
+    ) -> Result<RankInfo, Reason> {
+        let description = meta_description(soup);
+        let mut tier = None;
         let mut division = String::new();
         let mut lp = String::new();
 
-        if let Some(description) = meta_description(soup) {
-            if let Some((parsed_tier, parsed_division, parsed_lp)) =
-                self.parse_rank_text(&description)
-            {
-                tier = parsed_tier;
-                division = parsed_division;
-                lp = parsed_lp;
-            }
-        }
-
-        // OP.GG's Lv. description explicitly denotes an unranked profile.
-        // Never use another player's or a historical tier_info for that profile.
-        let explicitly_unranked = meta_description(soup)
-            .is_some_and(|text| text.contains(" / Lv. ") || text.contains(" / Unranked"));
-        if tier == "Unranked" && !explicitly_unranked {
+        if let Some((parsed_tier, parsed_division, parsed_lp)) = description
+            .as_deref()
+            .and_then(|text| self.parse_rank_text(text))
+        {
+            tier = Some(parsed_tier);
+            division = parsed_division;
+            lp = parsed_lp;
+        } else if is_explicitly_unranked(description.as_deref()) {
+            // OP.GG prints the level instead of a tier for unranked profiles.
+            // Never use another player's or a historical tier_info for them.
+            tier = Some("Unranked".to_owned());
+        } else {
             static TIER_INFO: LazyLock<Regex> = LazyLock::new(|| {
                 let pattern = r#""tier_info":\{"lp":(?P<lp>\d+),"tier":"(?P<tier>[A-Z_]+)","label":"(?P<label>[^"]+)"\}"#;
                 Regex::new(pattern).expect("valid OP.GG tier regex")
@@ -397,18 +420,21 @@ impl RankFetcher {
                         .map(|value| value.as_str())
                         .unwrap_or_default(),
                 );
-                tier = normalized_tier;
+                tier = Some(normalized_tier);
                 division = normalized_division;
                 lp = normalized_lp;
             }
         }
 
-        RankInfo {
+        let Some(tier) = tier else {
+            return Err(Reason::ProfileMissing);
+        };
+        Ok(RankInfo {
             tier,
             division,
             lp,
             ..RankInfo::default()
-        }
+        })
     }
 
     pub fn parse_level_from_opgg(&self, soup: &Html, decoded_payload: &str) -> String {
@@ -601,31 +627,17 @@ impl RankFetcher {
         }
     }
 
-    fn with_defaults(&self, rank: RankInfo) -> RankInfo {
-        RankInfo {
-            riot_id_not_found: rank.riot_id_not_found,
-            tier: if rank.tier.is_empty() {
-                "Unranked".to_owned()
-            } else {
-                rank.tier
-            },
-            division: rank.division,
-            lp: rank.lp,
-            level: rank.level,
-            reached_last_season: if rank.reached_last_season.is_empty() {
-                "Unranked".to_owned()
-            } else {
-                rank.reached_last_season
-            },
-            finished_last_season: if rank.finished_last_season.is_empty() {
-                "Unranked".to_owned()
-            } else {
-                rank.finished_last_season
-            },
-            tft: rank.tft,
-            provenance: rank.provenance,
-            tft_provenance: rank.tft_provenance,
+    /// Fill in the historical-season labels only. The current tier is never
+    /// defaulted here: the parser either found a standing or reported an error,
+    /// so an empty tier can no longer become an invented `Unranked`.
+    fn with_defaults(&self, mut rank: RankInfo) -> RankInfo {
+        if rank.reached_last_season.is_empty() {
+            rank.reached_last_season = "Unranked".to_owned();
         }
+        if rank.finished_last_season.is_empty() {
+            rank.finished_last_season = "Unranked".to_owned();
+        }
+        rank
     }
 }
 
@@ -678,6 +690,19 @@ fn meta_description(soup: &Html) -> Option<String> {
         .find_map(|element| element.value().attr("content").map(str::to_owned))
 }
 
+/// Whether OP.GG's summary states that this profile has no current tier.
+///
+/// Unranked summaries carry either the literal `Unranked` label or the
+/// account level where a ranked summary carries the tier (`Name#TAG / Lv. 83`).
+/// The level marker is the evidence; a merely unfamiliar summary is not.
+fn is_explicitly_unranked(description: Option<&str>) -> bool {
+    static UNRANKED: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\bUnranked\b|\b(?:lv\.?|level)\s*\d+\b")
+            .expect("valid unranked summary regex")
+    });
+    description.is_some_and(|text| UNRANKED.is_match(text))
+}
+
 fn title_case(value: &str) -> String {
     value
         .split_whitespace()
@@ -708,29 +733,40 @@ mod tests {
         let fetcher = RankFetcher::new();
         assert_eq!(
             fetcher.parse_current_rank_from_opgg(&soup, html_doc),
-            RankInfo {
+            Ok(RankInfo {
                 tier: "Challenger".into(),
                 division: String::new(),
                 lp: "1952".into(),
                 ..RankInfo::default()
-            }
+            })
         );
         assert_eq!(fetcher.parse_level_from_opgg(&soup, html_doc), "909");
     }
 
     #[test]
     fn parses_unranked_level_from_description() {
+        let fetcher = RankFetcher::new();
         let soup =
             Html::parse_document(r#"<meta name="description" content="Faker#T 1 / Lv. 71"/>"#);
-        let fetcher = RankFetcher::new();
         assert_eq!(
             fetcher.parse_current_rank_from_opgg(&soup, ""),
-            RankInfo {
+            Ok(RankInfo {
                 tier: "Unranked".into(),
                 ..RankInfo::default()
-            }
+            })
         );
         assert_eq!(fetcher.parse_level_from_opgg(&soup, ""), "71");
+    }
+
+    #[test]
+    fn profile_without_standing_evidence_is_a_parse_error_not_unranked() {
+        let soup = Html::parse_document(
+            r#"<img src="profile_icons/profileIcon6.jpg"/><div><span>83</span></div>"#,
+        );
+        assert_eq!(
+            RankFetcher::new().parse_current_rank_from_opgg(&soup, ""),
+            Err(Reason::ProfileMissing)
+        );
     }
 
     #[test]
