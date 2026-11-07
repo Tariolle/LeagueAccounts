@@ -218,7 +218,8 @@ fn download_and_swap(app: &AppHandle, job: &Install) -> Result<(), (Event, Updat
     logging::record(Event::UpdateDownloaded, Reason::None);
     updates::verify_file(&job.paths.staged, &job.download.sha256)
         .map_err(|error| (Event::UpdateVerificationFailed, error))?;
-    self_update::swap(&job.paths).map_err(|error| failed(error.into()))
+    let target = updater.status().release.ok_or_else(|| failed(UpdateError::from(std::io::Error::other("missing update target"))))?;
+    self_update::swap(&job.paths, &target.version).map_err(|error| failed(error.into()))
 }
 
 /// While automatic updates are on, check right away at launch and then every
@@ -265,8 +266,7 @@ pub fn check_now(app: AppHandle, shared: Arc<Shared>) -> CommandResult<UpdateSta
 
 /// No login, rank refresh or match in progress (the UI checks its own dialogs).
 pub fn idle(shared: &Shared) -> bool {
-    let refreshing = shared.refresh_running.lock().map(|running| *running).unwrap_or(true);
-    !refreshing && !shared.login.is_running() && !leagueaccounts::riot_client::in_game()
+    !shared.login.has_refreshes() && !shared.login.is_running() && !leagueaccounts::riot_client::in_game()
 }
 
 /// Exit and start the installed version, unless a login or refresh is running.
@@ -275,7 +275,7 @@ pub fn restart(app: &AppHandle, shared: &Shared) -> CommandResult<()> {
     if updater.status().phase != Phase::Ready {
         return Err(fail("update_not_ready"));
     }
-    if shared.refresh_running.lock().map(|running| *running).unwrap_or(true) {
+    if shared.login.has_refreshes() {
         return Err(fail("refresh_running"));
     }
     if !shared.login.close_if_idle() {
@@ -285,10 +285,9 @@ pub fn restart(app: &AppHandle, shared: &Shared) -> CommandResult<()> {
     let minimized = app.get_webview_window("main").is_some_and(|window| {
         window.is_minimized().unwrap_or(false) || !window.is_focused().unwrap_or(true)
     });
-    let version = updater.status().release.map(|release| release.version).unwrap_or_default();
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     *updater.restart.lock().unwrap_or_else(|error| error.into_inner()) =
-        Some(self_update::restart_args(&args, std::process::id(), &version, minimized));
+        Some(self_update::restart_args(&args, std::process::id(), minimized));
     updater.set(app, |status| status.phase = Phase::Restarting);
     app.exit(0);
     Ok(())
@@ -337,7 +336,7 @@ pub fn finish_previous_update() {
 /// The release this process was installed for, if this build reports an older
 /// version: installing it again would restart into the same build forever.
 pub fn mislabeled_release() -> Option<String> {
-    self_update::installed_release(&std::env::args_os().collect::<Vec<_>>())
+    self_update::installed_target(&Paths::current()?)
         .filter(|release| updates::is_newer(release, env!("CARGO_PKG_VERSION")))
 }
 
