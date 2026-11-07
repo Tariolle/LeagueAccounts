@@ -87,21 +87,78 @@ fn explicit_unranked_description_ignores_other_players_and_history_ranks() {
 }
 
 #[test]
-fn unranked_profile_survives_description_wording_changes() {
-    // The profile icon is the guard against challenge pages; an unfamiliar
-    // description must not turn a real unranked profile into an error.
-    let body = r#"<meta name="description" content="Player#EUW - Level 83"><img src="profile_icons/profileIcon6.jpg">"#;
-    let info = RankFetcher::new().parse_profile(body).unwrap();
-    assert_eq!(info.tier, "Unranked");
+fn unranked_requires_the_profiles_own_summary_evidence() {
+    // Level wording may vary, but the level marker must be there: the profile
+    // icon and a level badge only prove that the profile exists.
+    for description in [
+        "Player#EUW - Level 83",
+        "Player#EUW / Lv. 83",
+        "Player#EUW / Unranked",
+    ] {
+        let body = format!(
+            r#"<meta name="description" content="{description}"><img src="profile_icons/profileIcon6.jpg">"#
+        );
+        assert_eq!(
+            RankFetcher::new().parse_profile(&body).unwrap().tier,
+            "Unranked",
+            "{description}"
+        );
+    }
+    // A profile without any standing evidence is a parsing failure, not an
+    // unranked player, so a refresh never invents a standing.
+    for body in [
+        r#"<img src="profile_icons/profileIcon6.jpg"><div><span>83</span></div>"#,
+        r#"<meta name="description" content="Player#EUW"><img src="profile_icons/profileIcon6.jpg">"#,
+    ] {
+        assert!(
+            RankFetcher::new().parse_profile(body).is_err(),
+            "{body}"
+        );
+    }
 }
 
 #[test]
-fn tft_profile_without_history_is_unranked_not_error() {
+fn unrecognized_profile_keeps_the_stored_standing_instead_of_unranked() {
+    use leagueaccounts::models::{Account, RankInfo};
+    let body = r#"<meta name="description" content="Player#EUW"><img src="profile_icons/profileIcon6.jpg">"#;
+    assert!(RankFetcher::new().parse_profile(body).is_err());
+    let mut account = Account {
+        tier: "Diamond".into(),
+        division: "II".into(),
+        lp: "57".into(),
+        ..Default::default()
+    };
+    RankInfo::error().apply_to(&mut account);
+    assert_eq!(
+        (
+            account.tier.as_str(),
+            account.division.as_str(),
+            account.lp.as_str()
+        ),
+        ("Diamond", "II", "57")
+    );
+}
+
+#[test]
+fn tft_unranked_needs_an_visible_entry_and_unreadable_entries_error() {
     let fetcher = RankFetcher::new();
-    for payload in ["profile_icons/profileIcon6.jpg", r#"{"entry":null}"#] {
+    // `"entry":null` and a null ranked block are OP.GG's unranked shapes.
+    for payload in [r#"{"entry":null}"#, r#"{"entry":{"RANKED_TFT":null}}"#] {
         let tft = fetcher.parse_tft_from_opgg(payload);
         assert_eq!(tft.tier, "Unranked", "{payload}");
         assert_eq!(tft.last_set, "Unranked", "{payload}");
+    }
+    // A page without an entry token, or an entry whose ranked block cannot be
+    // read, proves nothing about the standing.
+    for payload in [
+        "profile_icons/profileIcon6.jpg",
+        r#"{"entry":{"RANKED_TFT":{"tftSetCoreName":"TFTSet18"}}}"#,
+    ] {
+        assert_eq!(
+            fetcher.parse_tft_from_opgg(payload).tier,
+            "Error",
+            "{payload}"
+        );
     }
 }
 

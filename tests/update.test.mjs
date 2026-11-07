@@ -48,6 +48,43 @@ test("automatic updates: launch screen, idle restart and download fallback", { t
       }
     });
 
+    await t.test("a slow cold start still catches the launch check before revealing the app", async () => {
+      const page = await launch("slow-update");
+      try {
+        await page.waitForSelector("#startup-loader .update-screen", { timeout: 10000 });
+        assert.equal(await page.$("body.ready"), null);
+        const first = await progress(page);
+        await page.waitForFunction(start => Number(document.querySelector(".update-meter").getAttribute("aria-valuenow")) > start, {}, first);
+        assert.match(await page.$eval(".update-screen-detail", el => el.textContent), /^\d+\.\d \/ 14\.0 MB$/);
+      } finally {
+        await page.close();
+      }
+    });
+
+    await t.test("a launch check that outlives the loading screen shows progress in the app", async () => {
+      const page = await launch("late-update");
+      try {
+        await page.waitForSelector("body.ready #accounts > .card", { timeout: 10000 });
+        assert.equal(await page.$("#startup-loader"), null);
+        await page.waitForSelector(".update-banner[data-update-progress]", { timeout: 10000 });
+        assert.match(await page.$eval("[data-update-progress]", el => el.textContent), /Downloading version 3\.1\.0/);
+        const first = await progress(page);
+        await page.waitForFunction(start => Number(document.querySelector(".update-banner .update-meter").getAttribute("aria-valuenow")) > start, {}, first);
+        // The banner body is status text: only its close button dismisses it.
+        const body = await page.$(".update-banner .update-body strong");
+        assert.notEqual(body, null);
+        await body.click();
+        assert.notEqual(await page.$(".update-banner[data-update-progress]"), null);
+        await page.click('button[data-update-progress="close"]');
+        await page.waitForSelector(".update-banner[data-update-progress]", { hidden: true });
+        await page.waitForSelector('[data-update-notice]', { timeout: 15000 });
+        assert.equal(await page.$('.update-banner[data-update-progress]'), null);
+        await page.click('[data-update-notice] [data-update="later"]');
+      } finally {
+        await page.close();
+      }
+    });
+
     await t.test("continuing in the background shows the app and asks before restarting", async () => {
       const page = await launch("updating");
       try {

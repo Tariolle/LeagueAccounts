@@ -262,6 +262,13 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
     await t.test("login progress follows completed steps without video or audio", async () => {
       await open("login");
       await page.waitForSelector(".login-overlay");
+      await page.waitForSelector(".login-update:not([hidden])");
+      const update = await page.$eval(".login-update", el => ({
+        percent: el.querySelector(".login-update-percent").textContent,
+        eta: el.querySelector(".login-update-eta").textContent,
+      }));
+      assert.match(update.percent, /\d+%$/);
+      assert.match(update.eta, /\d+:\d{2}/);
       assert.equal(await page.$$eval("video,audio", els => els.length), 0);
       await page.waitForFunction(() => Number(document.querySelector('[role="progressbar"]').getAttribute("aria-valuenow")) > 0);
       const progress = await page.$eval('[role="progressbar"]', el => ({
@@ -276,9 +283,61 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
       assert.equal(progress.current, progress.label);
       await page.waitForSelector(".login-overlay.is-success", { timeout: 15000 });
       assert.equal(await page.$$eval("video,audio", els => els.length), 0);
+      assert.equal(await page.$eval(".login-update", el => el.hidden), true);
       assert.equal(await page.$eval('[role="progressbar"]', el => el.getAttribute("aria-valuenow") === el.getAttribute("aria-valuemax")), true);
       await page.click('[data-login="close"]');
       await page.waitForSelector(".login-overlay", { hidden: true });
+    });
+    await t.test("a second patch replaces old progress and stays active until launch resumes", async () => {
+      await open();
+      const frames = await page.evaluate(async () => {
+        const { openLoginOverlay } = await import('/src/login.ts');
+        const overlay = openLoginOverlay({
+          account: { name: "Patch Tester", accountId: "patch-tester" },
+          tier: "Gold", viaRiot: true, closeLeague: false, launchGame: true,
+          onCancel() {},
+        });
+        const snapshot = () => {
+          const dialog = document.querySelector('.login-overlay');
+          const line = dialog.querySelector('.login-update');
+          const bar = dialog.querySelector('.login-progress');
+          return {
+            hidden: line.hidden || getComputedStyle(line).display === 'none',
+            percent: line.querySelector('.login-update-percent').textContent,
+            eta: line.querySelector('.login-update-eta').textContent,
+            active: [...dialog.querySelectorAll('.login-steps .active')].map(row => row.dataset.step),
+            label: dialog.querySelector('[data-step="launchGame"] .step-label').textContent,
+            current: bar.getAttribute('aria-valuetext'),
+            resolved: Number(bar.getAttribute('aria-valuenow')),
+          };
+        };
+        const frames = [];
+        for (const progress of [{ percent: 82, remainingMs: 42000 }, { percent: 17, remainingMs: 96000 }]) {
+          overlay.step('updating');
+          overlay.update(progress);
+          frames.push(snapshot());
+          overlay.step('launchGame');
+          overlay.update(null);
+          frames.push(snapshot());
+        }
+        overlay.close();
+        return frames;
+      });
+      assert.match(frames[0].percent, /82%$/);
+      assert.match(frames[0].eta, /0:42/);
+      assert.match(frames[2].percent, /17%$/);
+      assert.match(frames[2].eta, /1:36/);
+      for (const index of [0, 2]) {
+        assert.equal(frames[index].hidden, false);
+        assert.deepEqual(frames[index].active, ['launchGame']);
+        assert.equal(frames[index].current, frames[index].label);
+        assert.equal(frames[index].resolved, frames[0].resolved);
+      }
+      for (const index of [1, 3]) {
+        assert.equal(frames[index].hidden, true);
+        assert.equal(frames[index].current, frames[index].label);
+        assert.notEqual(frames[index].label, frames[index - 1].label);
+      }
     });
     await t.test("logging in anyway to a banned account launches the game", async () => {
       await open("banned");
@@ -367,6 +426,67 @@ test("account collection, client frames and silent motion", { timeout: 180000 },
       await page.waitForSelector("#schedule.running");
       await page.waitForSelector("#schedule:not(.running)", { timeout: 60000 });
       assert.equal(await page.$(".toast"), null);
+    });
+    await t.test("keyboard focus selects the actual account and void commands report success", async () => {
+      await open();
+      const target = await page.$eval('#accounts > .card:nth-child(2)', card => card.dataset.key);
+      await page.$eval('#accounts > .card:nth-child(2)', card => card.focus());
+      assert.equal(await page.$eval('#accounts > .selected', card => card.dataset.key), target);
+      await page.keyboard.press("Delete");
+      await page.waitForSelector('.modal [data-value="cancel"]');
+      assert.equal(await page.$eval('.modal [data-value="cancel"]', button => button === document.activeElement), true);
+      await page.keyboard.press("Enter");
+      await page.waitForSelector('.modal', { hidden: true });
+      assert.equal(await count(), 11);
+      await page.evaluate(async () => {
+        const { api } = await import('/src/api.ts');
+        window.__copiedId = null;
+        api.copyAccountId = async copied => { window.__copiedId = copied; };
+      });
+      await page.keyboard.down("Control");
+      await page.keyboard.press("c");
+      await page.keyboard.up("Control");
+      await page.waitForFunction(() => window.__copiedId !== null);
+      assert.equal(await page.evaluate(() => `${window.__copiedId.region}:${window.__copiedId.accountId}`), target);
+      await page.waitForFunction(() => [...document.querySelectorAll('.toast')].some(toast => /copied/i.test(toast.textContent)));
+      await page.keyboard.press("Delete");
+      await page.waitForSelector('.modal [data-value="delete"]');
+      await page.click('.modal [data-value="delete"]');
+      await page.waitForFunction(key => ![...document.querySelectorAll('#accounts > .card')].some(card => card.dataset.key === key), {}, target);
+      assert.equal(await count(), 10);
+    });
+    await t.test("a pending modal save cannot be duplicated or dismissed and failures allow retry", async () => {
+      await open();
+      await page.evaluate(async () => {
+        const { api, ApiError } = await import('/src/api.ts');
+        const save = api.updateAccount;
+        window.__saveCalls = 0;
+        api.updateAccount = async (key, input) => {
+          window.__saveCalls++;
+          if (window.__saveCalls === 1) {
+            await new Promise(resolve => { window.__finishSave = resolve; });
+            throw new ApiError('save_failed');
+          }
+          return save(key, input);
+        };
+      });
+      await page.click('#accounts > .card:first-child [data-act="menu"]');
+      await page.click('aria/Edit');
+      await page.waitForSelector('.modal [name="description"]');
+      await page.$eval('.modal [name="description"]', input => { input.value = "Committed only once"; });
+      await page.click('.modal [data-value="save"]');
+      await page.waitForFunction(() => window.__saveCalls === 1);
+      await page.keyboard.press("Enter");
+      await page.keyboard.press("Escape");
+      assert.notEqual(await page.$('.modal'), null);
+      assert.equal(await page.evaluate(() => window.__saveCalls), 1);
+      await page.evaluate(() => window.__finishSave());
+      await page.waitForFunction(() => !document.querySelector('.modal [data-value="save"]').disabled);
+      assert.doesNotMatch(await text('#accounts'), /Committed only once/);
+      await page.click('.modal [data-value="save"]');
+      await page.waitForSelector('.modal', { hidden: true });
+      assert.equal(await page.evaluate(() => window.__saveCalls), 2);
+      assert.match(await text('#accounts'), /Committed only once/);
     });
     assert.deepEqual(errors, []);
   } finally {

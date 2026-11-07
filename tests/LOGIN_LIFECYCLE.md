@@ -37,6 +37,20 @@ they do not read saved credentials, contact Riot, or terminate installed games.
   Riot's own window sends after sign-in), that the launch waits until Riot
   reports the new region, and that a region that never applies fails with
   `riot_region_failed`.
+- `src/riot_client.rs` checks updates and repairs throughout game launch and
+  login confirmation, including another patch after an accepted or pending
+  launch. `NeedsRepair` and `OutOfDate` still initiate manual patching;
+  `Repairing` and `Updating` keep reporting progress without repeating launch
+  requests. Patch waiting does not spend ordinary launch attempts; a confirmed
+  patch completion restores a full game-start window, while an unreadable API
+  does not reset it. Neither
+  unchanged byte counters with an advancing percentage nor a completed
+  progress sample cause a false stall. Cancellation and account changes are
+  checked while patching. Four minutes without byte or percentage progress,
+  or thirty minutes of total patch waiting, ends with `game_launch_failed`.
+- `tests/ui.test.mjs` checks a second patch with a lower percentage and longer
+  ETA: it replaces the old values, keeps the launch row active, and hides the
+  patch progress when launching resumes.
 - `tests/riot_renderer.test.mjs` runs the production renderer helper against a
   dummy native form. It checks rejection after MFA resets the form, terminal
   errors while a CAPTCHA remains visible, pending challenges, and success.
@@ -87,6 +101,13 @@ expressions, or renderer command lines while inspecting these cases.
    must sign in each time without "An unexpected error occurred while logging
    in", and `GET /riotclient/region-locale` must report the launched account's
    region.
+9. Start with a different installed game language and select `zh_CN` for the
+   account. Region selection must precede language selection and the first
+   launch request. If Riot moves through `NeedsRepair`, `Repairing`, or
+   `OutOfDate` between downloads, progress must stay in the updating phase.
+   After a patch finishes, verify another update during login confirmation is
+   reported before success, even if the game process has appeared. Confirm
+   the final language remains `zh_CN`; do not substitute `zh_MY` in this check.
 
 The automated dummy-process tests are not a substitute for these installed-client
 checks: Riot's native renderer and authentication UI are undocumented interfaces.
