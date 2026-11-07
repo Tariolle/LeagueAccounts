@@ -53,6 +53,27 @@ pub enum LoginOutcome {
     AlreadySignedIn,
 }
 
+/// How far the update that blocks a launch has progressed.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProgress {
+    /// Share of the update already applied, 0-100, when Riot reports it.
+    pub percent: Option<f32>,
+    /// Riot's estimate of the time left, when it reports one.
+    pub remaining_ms: Option<u64>,
+}
+
+/// A progress sample plus the work it reports, used to tell a stalled update
+/// from a running one. Bytes move during phases where the percentage does not.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct UpdateSnapshot {
+    updating: bool,
+    /// Queued/manual patches need a launch request; active jobs only need polling.
+    needs_launch: bool,
+    progress: UpdateProgress,
+    work: u64,
+}
+
 /// Progress reported to the UI while signing in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoginStep {
@@ -249,30 +270,6 @@ pub fn game_installed(game: Game) -> bool {
         .exists()
 }
 
-/// Whether the client has an update for the product that it must download or
-/// install before the game can start.
-///
-/// The client writes this file for the game's integration (it passes the path
-/// as `app-update-status`), so it also describes what the Play button waits
-/// for. A missing or unreadable file is not an update.
-pub fn update_pending(game: Game) -> bool {
-    let path = program_data()
-        .join(r"Riot Games\Metadata")
-        .join(format!("{}.live.update-status.json", game.product()));
-    std::fs::read_to_string(path).is_ok_and(|text| update_reported(&text))
-}
-
-/// `true` when the update-status document reports work the client has to do
-/// before the game can start.
-fn update_reported(text: &str) -> bool {
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
-        return false;
-    };
-    ["updateAvailable", "updateRequired"]
-        .iter()
-        .any(|key| json["status"][*key].as_bool() == Some(true))
-}
-
 /// Riot's per-product locale resource for the live patchline.
 fn product_locale_path(game: Game) -> String {
     format!(
@@ -287,11 +284,31 @@ fn product_locale_path(game: Game) -> String {
 fn launch_game(
     game: Game,
     account_id: &str,
+    locale: Option<&str>,
     progress: &mut dyn FnMut(LoginStep),
+    on_update: &mut dyn FnMut(Option<UpdateProgress>),
     cancel: &AtomicBool,
 ) -> Result<(), LoginError> {
-    let mut reported_update: Option<bool> = None;
-    launch_game_with(
+    // The patch belongs to the launch row: while it runs, the row is renamed
+    // and carries its percentage instead of a second step appearing.
+    let mut reported_step: Option<bool> = None;
+    let mut reported_progress: Option<UpdateProgress> = None;
+    let mut report = |update: Option<UpdateProgress>| {
+        let updating = update.is_some();
+        if reported_step != Some(updating) {
+            progress(if updating {
+                LoginStep::Updating
+            } else {
+                LoginStep::LaunchGame
+            });
+            reported_step = Some(updating);
+        }
+        if reported_progress != update {
+            on_update(update);
+            reported_progress = update;
+        }
+    };
+    let result = launch_game_with(
         account_id,
         cancel,
         status,
@@ -310,21 +327,33 @@ fn launch_game(
             api.follow_league_region(REGION_TIMEOUT, cancel)?;
             Ok(api.launch(game))
         },
+        || LocalApi::read().and_then(|api| api.update_progress(game)),
+        &mut report,
         || {
-            // A game that is being patched is not launched yet; say so instead
-            // of leaving the last step on "launching" for minutes.
-            let updating = update_pending(game);
-            if reported_update != Some(updating) {
-                progress(if updating {
-                    LoginStep::Updating
-                } else {
-                    LoginStep::LaunchGame
-                });
-                reported_update = Some(updating);
+            // The client rewrites the product settings from its own metadata
+            // a few seconds after it starts, which can undo the locale the
+            // login applied and put the region default back before the game
+            // process is spawned. One attempt per tick, so a client that is
+            // still starting never blocks the loop.
+            if let Some(locale) = locale {
+                ensure_locale(game, locale);
             }
             thread::sleep(Duration::from_secs(1));
         },
-    )
+    );
+
+    if result.is_ok() {
+        if let Some(locale) = locale {
+            // The launch was confirmed; record whether the client kept the
+            // language the account asked for.
+            if let Some(current) = LocalApi::read().and_then(|api| api.product_locale(game)) {
+                if current != locale {
+                    logging::record(Event::LoginProgress, Reason::LocaleRejected);
+                }
+            }
+        }
+    }
+    result
 }
 
 /// Riot answers a launch request only once the game process exists, which
@@ -335,6 +364,9 @@ enum Launch {
     /// No answer yet; Riot keeps launching after the request times out and
     /// answers repeated requests with "already launched".
     Pending,
+    /// Riot answered 424: the product is not up to date and it patches it
+    /// before a launch can be accepted.
+    Updating,
     Rejected,
 }
 
@@ -343,20 +375,37 @@ fn launch_game_with(
     cancel: &AtomicBool,
     mut observe: impl FnMut() -> GameStatus,
     mut request: impl FnMut() -> Result<Launch, LoginError>,
+    mut update: impl FnMut() -> Option<UpdateSnapshot>,
+    report: &mut dyn FnMut(Option<UpdateProgress>),
     mut wait: impl FnMut(),
 ) -> Result<(), LoginError> {
     let mut requested = false;
+    let mut blocked = false;
+    let mut attempts = 0;
+    let mut update_ticks = 0;
+    let mut stalled = 0;
+    let mut work = None;
     let mut diagnostics = LoginDiagnostics::default();
-    for attempt in 0..40 {
+    while attempts < ATTEMPTS {
         check_cancelled(cancel)?;
         let current = observe();
         check_cancelled(cancel)?;
-        if launch_confirmed(&current, account_id)? {
+        let confirmed = launch_confirmed(&current, account_id)?;
+        // Keep checking after each patch and during login confirmation. Even
+        // an observed game process must not hide a newly active patch.
+        let snapshot = update();
+        if blocked && snapshot.is_some_and(|snapshot| !snapshot.updating) {
+            // A late language patch must still leave the game a full startup
+            // window. An unavailable API alone cannot reset that deadline.
+            attempts = 0;
+            blocked = false;
+        }
+        let snapshot = snapshot.filter(|snapshot| snapshot.updating);
+        check_cancelled(cancel)?;
+        if confirmed && snapshot.is_none() {
+            report(None);
             return Ok(());
         }
-        // Never launch through a restored or newly changed Riot session.
-        // An existing game with an unreadable identity must become observable
-        // before it can count as success; do not launch another copy over it.
         let mut reason = if current.league_running() {
             Reason::GameIdentityPending
         } else if current.signed_in_as(account_id) {
@@ -364,23 +413,80 @@ fn launch_game_with(
         } else {
             Reason::AuthUnavailable
         };
+        if snapshot.is_some() {
+            // Resume after a patch even when Riot previously accepted a launch.
+            requested = false;
+            blocked = true;
+        }
         if !requested
+            && snapshot.is_none_or(|snapshot| snapshot.needs_launch)
             && !current.league_running()
             && current.signed_in_as(account_id)
-            && attempt % 2 == 0
+            && if blocked {
+                update_ticks % UPDATE_RETRY_TICKS == 0
+            } else {
+                attempts % 2 == 0
+            }
         {
             match request()? {
-                Launch::Accepted => requested = true,
-                Launch::Pending => reason = Reason::LaunchPending,
-                Launch::Rejected => reason = Reason::LaunchRejected,
+                Launch::Accepted => {
+                    requested = true;
+                    blocked = snapshot.is_some();
+                }
+                Launch::Pending => {
+                    blocked = snapshot.is_some();
+                    reason = Reason::LaunchPending;
+                }
+                Launch::Updating => blocked = true,
+                Launch::Rejected => {
+                    blocked = snapshot.is_some();
+                    reason = Reason::LaunchRejected;
+                }
             }
         }
-        diagnostics.waiting(reason);
+        if blocked {
+            let progress = snapshot.map(|snapshot| snapshot.progress).unwrap_or(UpdateProgress {
+                percent: None,
+                remaining_ms: None,
+            });
+            report(Some(progress));
+            if let Some(snapshot) = snapshot {
+                let current_work = (snapshot.work, snapshot.progress.percent);
+                if work == Some(current_work) {
+                    stalled += 1;
+                } else {
+                    stalled = 0;
+                    work = Some(current_work);
+                }
+            }
+            diagnostics.waiting(Reason::Updating);
+            update_ticks += 1;
+            if update_ticks >= UPDATE_TICKS || stalled >= UPDATE_STALL_TICKS {
+                report(None);
+                diagnostics.waiting(Reason::UpdateFailed);
+                return Err(LoginError::GameLaunchFailed);
+            }
+        } else {
+            report(None);
+            stalled = 0;
+            work = None;
+            diagnostics.waiting(reason);
+            attempts += 1;
+        }
         wait();
     }
     check_cancelled(cancel)?;
     Err(LoginError::GameLaunchFailed)
 }
+
+/// Launch attempts that are not spent waiting for an update.
+const ATTEMPTS: u32 = 40;
+/// One tick per second: at most 30 minutes of patch waiting per launch.
+const UPDATE_TICKS: u32 = 1_800;
+/// Ticks with neither byte nor percentage progress: the patch is stuck.
+const UPDATE_STALL_TICKS: u32 = 240;
+/// Retry a blocked launch when the patch API has no active state to report.
+const UPDATE_RETRY_TICKS: u32 = 3;
 
 fn launch_confirmed(current: &GameStatus, account_id: &str) -> Result<bool, LoginError> {
     let different = |name: &Option<String>| {
@@ -406,17 +512,27 @@ fn start_game(
     account_id: &str,
     locale: Option<&str>,
     progress: &mut dyn FnMut(LoginStep),
+    on_update: &mut dyn FnMut(Option<UpdateProgress>),
     cancel: &AtomicBool,
 ) -> Result<(), LoginError> {
+    // Region changes can rebuild product metadata. Set the account's region
+    // before its language, so the first launch patches the intended locale.
+    check_cancelled(cancel)?;
+    if let Some(api) = LocalApi::read().filter(|api| api.session() == Session::SignedIn) {
+        if api.username().is_some_and(|name| !name.eq_ignore_ascii_case(account_id)) {
+            return Err(LoginError::AccountMismatch);
+        }
+        api.follow_league_region(REGION_TIMEOUT, cancel)?;
+    }
     if let Some(locale) = locale {
         apply_locale(game, locale, cancel);
     }
-    let launched = match launch_game(game, account_id, progress, cancel) {
+    let launched = match launch_game(game, account_id, locale, progress, on_update, cancel) {
         Err(LoginError::GameLaunchFailed) if game == Game::Tft => {
             if let Some(locale) = locale {
                 apply_locale(Game::League, locale, cancel);
             }
-            launch_game(Game::League, account_id, progress, cancel)
+            launch_game(Game::League, account_id, locale, progress, on_update, cancel)
         }
         result => result,
     };
@@ -469,6 +585,30 @@ fn apply_locale(game: Game, locale: &str, cancel: &AtomicBool) {
             (false, false) => Reason::LocaleUnavailable,
         },
     );
+}
+
+/// Put the locale back after the client rewrote it from its own metadata.
+///
+/// One attempt per call: the launch loop ticks about once a second, so a
+/// client that is still starting is retried there instead of blocking here.
+/// The settings file is brought in step as well — the client's own rewrite
+/// drops `zh_CN` from `available_locales`, and the launcher reads that list
+/// when it builds the game's `--locale=`. The write is skipped when nothing
+/// changed.
+fn ensure_locale(game: Game, locale: &str) -> bool {
+    let Some(api) = LocalApi::read() else {
+        return false;
+    };
+    if api.product_locale(game).as_deref() != Some(locale)
+        && !(api.set_product_locale(game, locale)
+            && api.product_locale(game).as_deref() == Some(locale))
+    {
+        return false;
+    }
+    if let Some(path) = crate::game_locale::settings_file(game.product()) {
+        crate::game_locale::write(&path, locale);
+    }
+    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -674,9 +814,47 @@ impl LocalApi {
             Ok(response) if response.status().is_success() || response.status() == 423 => {
                 Launch::Accepted
             }
+            // 424: the product is not up to date; Riot patches it before it
+            // can launch, and accepts a new request once the patch is done.
+            Ok(response) if response.status().as_u16() == 424 => Launch::Updating,
             Err(error) if error.is_timeout() => Launch::Pending,
             _ => Launch::Rejected,
         }
+    }
+
+    /// How far the update that keeps `game` from launching has progressed.
+    /// Riot reports a zero estimate until it knows how long the rest takes.
+    fn update_progress(&self, game: Game) -> Option<UpdateSnapshot> {
+        let (status, body) = self.get(&format!(
+            "/patch-proxy/v2/patch-states/products/{}/patchlines/live",
+            game.product()
+        ))?;
+        if status != 200 {
+            return None;
+        }
+        let progress = &body["progress"];
+        let percent = progress["overallProgress"]
+            .as_f64()
+            .map(|value| (value.clamp(0.0, 100.0) * 10.0).round() as f32 / 10.0);
+        let remaining_ms = progress["totalTimeRemainingMs"]
+            .as_u64()
+            .filter(|ms| *ms > 0)
+            .map(|ms| ms / 1000 * 1000);
+        let work = ["totalBytesDone", "totalBytesWritten", "totalBytesDownloaded"]
+            .iter()
+            .filter_map(|key| progress[*key].as_u64())
+            .sum();
+        let state = body["state"].as_str();
+        let needs_launch = matches!(state, Some("OutOfDate" | "NeedsRepair"));
+        Some(UpdateSnapshot {
+            updating: needs_launch || matches!(state, Some("Updating" | "Repairing")),
+            needs_launch,
+            progress: UpdateProgress {
+                percent,
+                remaining_ms,
+            },
+            work,
+        })
     }
 
     /// Read the product locale the client will launch `game` with.
@@ -1054,6 +1232,21 @@ fn wait_for_riot_id_with(
     None
 }
 
+/// Whether a game client exists; does not perform local API requests.
+pub fn game_client_running() -> bool {
+    running_processes().iter().any(|process| {
+        matches!(process.name.as_str(), "leagueclient.exe" | "tftclient.exe")
+    })
+}
+
+/// Only adopt profile metadata from a game session for this account.
+pub fn signed_in_riot_id_for(account_id: &str) -> Option<String> {
+    let processes = running_processes();
+    let username = game_username(&processes)?;
+    if !username.eq_ignore_ascii_case(account_id) { return None; }
+    riot_id_from_processes(&processes)
+}
+
 fn riot_id_from_processes(processes: &[Process]) -> Option<String> {
     let mut riot_id: Option<String> = None;
     for process in processes
@@ -1188,6 +1381,7 @@ pub fn login(
     password: &str,
     options: LaunchOptions<'_>,
     progress: &mut dyn FnMut(LoginStep),
+    on_update: &mut dyn FnMut(Option<UpdateProgress>),
     on_ban: &mut dyn FnMut(Option<Ban>) -> bool,
     cancel: &AtomicBool,
 ) -> Result<LoginOutcome, LoginError> {
@@ -1240,7 +1434,7 @@ pub fn login(
                                 await_product_context(&mut client, progress, cancel)?;
                             }
                             progress(LoginStep::LaunchGame);
-                            start_game(game, account_id, locale, progress, cancel)?;
+                            start_game(game, account_id, locale, progress, on_update, cancel)?;
                         }
                         progress(LoginStep::Done);
                         return Ok(LoginOutcome::AlreadySignedIn);
@@ -1283,7 +1477,7 @@ pub fn login(
         client.close_debugger()?;
         check_cancelled(cancel)?;
         progress(LoginStep::LaunchGame);
-        start_game(game, account_id, locale, progress, cancel)?;
+        start_game(game, account_id, locale, progress, on_update, cancel)?;
         client.replaced_by_game();
     } else {
         // No launch now, but the next manual start should already be in the
@@ -1403,7 +1597,7 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     #[test]
     fn riot_id_discovery_stops_when_cancelled_before_or_during_a_read() {
@@ -1873,13 +2067,26 @@ mod tests {
     fn serve_local_api(
         exchanges: Vec<(&'static str, String)>,
     ) -> (LocalApi, thread::JoinHandle<Vec<String>>) {
+        serve_local_api_with(
+            exchanges
+                .into_iter()
+                .map(|(request, body)| (request, 200, body))
+                .collect(),
+        )
+    }
+
+    /// Answers each request with the next status and body, and returns the
+    /// bodies sent.
+    fn serve_local_api_with(
+        exchanges: Vec<(&'static str, u16, String)>,
+    ) -> (LocalApi, thread::JoinHandle<Vec<String>>) {
         use std::io::{BufRead, Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let mut requests = Vec::new();
-            for (request, body) in exchanges {
+            for (request, status, body) in exchanges {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1906,7 +2113,7 @@ mod tests {
                 requests.push(String::from_utf8(sent).unwrap());
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 )
                 .unwrap();
@@ -2050,6 +2257,8 @@ mod tests {
                     requests.set(requests.get() + 1);
                     Ok(Launch::Accepted)
                 },
+                || None,
+                &mut |_| {},
                 || {},
             );
             assert_eq!(result, expected);
@@ -2082,6 +2291,8 @@ mod tests {
                         Launch::Accepted
                     })
                 },
+                || None,
+                &mut |_| {},
                 || {},
             );
             assert_eq!(result, Ok(()));
@@ -2102,6 +2313,8 @@ mod tests {
                 }
             },
             || panic!("must not launch after cancellation"),
+            || None,
+            &mut |_| {},
             || {},
         );
         assert_eq!(result, Err(LoginError::Cancelled));
@@ -2117,6 +2330,8 @@ mod tests {
                 ..GameStatus::default()
             },
             || panic!("must not launch over another account"),
+            || None,
+            &mut |_| {},
             || {},
         );
         assert_eq!(result, Err(LoginError::AccountMismatch));
@@ -2245,17 +2460,365 @@ mod tests {
     }
 
     #[test]
-    fn update_status_reports_only_work_the_client_must_finish_first() {
-        assert!(!update_reported(
-            r#"{"productSessionId":"x","status":{"updateAvailable":false,"updateRequired":false}}"#
-        ));
-        assert!(update_reported(r#"{"status":{"updateAvailable":true}}"#));
-        assert!(update_reported(r#"{"status":{"updateRequired":true}}"#));
-        // Missing, malformed or foreign documents are not an update.
-        assert!(!update_reported(""));
-        assert!(!update_reported("not json"));
-        assert!(!update_reported(r#"{"status":{}}"#));
-        assert!(!update_reported(r#"{"status":{"updateAvailable":"true"}}"#));
+    fn a_blocked_launch_is_not_a_failure_and_reports_the_patch() {
+        let polls = Cell::new(0);
+        let requests = Cell::new(0);
+        let reported = RefCell::new(Vec::new());
+        let result = launch_game_with(
+            "selected",
+            &AtomicBool::new(false),
+            || {
+                polls.set(polls.get() + 1);
+                GameStatus {
+                    client_open: polls.get() > 12,
+                    signed_in_user: Some("selected".into()),
+                    game_user: (polls.get() > 12).then(|| "selected".into()),
+                    ..GameStatus::default()
+                }
+            },
+            || {
+                let count = requests.get() + 1;
+                requests.set(count);
+                // The first request starts the patch; Riot refuses to launch
+                // until it has finished.
+                Ok(if count < 4 {
+                    Launch::Updating
+                } else {
+                    Launch::Accepted
+                })
+            },
+            || {
+                Some(UpdateSnapshot {
+                    updating: polls.get() < 8,
+                    needs_launch: false,
+                    progress: UpdateProgress {
+                        percent: Some(41.5),
+                        remaining_ms: Some(90_000),
+                    },
+                    work: polls.get() as u64,
+                })
+            },
+            &mut |update| reported.borrow_mut().push(update),
+            || {},
+        );
+
+        assert_eq!(result, Ok(()));
+        let reported = reported.into_inner();
+        assert!(reported.contains(&Some(UpdateProgress {
+            percent: Some(41.5),
+            remaining_ms: Some(90_000),
+        })));
+        assert_eq!(reported.last(), Some(&None));
+    }
+
+    #[test]
+    fn a_second_patch_after_a_pending_or_accepted_launch_keeps_reporting_progress() {
+        for resumed in [Launch::Pending, Launch::Accepted] {
+            let ticks = Cell::new(0u32);
+            let reported = RefCell::new(Vec::new());
+            let result = launch_game_with(
+                "selected",
+                &AtomicBool::new(false),
+                || GameStatus {
+                    client_open: ticks.get() > 80,
+                    signed_in_user: Some("selected".into()),
+                    game_user: (ticks.get() > 80).then(|| "selected".into()),
+                    ..GameStatus::default()
+                },
+                || Ok(if ticks.get() == 0 { Launch::Updating } else { resumed }),
+                || {
+                    let tick = ticks.get();
+                    (tick < 4 || (6..=80).contains(&tick)).then_some(UpdateSnapshot {
+                        updating: true,
+                        needs_launch: false,
+                        progress: UpdateProgress {
+                            percent: Some(if tick < 4 { 42.0 } else { 17.0 }),
+                            remaining_ms: Some(90_000),
+                        },
+                        work: u64::from(tick),
+                    })
+                },
+                &mut |update| reported.borrow_mut().push(update),
+                || ticks.set(ticks.get() + 1),
+            );
+            assert!(
+                reported.borrow().iter().flatten().any(|update| update.percent == Some(17.0)),
+                "the second patch disappeared after {resumed:?}: {result:?}"
+            );
+            assert_eq!(result, Ok(()));
+            assert_eq!(reported.borrow().last(), Some(&None));
+        }
+    }
+
+    #[test]
+    fn a_late_second_patch_leaves_a_full_window_for_the_game_to_start() {
+        let ticks = Cell::new(0u32);
+        let result = launch_game_with(
+            "selected",
+            &AtomicBool::new(false),
+            || GameStatus {
+                client_open: ticks.get() == 70,
+                signed_in_user: Some("selected".into()),
+                game_user: (ticks.get() == 70).then(|| "selected".into()),
+                ..GameStatus::default()
+            },
+            || Ok(Launch::Accepted),
+            || Some(UpdateSnapshot {
+                updating: ticks.get() < 3 || (42..52).contains(&ticks.get()),
+                needs_launch: false,
+                progress: UpdateProgress { percent: Some(17.0), remaining_ms: None },
+                work: u64::from(ticks.get()),
+            }),
+            &mut |_| {},
+            || ticks.set(ticks.get() + 1),
+        );
+        assert_eq!(result, Ok(()), "a completed patch must leave time for game startup");
+    }
+
+    #[test]
+    fn repair_and_out_of_date_transitions_keep_the_patch_visible() {
+        use serde_json::json;
+
+        let exchanges = (0..=78).map(|tick| {
+            let state = match tick {
+                0 => "NeedsRepair",
+                1..=50 => "Repairing",
+                51 => "OutOfDate",
+                52..=75 => "Updating",
+                _ => "UpToDate",
+            };
+            (
+                "GET /patch-proxy/v2/patch-states/products/league_of_legends/patchlines/live ",
+                json!({
+                    "state": state,
+                    "launchable": state == "UpToDate",
+                    "progress": {"overallProgress": tick, "totalBytesDone": tick}
+                }).to_string(),
+            )
+        }).collect();
+        let (api, server) = serve_local_api(exchanges);
+        let ticks = Cell::new(0u32);
+        let reported = RefCell::new(Vec::new());
+        let requested = RefCell::new(Vec::new());
+        let result = launch_game_with(
+            "selected",
+            &AtomicBool::new(false),
+            || GameStatus {
+                client_open: ticks.get() == 78,
+                signed_in_user: Some("selected".into()),
+                game_user: (ticks.get() == 78).then(|| "selected".into()),
+                ..GameStatus::default()
+            },
+            || {
+                requested.borrow_mut().push(ticks.get());
+                Ok(Launch::Accepted)
+            },
+            || api.update_progress(Game::League),
+            &mut |update| reported.borrow_mut().push((ticks.get(), update)),
+            || ticks.set(ticks.get() + 1),
+        );
+        assert_eq!(result, Ok(()), "repairing must not consume the launch timeout");
+        server.join().unwrap();
+        assert!(reported.borrow().iter().filter(|(tick, _)| *tick < 76).all(|(_, update)| update.is_some()));
+        assert!(requested.borrow().contains(&0), "NeedsRepair must start a manual patch");
+        assert!(requested.borrow().iter().all(|tick| *tick == 0 || *tick == 51 || *tick >= 76));
+    }
+
+    #[test]
+    fn login_confirmation_rechecks_patching_even_after_the_game_process_appears() {
+        let ticks = Cell::new(0u32);
+        let reported = RefCell::new(Vec::new());
+        let result = launch_game_with(
+            "selected",
+            &AtomicBool::new(false),
+            || GameStatus {
+                client_open: ticks.get() >= 6,
+                signed_in_user: Some("selected".into()),
+                game_user: (ticks.get() >= 6).then(|| "selected".into()),
+                ..GameStatus::default()
+            },
+            || Ok(Launch::Accepted),
+            || Some(UpdateSnapshot {
+                updating: ticks.get() < 3 || (6..10).contains(&ticks.get()),
+                needs_launch: false,
+                progress: UpdateProgress {
+                    percent: Some(if ticks.get() < 3 { 42.0 } else { 17.0 }),
+                    remaining_ms: None,
+                },
+                work: u64::from(ticks.get()),
+            }),
+            &mut |update| reported.borrow_mut().push(update),
+            || ticks.set(ticks.get() + 1),
+        );
+        assert!(reported.borrow().iter().flatten().any(|update| update.percent == Some(17.0)));
+        assert_eq!(result, Ok(()));
+        assert_eq!(ticks.get(), 10);
+        assert_eq!(reported.borrow().last(), Some(&None));
+    }
+
+    #[test]
+    fn percentage_progress_without_bytes_finishes_and_completed_samples_do_not_block_launch() {
+        let ticks = Cell::new(0u32);
+        let result = launch_game_with(
+            "selected",
+            &AtomicBool::new(false),
+            || GameStatus {
+                client_open: ticks.get() > 302,
+                signed_in_user: Some("selected".into()),
+                game_user: (ticks.get() > 302).then(|| "selected".into()),
+                ..GameStatus::default()
+            },
+            || {
+                assert!(ticks.get() >= 300, "do not restart the launch during patching");
+                Ok(Launch::Accepted)
+            },
+            || Some(UpdateSnapshot {
+                updating: ticks.get() < 300,
+                needs_launch: false,
+                progress: UpdateProgress {
+                    percent: Some(if ticks.get() < 300 { ticks.get() as f32 / 4.0 } else { 100.0 }),
+                    remaining_ms: None,
+                },
+                work: 0,
+            }),
+            &mut |_| {},
+            || ticks.set(ticks.get() + 1),
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn an_unobservable_blocked_patch_reports_updating_and_has_a_hard_limit() {
+        let ticks = Cell::new(0u32);
+        let reported = RefCell::new(Vec::new());
+        let result = launch_game_with(
+            "selected",
+            &AtomicBool::new(false),
+            || GameStatus {
+                signed_in_user: Some("selected".into()),
+                ..GameStatus::default()
+            },
+            || Ok(Launch::Updating),
+            || None,
+            &mut |update| reported.borrow_mut().push(update),
+            || ticks.set(ticks.get() + 1),
+        );
+        assert_eq!(result, Err(LoginError::GameLaunchFailed));
+        assert_eq!(ticks.get(), UPDATE_TICKS - 1);
+        assert_eq!(reported.borrow().first(), Some(&Some(UpdateProgress {
+            percent: None,
+            remaining_ms: None,
+        })));
+        assert_eq!(reported.borrow().last(), Some(&None));
+    }
+
+    #[test]
+    fn patch_wait_still_checks_cancellation_and_account_changes() {
+        for cancelled in [false, true] {
+            let cancel = AtomicBool::new(false);
+            let ticks = Cell::new(0u32);
+            let result = launch_game_with(
+                "selected",
+                &cancel,
+                || GameStatus {
+                    signed_in_user: Some(if ticks.get() == 0 { "selected" } else { "previous" }.into()),
+                    ..GameStatus::default()
+                },
+                || panic!("an active patch must not be relaunched"),
+                || Some(UpdateSnapshot {
+                    updating: true,
+                    needs_launch: false,
+                    progress: UpdateProgress { percent: Some(12.0), remaining_ms: None },
+                    work: u64::from(ticks.get()),
+                }),
+                &mut |_| {},
+                || {
+                    ticks.set(ticks.get() + 1);
+                    cancel.store(cancelled, Ordering::SeqCst);
+                },
+            );
+            assert_eq!(result, Err(if cancelled { LoginError::Cancelled } else { LoginError::AccountMismatch }));
+        }
+    }
+
+    #[test]
+    fn a_stalled_update_ends_the_login_without_spending_launch_attempts() {
+        let ticks = Cell::new(0u32);
+        let result = launch_game_with(
+            "selected",
+            &AtomicBool::new(false),
+            || GameStatus {
+                signed_in_user: Some("selected".into()),
+                ..GameStatus::default()
+            },
+            || Ok(Launch::Updating),
+            || {
+                ticks.set(ticks.get() + 1);
+                Some(UpdateSnapshot {
+                    updating: true,
+                    needs_launch: false,
+                    progress: UpdateProgress {
+                        percent: Some(12.0),
+                        remaining_ms: None,
+                    },
+                    work: 7,
+                })
+            },
+            &mut |_| {},
+            || {},
+        );
+
+        assert_eq!(result, Err(LoginError::GameLaunchFailed));
+        assert!(ticks.get() > UPDATE_STALL_TICKS);
+        assert!(ticks.get() <= UPDATE_STALL_TICKS + 2);
+    }
+
+    #[test]
+    fn update_progress_reads_the_percentage_and_time_left() {
+        use serde_json::json;
+
+        let body = json!({
+            "launchable": false,
+            "progress": {
+                "overallProgress": 42.34,
+                "totalTimeRemainingMs": 90_500,
+                "totalBytesDone": 100,
+                "totalBytesWritten": 200,
+                "totalBytesDownloaded": 50
+            },
+            "state": "Updating"
+        })
+        .to_string();
+        let (api, server) = serve_local_api(vec![(
+            "GET /patch-proxy/v2/patch-states/products/league_of_legends/patchlines/live ",
+            body,
+        )]);
+
+        assert_eq!(
+            api.update_progress(Game::League),
+            Some(UpdateSnapshot {
+                updating: true,
+                needs_launch: false,
+                progress: UpdateProgress {
+                    percent: Some(42.3),
+                    remaining_ms: Some(90_000),
+                },
+                work: 350,
+            })
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_launch_blocked_by_an_update_is_not_a_failure() {
+        let (api, server) = serve_local_api_with(vec![(
+            "POST /product-launcher/v1/products/league_of_legends/patchlines/live ",
+            424,
+            r#"{"httpStatus":424,"message":"product not up to date"}"#.to_string(),
+        )]);
+
+        assert_eq!(api.launch(Game::League), Launch::Updating);
+        server.join().unwrap();
     }
 
     #[test]
