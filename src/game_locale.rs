@@ -12,9 +12,9 @@
 //!   is cleared, the file rewritten, and the attribute restored — the same
 //!   thing LOLauncher does with `chmod`.
 //!
-//! Only the `settings.locale` line is touched. `available_locales` is left
-//! alone: it describes what Riot publishes, and rewriting it would make the
-//! file disagree with the registry without changing what the client accepts.
+//! The requested `settings.locale` is also added to `available_locales` when
+//! missing, so the launcher accepts `zh_CN`. This changes the local settings
+//! file only; it does not change Riot's published registry or prevent rewrites.
 
 use std::path::{Path, PathBuf};
 
@@ -56,6 +56,11 @@ pub fn read(path: &Path) -> Option<String> {
 /// Both edits are line replacements: the client writes its own ordering and
 /// quoting, and a YAML round-trip would churn every line of the file.
 pub fn write(path: &Path, locale: &str) -> bool {
+    // Validate before reading or writing: callers outside the editor must not
+    // be able to put an unknown or quoted value into the client's settings.
+    if locale.chars().any(char::is_control) || !crate::locales::is_known(locale) {
+        return false;
+    }
     let Ok(contents) = std::fs::read_to_string(path) else {
         return false;
     };
@@ -310,5 +315,20 @@ mod tests {
 
         assert!(!write(&path, "zh_CN"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), only_data);
+    }
+
+    #[test]
+    fn an_unknown_locale_is_rejected_before_any_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("product_settings.yaml");
+        std::fs::write(&path, sample()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        assert!(!write(&path, "xx_YY"));
+        assert!(!write(&path, "zh_MY\"\n  injected: true"));
+        for locale in ["en_US\n", "\nen_US", "en_US\t", "\0en_US"] {
+            assert!(!write(&path, locale));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 }
