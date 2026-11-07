@@ -1,10 +1,12 @@
 use crate::credentials;
+use crate::locales;
 use crate::logging::{self, Event, Reason};
 use crate::models::{Account, AccountKey, RankInfo, RankProvenance, TftRank};
 use crate::rank_fetcher::RankProvider;
-use crate::utils::{accounts_file, region_display, sort_accounts};
+use crate::utils::{accounts_file, region_display, sort_accounts, REGION_MAP};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use serde::ser::{SerializeSeq, Serializer as _};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,6 +16,25 @@ use std::thread;
 pub const KEYRING_SERVICE: &str = credentials::SERVICE;
 
 pub type ManagerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+/// Everything an explicit account edit may change. A `None` or empty password
+/// keeps the stored credential, so an untouched field cannot wipe it.
+#[derive(Clone, Debug)]
+pub struct AccountChanges {
+    pub name: String,
+    pub description: String,
+    pub locale: Option<String>,
+    pub skip_profile_update: bool,
+    pub password: Option<String>,
+}
+
+/// One account's admission to a rank refresh. The private generation makes a
+/// late result invalid once the account is deleted, renamed, or refreshed
+/// again.
+pub struct RankJob {
+    pub account: Account,
+    generation: u64,
+}
 
 pub struct AddAccountsResult {
     pub added: Vec<Account>,
@@ -25,6 +46,20 @@ trait PasswordStore {
     fn get(&self, key: &str) -> ManagerResult<Option<String>>;
     fn set(&self, key: &str, password: &str) -> ManagerResult<()>;
     fn delete(&self, key: &str) -> ManagerResult<()>;
+
+    fn snapshot(&self, key: &str) -> ManagerResult<credentials::PasswordSnapshot> {
+        Ok(credentials::PasswordSnapshot {
+            primary: self.get(key)?,
+            legacy: None,
+        })
+    }
+
+    fn restore(&self, key: &str, snapshot: credentials::PasswordSnapshot) -> ManagerResult<()> {
+        match snapshot.primary {
+            Some(password) => self.set(key, &password),
+            None => self.delete(key),
+        }
+    }
 }
 
 struct NativePasswords<'a>(&'a str);
@@ -41,12 +76,26 @@ impl PasswordStore for NativePasswords<'_> {
     fn delete(&self, key: &str) -> ManagerResult<()> {
         credentials::delete_password(self.0, key)
     }
+
+    fn snapshot(&self, key: &str) -> ManagerResult<credentials::PasswordSnapshot> {
+        credentials::snapshot_password(self.0, key)
+    }
+
+    fn restore(&self, key: &str, snapshot: credentials::PasswordSnapshot) -> ManagerResult<()> {
+        credentials::restore_password(self.0, key, snapshot)
+    }
 }
 
 pub struct AccountManager {
     pub accounts: Vec<Account>,
     pub accounts_file: PathBuf,
     pub rank_fetcher: Arc<dyn RankProvider>,
+    /// Set when the stored file could not be read or parsed. Persistent
+    /// mutations are refused until an explicit reload succeeds, so a partial
+    /// in-memory list can never replace a file we failed to understand.
+    load_failed: bool,
+    rank_generation: u64,
+    rank_jobs: HashMap<AccountKey, u64>,
 }
 
 impl AccountManager {
@@ -57,6 +106,9 @@ impl AccountManager {
                 logging::record(Event::DataDirectoryFailed, Reason::from_error(error));
             })?,
             rank_fetcher,
+            load_failed: false,
+            rank_generation: 0,
+            rank_jobs: HashMap::new(),
         })
     }
 
@@ -65,6 +117,9 @@ impl AccountManager {
             accounts: Vec::new(),
             accounts_file: path.into(),
             rank_fetcher,
+            load_failed: false,
+            rank_generation: 0,
+            rank_jobs: HashMap::new(),
         }
     }
 
@@ -73,16 +128,34 @@ impl AccountManager {
     }
 
     fn load_accounts_with_service(&mut self, service: &str) -> ManagerResult<()> {
-        self.accounts.clear();
-        if !self.accounts_file.exists() {
-            return Ok(());
-        }
-        let contents = std::fs::read_to_string(&self.accounts_file).inspect_err(|error| {
-            logging::record(Event::AccountsLoadFailed, Reason::from_error(error));
-        })?;
-        let mut loaded: Vec<Account> = serde_json::from_str(&contents).inspect_err(|error| {
-            logging::record(Event::AccountsLoadFailed, Reason::from_error(error));
-        })?;
+        let contents = match std::fs::read(&self.accounts_file) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A file that has never existed is a new, empty, writable store.
+                self.accounts.clear();
+                self.rank_jobs.clear();
+                self.load_failed = false;
+                return Ok(());
+            }
+            Err(error) => {
+                logging::record(Event::AccountsLoadFailed, Reason::from_error(&error));
+                // Reading failed, so nothing here can honestly be called a
+                // backup. Keep the old memory and refuse later writes.
+                self.load_failed = true;
+                return Err(Box::new(error));
+            }
+        };
+        let mut loaded: Vec<Account> = match serde_json::from_slice(&contents) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                logging::record(Event::AccountsLoadFailed, Reason::from_error(&error));
+                // Damage is visible only after a successful read: preserve the
+                // readable file under a name that cannot replace another backup.
+                let _ = self.back_up_corrupt_accounts(&contents);
+                self.load_failed = true;
+                return Err(Box::new(error));
+            }
+        };
         for account in &mut loaded {
             if account.region_display.is_empty() {
                 account.region_display = region_display(&account.region);
@@ -96,27 +169,86 @@ impl AccountManager {
             .unwrap_or_default();
         }
         self.accounts = loaded;
+        self.load_failed = false;
+        self.rank_jobs.clear();
         sort_accounts(&mut self.accounts);
         Ok(())
+    }
+
+    /// Copy a readable but unparseable file beside itself under the first free
+    /// `.corrupt[.N]` name. An existing file is never replaced.
+    fn back_up_corrupt_accounts(&self, contents: &[u8]) -> ManagerResult<PathBuf> {
+        let parent = self
+            .accounts_file
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let Some(name) = self.accounts_file.file_name() else {
+            return Err(std::io::Error::other("accounts file has no name").into());
+        };
+        for suffix in 0..=u32::MAX {
+            let candidate = if suffix == 0 {
+                format!("{}.corrupt", name.to_string_lossy())
+            } else {
+                format!("{}.corrupt.{suffix}", name.to_string_lossy())
+            };
+            let candidate = parent.join(candidate);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(mut file) => {
+                    if let Err(error) = file.write_all(contents).and_then(|()| file.sync_all()) {
+                        drop(file);
+                        let _ = std::fs::remove_file(&candidate);
+                        return Err(Box::new(error));
+                    }
+                    return Ok(candidate);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(Box::new(error)),
+            }
+        }
+        Err(std::io::Error::other("no free backup name").into())
     }
 
     pub fn save_accounts(&self) -> ManagerResult<()> {
         self.persist_accounts(self.prepare_accounts(&self.accounts)?)
     }
 
-    fn prepare_accounts(&self, accounts: &[Account]) -> ManagerResult<tempfile::NamedTempFile> {
+    fn ensure_loaded(&self) -> ManagerResult<()> {
+        if self.load_failed {
+            return Err(std::io::Error::other(
+                "stored accounts have not loaded successfully",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn prepare_accounts<'a>(
+        &self,
+        accounts: impl IntoIterator<Item = &'a Account>,
+    ) -> ManagerResult<tempfile::NamedTempFile> {
         let result = (|| -> ManagerResult<_> {
-            let parent = self
-                .accounts_file
+            self.ensure_loaded()?;
+            let parent = self.accounts_file
                 .parent()
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."));
             std::fs::create_dir_all(parent)?;
-            let json = serde_json::to_vec_pretty(accounts)?;
-            // Unique sibling files avoid colliding with another app instance.
-            // Dropping a failed write removes its temporary file automatically.
+            // Stream references into a unique sibling file: no complete JSON
+            // buffer or duplicate account/password list is needed.
             let mut file = tempfile::NamedTempFile::new_in(parent)?;
-            file.write_all(&json)?;
+            {
+                let mut serializer = serde_json::Serializer::pretty(file.as_file_mut());
+                let mut sequence = serializer.serialize_seq(None)?;
+                for account in accounts {
+                    sequence.serialize_element(account)?;
+                }
+                sequence.end()?;
+            }
             file.as_file().sync_all()?;
             Ok(file)
         })();
@@ -147,6 +279,7 @@ impl AccountManager {
         accounts: Vec<Account>,
         passwords: &impl PasswordStore,
     ) -> ManagerResult<AddAccountsResult> {
+        self.ensure_loaded()?;
         let mut keys: HashSet<_> = self
             .accounts
             .iter()
@@ -171,7 +304,7 @@ impl AccountManager {
             }
             if !account.password.is_empty() {
                 let credential_key = format!("{}:{}", account.region, account.account_id);
-                let stored = passwords.get(&credential_key).and_then(|previous| {
+                let stored = passwords.snapshot(&credential_key).and_then(|previous| {
                     passwords.set(&credential_key, &account.password)?;
                     Ok(previous)
                 });
@@ -198,10 +331,7 @@ impl AccountManager {
                 // Attempt every rollback even if an individual restore fails.
                 let mut rollback_error = None;
                 for (key, previous) in previous_passwords.into_iter().rev() {
-                    let restored = match previous {
-                        Some(password) => passwords.set(&key, &password),
-                        None => passwords.delete(&key),
-                    };
+                    let restored = passwords.restore(&key, previous);
                     if let Err(error) = restored {
                         rollback_error.get_or_insert(error);
                     }
@@ -214,6 +344,81 @@ impl AccountManager {
             added,
             skipped_indices,
         })
+    }
+
+    /// Change one account and publish the edited metadata and password only
+    /// after both the account file and the credential store accepted them.
+    ///
+    /// `None` or an empty password leaves the stored credential untouched.
+    /// The bool is `true` when the Riot ID changed, which resets the rank and
+    /// invalidates refresh results admitted before the edit.
+    pub fn update_account(
+        &mut self,
+        key: &AccountKey,
+        changes: AccountChanges,
+    ) -> ManagerResult<(Account, bool)> {
+        self.update_account_with(key, changes, &NativePasswords(KEYRING_SERVICE))
+    }
+
+    fn update_account_with(
+        &mut self,
+        key: &AccountKey,
+        changes: AccountChanges,
+        passwords: &impl PasswordStore,
+    ) -> ManagerResult<(Account, bool)> {
+        let index = self
+            .accounts
+            .iter()
+            .position(|account| account.key() == *key)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "account not found")
+            })?;
+        let mut updated = self.accounts[index].clone();
+        let renamed = updated.name != changes.name;
+        updated.name = changes.name;
+        updated.description = changes.description;
+        updated.locale = changes.locale;
+        updated.skip_profile_update = changes.skip_profile_update;
+        if renamed {
+            reset_rank(&mut updated);
+        }
+        let new_password = changes
+            .password
+            .as_deref()
+            .filter(|password| !password.is_empty());
+        if let Some(password) = new_password {
+            updated.password = password.to_owned();
+        }
+        // Prepare the replacement first: a file failure must not drop the
+        // credential that is still in use.
+        let file = self.prepare_accounts(self.accounts.iter().enumerate().map(
+            |(position, account)| if position == index { &updated } else { account },
+        ))?;
+        let credential_key = format!("{}:{}", key.region, key.account_id);
+        let previous_password = match new_password {
+            Some(password) => {
+                let previous = passwords.snapshot(&credential_key)?;
+                if let Err(error) = passwords.set(&credential_key, password) {
+                    // Backends must not leave a partial replacement visible
+                    // when they report a failed write.
+                    passwords.restore(&credential_key, previous)?;
+                    return Err(error);
+                }
+                Some(previous)
+            }
+            None => None,
+        };
+        if let Err(error) = self.persist_accounts(file) {
+            if let Some(previous) = previous_password {
+                passwords.restore(&credential_key, previous)?;
+            }
+            return Err(error);
+        }
+        if renamed {
+            self.rank_jobs.remove(key);
+        }
+        self.accounts[index] = updated.clone();
+        Ok((updated, renamed))
     }
 
     pub fn delete_account(&mut self, account_id: &str, region: &str) -> ManagerResult<()> {
@@ -234,14 +439,16 @@ impl AccountManager {
         // Prepare the replacement before deleting anything from the keyring.
         let file = self.prepare_accounts(&next)?;
         let key = format!("{region}:{account_id}");
-        let previous = passwords.get(&key)?;
+        let previous = passwords.snapshot(&key)?;
         passwords.delete(&key)?;
         if let Err(error) = self.persist_accounts(file) {
-            if let Some(password) = previous {
-                passwords.set(&key, &password)?;
-            }
+            passwords.restore(&key, previous)?;
             return Err(error);
         }
+        self.rank_jobs.remove(&AccountKey {
+            account_id: account_id.to_owned(),
+            region: region.to_owned(),
+        });
         self.accounts = next;
         Ok(())
     }
@@ -277,26 +484,47 @@ impl AccountManager {
         Ok(())
     }
 
-    pub fn apply_rank_info(&mut self, fetched: &Account, info: &RankInfo) -> bool {
-        if let Some(account) = self
-            .account_mut(&fetched.key())
-            .filter(|account| account.name == fetched.name)
-        {
-            info.apply_to(account);
-            return true;
+    /// Admit one account to a refresh. Every admission invalidates earlier
+    /// tickets for the same account.
+    pub fn begin_rank_refresh(&mut self, key: &AccountKey) -> Option<RankJob> {
+        let account = self.account(key)?.clone();
+        self.rank_generation = self.rank_generation.wrapping_add(1);
+        self.rank_jobs.insert(key.clone(), self.rank_generation);
+        Some(RankJob {
+            account,
+            generation: self.rank_generation,
+        })
+    }
+
+    /// Apply a result only while its ticket is still the newest for the same
+    /// key and Riot ID. Deleted, recreated, or renamed accounts reject older
+    /// tickets.
+    pub fn apply_rank_info(&mut self, job: &RankJob, info: &RankInfo) -> bool {
+        let key = job.account.key();
+        if self.rank_jobs.get(&key) != Some(&job.generation) {
+            return false;
         }
-        false
+        let Some(account) = self
+            .account_mut(&key)
+            .filter(|account| account.name == job.account.name)
+        else {
+            return false;
+        };
+        info.apply_to(account);
+        true
     }
 
     /// Fetch all ranks with at most four concurrent provider calls.
     pub fn refresh_ranks(&mut self) -> ManagerResult<()> {
         logging::record(Event::RankRefreshStarted, Reason::None);
-        let jobs: Vec<(usize, Account)> = self.accounts.iter().cloned().enumerate().collect();
+        let keys: Vec<AccountKey> = self.accounts.iter().map(Account::key).collect();
+        let jobs: Vec<RankJob> = keys
+            .iter()
+            .filter_map(|key| self.begin_rank_refresh(key))
+            .collect();
         let results = run_rank_jobs(self.rank_fetcher.clone(), jobs);
-        for (index, info) in results {
-            if let Some(account) = self.accounts.get_mut(index) {
-                info.apply_to(account);
-            }
+        for (job, info) in results {
+            self.apply_rank_info(&job, &info);
         }
         sort_accounts(&mut self.accounts);
         self.save_accounts()?;
@@ -339,13 +567,19 @@ impl AccountManager {
         })?;
         let mut accounts = Vec::with_capacity(data.len());
         let mut skipped = 0;
-        for item in data {
+        for (index, item) in data.into_iter().enumerate() {
             let account_id = item.account_id.trim().to_owned();
-            let region = item.region.trim().to_owned();
-            if account_id.is_empty() || region.is_empty() {
+            if account_id.is_empty() {
                 skipped += 1;
                 continue;
             }
+            let Some(region) = normalize_import_region(&item.region) else {
+                return Err(import_error(index, "unsupported region"));
+            };
+            let locale = match normalized_import_locale(item.locale.as_deref()) {
+                Ok(locale) => locale,
+                Err(()) => return Err(import_error(index, "invalid locale")),
+            };
             let account = Account {
                 account_id: account_id.clone(),
                 name: item.name,
@@ -377,7 +611,7 @@ impl AccountManager {
                     item.finished_last_season
                 },
                 tft: item.tft,
-                locale: item.locale,
+                locale,
                 skip_profile_update: item.skip_profile_update,
                 rank_provenance: item.rank_provenance,
                 tft_provenance: item.tft_provenance,
@@ -391,10 +625,55 @@ impl AccountManager {
     }
 }
 
+/// Map an exported region (internal code in any case, or a known display
+/// label) onto the internal code used everywhere else.
+fn normalize_import_region(value: &str) -> Option<String> {
+    if value.chars().any(char::is_control) {
+        return None;
+    }
+    let value = value.trim();
+    REGION_MAP
+        .iter()
+        .find(|(label, code)| {
+            label.eq_ignore_ascii_case(value) || code.eq_ignore_ascii_case(value)
+        })
+        .map(|(_, code)| (*code).to_owned())
+}
+
+/// Empty values keep Riot's own choice; anything not a known alias is rejected
+/// rather than stripped or guessed into a writable value.
+fn normalized_import_locale(value: Option<&str>) -> Result<Option<String>, ()> {
+    if value.is_some_and(|value| value.chars().any(char::is_control)) {
+        return Err(());
+    }
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => locales::normalize(value)
+            .map(|locale| Some(locale.to_owned()))
+            .ok_or(()),
+    }
+}
+
+/// Point at the failing import entry without echoing its values.
+fn import_error(index: usize, problem: &str) -> Box<dyn Error + Send + Sync> {
+    let error = std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("import item {index}: {problem}"),
+    );
+    logging::record(Event::ImportFailed, Reason::from_error(&error));
+    Box::new(error)
+}
+
+/// A renamed account no longer matches the Riot ID its ranks were fetched for.
+fn reset_rank(account: &mut Account) {
+    account.riot_id_not_found = false;
+    RankInfo::unranked().apply_to(account);
+}
+
 fn run_rank_jobs(
     provider: Arc<dyn RankProvider>,
-    jobs: Vec<(usize, Account)>,
-) -> Vec<(usize, RankInfo)> {
+    jobs: Vec<RankJob>,
+) -> Vec<(RankJob, RankInfo)> {
     if jobs.is_empty() {
         return Vec::new();
     }
@@ -408,28 +687,28 @@ fn run_rank_jobs(
         let provider = Arc::clone(&provider);
         workers.push(thread::spawn(move || loop {
             let job = queue.lock().ok().and_then(|mut queue| queue.pop_front());
-            let Some((index, account)) = job else { break };
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                provider.fetch_rank(&account)
-            }))
-            .unwrap_or_else(|_| {
-                logging::record(Event::RankWorkerPanicked, Reason::None);
-                RankInfo::error()
-            });
-            if sender.send((index, result)).is_err() {
+            let Some(job) = job else { break };
+            // The ticket owns the only account copy; the provider borrows it.
+            let result = {
+                let account = &job.account;
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    provider.fetch_rank(account)
+                }))
+                .unwrap_or_else(|_| {
+                    logging::record(Event::RankWorkerPanicked, Reason::None);
+                    RankInfo::error()
+                })
+            };
+            if sender.send((job, result)).is_err() {
                 break;
             }
         }));
     }
     drop(sender);
-    let mut results = Vec::new();
-    for result in receiver {
-        results.push(result);
-    }
+    let results: Vec<(RankJob, RankInfo)> = receiver.into_iter().collect();
     for worker in workers {
         let _ = worker.join();
     }
-    results.sort_by_key(|(index, _)| *index);
     results
 }
 
@@ -442,6 +721,7 @@ struct ExportAccount {
     region_display: String,
     password: String,
     description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     locale: Option<String>,
     skip_profile_update: bool,
     tier: String,
@@ -524,6 +804,11 @@ struct ImportAccount {
 mod tests {
     use super::*;
 
+    // The native store is shared outside the process, unlike TestPasswords.
+    // Keep fixture writes and cleanup within one admitted credential session.
+    #[cfg(windows)]
+    static NATIVE_CREDENTIALS: Mutex<()> = Mutex::new(());
+
     #[test]
     fn export_round_trips_account_settings_and_rank_provenance() {
         let directory = tempfile::tempdir().unwrap();
@@ -550,6 +835,404 @@ mod tests {
         assert_eq!(imported.rank_provenance, account.rank_provenance);
         assert_eq!(imported.tft_provenance, account.tft_provenance);
     }
+
+    #[test]
+    fn export_round_trips_locale_and_skip_profile_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = test_manager(directory.path().join("source.json"));
+        source.accounts.push(Account {
+            account_id: "synthetic-backup-account".into(),
+            region: "euw".into(),
+            // A cached synthetic value avoids even reading the native store.
+            password: "synthetic-backup-secret".into(),
+            locale: Some("zh_MY".into()),
+            skip_profile_update: true,
+            ..Account::default()
+        });
+        let mut exported: serde_json::Value =
+            serde_json::from_str(&source.export_accounts().unwrap()).unwrap();
+        assert_eq!(exported[0]["locale"], "zh_MY");
+        assert_eq!(exported[0]["skip_profile_update"], true);
+        // Passwordless import needs no credential store and tests the real
+        // import path without accessing any native target.
+        exported[0]["password"] = serde_json::Value::String(String::new());
+        let mut restored = test_manager(directory.path().join("restored.json"));
+        assert_eq!(restored.import_accounts(&exported.to_string()).unwrap(), (1, 0));
+        assert_eq!(restored.accounts[0].locale.as_deref(), Some("zh_MY"));
+        assert!(restored.accounts[0].skip_profile_update);
+
+        // Backups from before these fields existed keep the defaults.
+        assert_eq!(restored.import_accounts(
+            r#"[{"account_id":"old","region":"euw"}]"#
+        ).unwrap(), (1, 0));
+        let old = restored.accounts.iter().find(|account| account.account_id == "old").unwrap();
+        assert!(old.locale.is_none());
+        assert!(!old.skip_profile_update);
+    }
+
+    #[test]
+    fn a_missing_accounts_file_loads_empty_and_stays_writable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manager = test_manager(directory.path().join("accounts.json"));
+
+        manager.load_accounts().unwrap();
+        assert!(manager.accounts.is_empty());
+
+        let passwords = TestPasswords::default();
+        let result = manager
+            .add_accounts_with(vec![test_account("new")], &passwords)
+            .unwrap();
+        assert_eq!(result.added.len(), 1);
+        assert!(manager.accounts_file.exists());
+    }
+
+    #[test]
+    fn corrupt_accounts_are_backed_up_without_overwriting_and_block_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("accounts.json");
+        let mut manager = test_manager(&path);
+        manager.accounts.push(test_account("kept"));
+        manager.save_accounts().unwrap();
+        let original_memory = manager.accounts.clone();
+
+        let earlier_backup = directory.path().join("accounts.json.corrupt");
+        std::fs::write(&earlier_backup, "earlier backup").unwrap();
+        let corrupt = br#"[{"account_id": "broken""#;
+        std::fs::write(&path, corrupt).unwrap();
+
+        assert!(manager.load_accounts().is_err());
+        // The previous in-memory list survives, and writes cannot replace a
+        // file that was never understood.
+        assert_eq!(manager.accounts, original_memory);
+        assert_eq!(std::fs::read(&earlier_backup).unwrap(), b"earlier backup");
+        let unique_backup = directory.path().join("accounts.json.corrupt.1");
+        assert_eq!(std::fs::read(&unique_backup).unwrap(), corrupt);
+        assert!(manager.save_accounts().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+        let passwords = TestPasswords::default();
+        passwords.set("euw:kept", "stored-password").unwrap();
+        let key = manager.accounts[0].key();
+        assert!(manager.add_accounts_with(vec![test_account("new")], &passwords).is_err());
+        assert!(manager.delete_account_with("kept", "euw", &passwords).is_err());
+        assert!(manager.update_account_with(&key, AccountChanges {
+            name: "Changed#EUW".into(),
+            description: String::new(),
+            locale: None,
+            skip_profile_update: false,
+            password: Some("different-password".into()),
+        }, &passwords).is_err());
+        assert!(manager.import_accounts_with(
+            r#"[{"account_id":"new","region":"euw"}]"#, &passwords
+        ).is_err());
+        assert_eq!(passwords.get("euw:kept").unwrap().as_deref(), Some("stored-password"));
+        assert_eq!(manager.accounts, original_memory);
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+
+        // Invalid UTF-8 is readable corruption too: preserve exact bytes,
+        // with another unique backup rather than treating it as a read error.
+        let non_utf8 = [0xff, 0xfe, b'['];
+        std::fs::write(&path, non_utf8).unwrap();
+        assert!(manager.load_accounts().is_err());
+        assert_eq!(std::fs::read(directory.path().join("accounts.json.corrupt.2")).unwrap(), non_utf8);
+        assert_eq!(std::fs::read(&unique_backup).unwrap(), corrupt);
+        assert_eq!(manager.accounts, original_memory);
+
+        // Only an explicit successful reload recovers the manager.
+        std::fs::write(&path, "[]").unwrap();
+        manager.load_accounts().unwrap();
+        assert!(manager.accounts.is_empty());
+        assert!(manager.save_accounts().is_ok());
+    }
+
+    #[test]
+    fn an_unreadable_store_is_not_reported_as_backed_up_or_overwritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked = directory.path().join("accounts.json");
+        std::fs::create_dir(&blocked).unwrap();
+        let mut manager = test_manager(&blocked);
+        manager.accounts.push(test_account("kept"));
+        let original_memory = manager.accounts.clone();
+
+        assert!(manager.load_accounts().is_err());
+        assert_eq!(manager.accounts, original_memory);
+        // A read failure creates no backup file and leaves the old memory.
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert!(manager
+            .add_accounts_with(vec![test_account("new")], &TestPasswords::default())
+            .is_err());
+        assert_eq!(manager.accounts, original_memory);
+    }
+
+    #[test]
+    fn update_account_commits_metadata_and_password_together() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("accounts.json");
+        let mut manager = test_manager(&path);
+        manager.accounts.push(Account {
+            account_id: "user".into(),
+            name: "Old#EUW".into(),
+            region: "euw".into(),
+            password: "old-password".into(),
+            tier: "Diamond".into(),
+            ..Account::default()
+        });
+        manager.save_accounts().unwrap();
+        let passwords = TestPasswords::default();
+        passwords.set("euw:user", "old-password").unwrap();
+        let key = manager.accounts[0].key();
+        let ticket = manager.begin_rank_refresh(&key).unwrap();
+
+        let (updated, renamed) = manager
+            .update_account_with(
+                &key,
+                AccountChanges {
+                    name: "New#EUW".into(),
+                    description: "note".into(),
+                    locale: Some("zh_MY".into()),
+                    skip_profile_update: true,
+                    password: Some("new-password".into()),
+                },
+                &passwords,
+            )
+            .unwrap();
+
+        assert!(renamed);
+        assert_eq!(updated.name, "New#EUW");
+        assert_eq!(updated.password, "new-password");
+        assert_eq!(updated.tier, "Unranked");
+        assert_eq!(manager.accounts[0], updated);
+        assert_eq!(
+            passwords.get("euw:user").unwrap().as_deref(),
+            Some("new-password")
+        );
+        // The rename invalidated the ticket admitted for the old Riot ID.
+        assert!(!manager.apply_rank_info(
+            &ticket,
+            &RankInfo {
+                tier: "Gold".into(),
+                ..RankInfo::default()
+            }
+        ));
+
+        let saved: Vec<Account> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved[0].name, "New#EUW");
+        assert_eq!(saved[0].locale.as_deref(), Some("zh_MY"));
+        assert!(saved[0].skip_profile_update);
+        assert!(saved[0].password.is_empty());
+
+        // Login, copy and export all read the same committed password.
+        let exported: Vec<serde_json::Value> =
+            serde_json::from_str(&manager.export_accounts().unwrap()).unwrap();
+        assert_eq!(exported[0]["password"], "new-password");
+        assert_eq!(exported[0]["locale"], "zh_MY");
+        assert_eq!(exported[0]["skip_profile_update"], true);
+    }
+
+    #[test]
+    fn update_account_without_a_password_keeps_the_stored_credential() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("accounts.json");
+        let mut manager = test_manager(&path);
+        manager.accounts.push(Account {
+            account_id: "user".into(),
+            name: "Same#EUW".into(),
+            region: "euw".into(),
+            password: "kept-password".into(),
+            ..Account::default()
+        });
+        manager.save_accounts().unwrap();
+        let passwords = TestPasswords::default();
+        passwords.set("euw:user", "kept-password").unwrap();
+        let key = manager.accounts[0].key();
+
+        for password in [None, Some(String::new())] {
+            let (updated, renamed) = manager
+                .update_account_with(
+                    &key,
+                    AccountChanges {
+                        name: "Same#EUW".into(),
+                        description: "note".into(),
+                        locale: None,
+                        skip_profile_update: false,
+                        password,
+                    },
+                    &passwords,
+                )
+                .unwrap();
+            assert!(!renamed);
+            assert_eq!(updated.password, "kept-password");
+            assert_eq!(
+                passwords.get("euw:user").unwrap().as_deref(),
+                Some("kept-password")
+            );
+        }
+    }
+
+    #[test]
+    fn failed_update_restores_memory_file_and_credential() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("accounts.json");
+        let mut manager = test_manager(&path);
+        manager.accounts.push(Account {
+            account_id: "user".into(),
+            name: "Old#EUW".into(),
+            region: "euw".into(),
+            password: "old-password".into(),
+            ..Account::default()
+        });
+        manager.save_accounts().unwrap();
+        let original = manager.accounts.clone();
+        let original_file = std::fs::read(&path).unwrap();
+        let key = manager.accounts[0].key();
+        let changes = |password: Option<&str>| AccountChanges {
+            name: "Renamed#EUW".into(),
+            description: String::new(),
+            locale: None,
+            skip_profile_update: false,
+            password: password.map(str::to_owned),
+        };
+
+        let mut passwords = TestPasswords::default();
+        passwords.set("euw:user", "old-password").unwrap();
+        let blocked = directory.path().join("blocked.json");
+        std::fs::create_dir(&blocked).unwrap();
+        manager.accounts_file = blocked;
+        assert!(manager
+            .update_account_with(&key, changes(Some("new-password")), &passwords)
+            .is_err());
+        assert_eq!(manager.accounts, original);
+        assert_eq!(
+            passwords.get("euw:user").unwrap().as_deref(),
+            Some("old-password")
+        );
+
+        manager.accounts_file = path;
+        passwords.fail_set = Some("euw:user".into());
+        assert!(manager
+            .update_account_with(&key, changes(Some("new-password")), &passwords)
+            .is_err());
+        assert_eq!(manager.accounts, original);
+        assert_eq!(std::fs::read(&manager.accounts_file).unwrap(), original_file);
+        assert_eq!(
+            passwords.get("euw:user").unwrap().as_deref(),
+            Some("old-password")
+        );
+
+        // Even a backend that changed the target before returning an error
+        // must leave the old file, memory and password after rollback.
+        passwords.fail_set = None;
+        *passwords.fail_after_set_once.borrow_mut() = Some("euw:user".into());
+        assert!(manager
+            .update_account_with(&key, changes(Some("new-password")), &passwords)
+            .is_err());
+        assert_eq!(manager.accounts, original);
+        assert_eq!(std::fs::read(&manager.accounts_file).unwrap(), original_file);
+        assert_eq!(passwords.get("euw:user").unwrap().as_deref(), Some("old-password"));
+    }
+
+    #[test]
+    fn deleting_and_recreating_an_account_invalidates_old_tickets() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manager = test_manager(directory.path().join("accounts.json"));
+        manager.accounts.push(test_account("user"));
+        manager.save_accounts().unwrap();
+        let passwords = TestPasswords::default();
+        let key = manager.accounts[0].key();
+        let ticket = manager.begin_rank_refresh(&key).unwrap();
+        let info = RankInfo {
+            tier: "Gold".into(),
+            ..RankInfo::default()
+        };
+
+        manager
+            .delete_account_with("user", "euw", &passwords)
+            .unwrap();
+        assert!(!manager.apply_rank_info(&ticket, &info));
+
+        manager
+            .add_accounts_with(vec![test_account("user")], &passwords)
+            .unwrap();
+        assert!(!manager.apply_rank_info(&ticket, &info));
+        let ticket = manager.begin_rank_refresh(&key).unwrap();
+        assert!(manager.apply_rank_info(&ticket, &info));
+    }
+
+    #[test]
+    fn import_normalizes_region_and_locale() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manager = test_manager(directory.path().join("accounts.json"));
+        let passwords = TestPasswords::default();
+        let json = r#"[
+            {"account_id":"one","region":" EUW ","locale":" zh-my "},
+            {"account_id":"two","region":"EUNE","locale":"ZH_MY","skip_profile_update":true},
+            {"account_id":"three","region":"na","locale":""}
+        ]"#;
+
+        assert_eq!(
+            manager.import_accounts_with(json, &passwords).unwrap(),
+            (3, 0)
+        );
+        let one = manager
+            .accounts
+            .iter()
+            .find(|account| account.account_id == "one")
+            .unwrap();
+        assert_eq!(one.region, "euw");
+        assert_eq!(one.locale.as_deref(), Some("zh_MY"));
+        assert!(!one.skip_profile_update);
+        let two = manager
+            .accounts
+            .iter()
+            .find(|account| account.account_id == "two")
+            .unwrap();
+        assert_eq!(two.region, "eune");
+        assert_eq!(two.locale.as_deref(), Some("zh_MY"));
+        assert!(two.skip_profile_update);
+        let three = manager
+            .accounts
+            .iter()
+            .find(|account| account.account_id == "three")
+            .unwrap();
+        assert_eq!(three.region, "na");
+        assert!(three.locale.is_none());
+    }
+
+    #[test]
+    fn import_rejects_unknown_region_and_locale_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manager = test_manager(directory.path().join("accounts.json"));
+        let passwords = TestPasswords::default();
+
+        let error = manager
+            .import_accounts_with(r#"[{"account_id":"bad","region":"NA1"}]"#, &passwords)
+            .unwrap_err();
+        assert!(error.to_string().contains("item 0"), "{error}");
+        assert!(manager.accounts.is_empty());
+        assert!(!manager.accounts_file.exists());
+
+        for locale in ["xx_YY", "zh_MY\"\n  injected: true", "en_US\n", "\nen_US", "\ten_US"] {
+            let json = format!(
+                r#"[{{"account_id":"bad","region":"euw","locale":{}}}]"#,
+                serde_json::to_string(locale).unwrap()
+            );
+            let error = manager
+                .import_accounts_with(&json, &passwords)
+                .unwrap_err();
+            assert!(error.to_string().contains("item 0"), "{error}");
+            assert!(manager.accounts.is_empty());
+            assert!(!manager.accounts_file.exists());
+        }
+        for region in ["euw\n", "\neuw", "euw\t", "\0EUW"] {
+            let json = serde_json::json!([{
+                "account_id": "bad",
+                "region": region,
+                "locale": "en_US"
+            }]).to_string();
+            assert!(manager.import_accounts_with(&json, &passwords).is_err());
+            assert!(manager.accounts.is_empty());
+            assert!(!manager.accounts_file.exists());
+        }
+    }
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -559,6 +1242,7 @@ mod tests {
     struct TestPasswords {
         values: RefCell<HashMap<String, String>>,
         fail_set: Option<String>,
+        fail_after_set_once: RefCell<Option<String>>,
         fail_delete: Option<String>,
     }
 
@@ -572,6 +1256,11 @@ mod tests {
                 return Err(std::io::Error::other("credential write refused").into());
             }
             self.values.borrow_mut().insert(key.into(), password.into());
+            let fail_after_set = self.fail_after_set_once.borrow().as_deref() == Some(key);
+            if fail_after_set {
+                self.fail_after_set_once.borrow_mut().take();
+                return Err(std::io::Error::other("partial credential write failed").into());
+            }
             Ok(())
         }
 
@@ -654,29 +1343,31 @@ mod tests {
     }
 
     #[test]
-    fn a_lookup_for_an_old_riot_id_cannot_overwrite_the_edited_account() {
+    fn a_result_for_an_old_riot_id_cannot_overwrite_the_edited_account() {
         let directory = tempfile::tempdir().unwrap();
-        let mut manager = AccountManager::with_path(
-            directory.path().join("accounts.json"),
-            Arc::new(crate::rank_fetcher::RankFetcher::default()),
-        );
-        let fetched = Account {
+        let mut manager = test_manager(directory.path().join("accounts.json"));
+        manager.accounts.push(Account {
             account_id: "user".into(),
             name: "Old Name#TAG".into(),
             region: "euw".into(),
+            tier: "Unranked".into(),
             ..Account::default()
-        };
-        manager.accounts.push(fetched.clone());
-        manager.accounts[0].name.clear();
+        });
+        let key = manager.accounts[0].key();
+        let ticket = manager.begin_rank_refresh(&key).unwrap();
         let info = RankInfo {
             tier: "Diamond".into(),
             ..RankInfo::default()
         };
-        assert!(!manager.apply_rank_info(&fetched, &info));
-        assert_eq!(manager.accounts[0].tier, fetched.tier);
+
         manager.accounts[0].name = "New Name#TAG".into();
-        assert!(!manager.apply_rank_info(&fetched, &info));
-        let current = manager.accounts[0].clone();
+        assert!(!manager.apply_rank_info(&ticket, &info));
+        assert_eq!(manager.accounts[0].tier, "Unranked");
+
+        // A newer admission for the same key replaces the old ticket.
+        let stale = manager.begin_rank_refresh(&key).unwrap();
+        let current = manager.begin_rank_refresh(&key).unwrap();
+        assert!(!manager.apply_rank_info(&stale, &info));
         assert!(manager.apply_rank_info(&current, &info));
         assert_eq!(manager.accounts[0].tier, "Diamond");
     }
@@ -954,6 +1645,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_rollback_does_not_modify_another_accounts_credential() {
+        let _credentials = NATIVE_CREDENTIALS.lock().unwrap();
         use std::os::windows::fs::OpenOptionsExt;
 
         // Use an isolated service, and clean up its dummy entries even if an
@@ -1007,14 +1699,27 @@ mod tests {
         assert_eq!(manager.accounts, original_accounts);
         assert_eq!(std::fs::read(&path).unwrap(), original_file);
 
-        primary_a.delete_credential().unwrap();
-        assert!(passwords.get("euw:a").unwrap().is_none());
+        // A failed file commit after deleting both copies restores both the
+        // primary and the matching legacy secret, not just the primary.
+        assert!(manager.delete_account_with("a", "euw", &passwords).is_err());
+        assert_eq!(primary_a.get_password().unwrap(), "current-a-password");
         assert_eq!(legacy.get_password().unwrap(), "stale-a-password");
+        assert_eq!(primary_b.get_password().unwrap(), "current-b-password");
+        assert_eq!(manager.accounts, original_accounts);
+        assert_eq!(std::fs::read(&path).unwrap(), original_file);
+
+        // Deleting the account clears the matching stale legacy entry too,
+        // while another account's primary credential is untouched.
+        passwords.delete("euw:a").unwrap();
+        assert!(passwords.get("euw:a").unwrap().is_none());
+        assert!(matches!(legacy.get_password(), Err(keyring::Error::NoEntry)));
+        assert_eq!(primary_b.get_password().unwrap(), "current-b-password");
     }
 
     #[cfg(windows)]
     #[test]
     fn loading_migrates_legacy_only_passwords_without_changing_other_credentials() {
+        let _credentials = NATIVE_CREDENTIALS.lock().unwrap();
         // Isolate every target, including the shared legacy entry, from the
         // user's credentials and from the native rollback regression above.
         struct Cleanup(Vec<keyring::Entry>);
@@ -1080,11 +1785,14 @@ mod tests {
         assert_eq!(migrated.get_password().unwrap(), "legacy-password");
         assert_eq!(current.get_password().unwrap(), "current-password");
         assert!(passwords.get("euw:missing").unwrap().is_none());
-        assert_eq!(legacy.get_password().unwrap(), "legacy-password");
+        // The shared legacy entry is removed only after the copy succeeded.
+        assert!(matches!(legacy.get_password(), Err(keyring::Error::NoEntry)));
         assert_eq!(std::fs::read(&path).unwrap(), original_file);
 
-        // Repeated startup must not replace a newer primary with stale legacy
-        // data. The loaded password must also remain available for exports.
+        // A primary entry is authoritative even when a stale legacy copy
+        // reappears; loading clears the stale copy. The loaded password must
+        // also remain available for exports.
+        legacy.set_password("legacy-password").unwrap();
         migrated.set_password("updated-password").unwrap();
         manager
             .accounts
@@ -1095,15 +1803,16 @@ mod tests {
         let exported: serde_json::Value =
             serde_json::from_str(&manager.export_accounts().unwrap()).unwrap();
         assert_eq!(exported[1]["password"], "updated-password");
-        assert_eq!(legacy.get_password().unwrap(), "legacy-password");
+        assert!(matches!(legacy.get_password(), Err(keyring::Error::NoEntry)));
         assert_eq!(migrated.get_password().unwrap(), "updated-password");
 
         // Even an explicitly empty primary is not a missing entry.
+        legacy.set_password("stale-again").unwrap();
         migrated.set_password("").unwrap();
         manager.load_accounts_with_service(&service).unwrap();
         assert!(manager.accounts[1].password.is_empty());
         assert_eq!(migrated.get_password().unwrap(), "");
-        assert_eq!(legacy.get_password().unwrap(), "legacy-password");
+        assert!(matches!(legacy.get_password(), Err(keyring::Error::NoEntry)));
     }
 
     #[test]
