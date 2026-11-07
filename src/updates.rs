@@ -6,8 +6,10 @@
 //! match the SHA-256 digest GitHub computed when they were uploaded.
 
 use crate::logging::Reason;
+use semver::Version;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -93,20 +95,27 @@ impl From<io::Error> for UpdateError {
     }
 }
 
-/// Parse "v3.1.0" / "3.1" / "3.1.0-beta" into comparable numbers.
-fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
-    let core = text.trim().trim_start_matches(['v', 'V']);
-    let core = core.split(['-', '+']).next()?;
-    let mut parts = core.split('.').map(|part| part.parse::<u64>().ok());
-    let major = parts.next()??;
-    let minor = parts.next().flatten().unwrap_or(0);
-    let patch = parts.next().flatten().unwrap_or(0);
-    Some((major, minor, patch))
+/// Parse a release version, keeping the optional `v` prefix GitHub tags use.
+/// Only complete semantic versions are accepted: short forms and unknown
+/// segments are not filled in with zeroes.
+fn parse_version(text: &str) -> Option<Version> {
+    Version::parse(without_v(text)).ok()
 }
 
+fn without_v(text: &str) -> &str {
+    text.strip_prefix('v')
+        .or_else(|| text.strip_prefix('V'))
+        .unwrap_or(text)
+}
+
+/// Whether `candidate` is a later semantic version than `current`. A leading
+/// `v` is accepted; anything that is not a complete semantic version is not
+/// newer.
 pub fn is_newer(candidate: &str, current: &str) -> bool {
     match (parse_version(candidate), parse_version(current)) {
-        (Some(candidate), Some(current)) => candidate > current,
+        (Some(candidate), Some(current)) => {
+            candidate.cmp_precedence(&current) == Ordering::Greater
+        }
         _ => false,
     }
 }
@@ -176,7 +185,7 @@ fn parse_release(json: &serde_json::Value) -> Option<Release> {
         return None;
     }
     Some(Release {
-        version: tag.trim_start_matches(['v', 'V']).to_owned(),
+        version: without_v(tag).to_owned(),
         name: json["name"].as_str().unwrap_or(tag).to_owned(),
         url: url.to_owned(),
         notes: json["body"].as_str().unwrap_or_default().chars().take(2000).collect(),
@@ -268,14 +277,29 @@ mod tests {
     const DIGEST: &str = "8c73b4c826f32e9405326642db2d25f5013533bed5b4ec63d63535bdcfb7df65";
 
     #[test]
-    fn compares_versions() {
+    fn compares_complete_semantic_versions() {
         assert!(is_newer("v3.1.0", "3.0.0"));
         assert!(is_newer("3.0.1", "3.0.0"));
-        assert!(is_newer("4", "3.9.9"));
+        assert!(is_newer("3.10.0", "3.9.9"));
+        assert!(is_newer("3.1.0", "3.1.0-beta"));
         assert!(!is_newer("v3.0.0", "3.0.0"));
         assert!(!is_newer("2.0.3", "3.0.0"));
         assert!(!is_newer("3.1.0-beta", "3.1.0"));
+        assert!(!is_newer("3.1.0+build.2", "3.1.0"), "build metadata has no precedence");
+        assert!(!is_newer("4", "3.9.9"), "a short version is not a semantic version");
+        assert!(!is_newer("3.1", "3.0.0"), "a short version is not a semantic version");
+        assert!(!is_newer("3.1.0.1", "3.1.0"), "a fourth segment is not silently dropped");
+        assert!(!is_newer("3.x", "3.0.0"), "an unknown segment is not treated as zero");
         assert!(!is_newer("latest", "3.0.0"));
+    }
+
+    #[test]
+    fn releases_with_a_non_semantic_tag_are_ignored() {
+        for tag in ["3.1", "4", "3.1.0.1", "latest"] {
+            let mut json = release(Vec::new());
+            json["tag_name"] = json!(tag);
+            assert!(parse_release(&json).is_none(), "{tag}");
+        }
     }
 
     #[test]
