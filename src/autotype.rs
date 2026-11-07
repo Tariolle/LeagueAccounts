@@ -1,13 +1,24 @@
 //! Types credentials into the previously focused window (the Riot Client).
 //!
-//! The sequence is: Alt+Tab back to the previous window, paste the account
-//! ID, Tab, paste the password, Enter. Clipboard writes exclude credentials
+//! The sequence is: validate the previously focused window against Riot's own
+//! install metadata, Alt+Tab back to it, paste the account ID, Tab, paste the
+//! password, Enter. The target process is pinned before the first keystroke,
+//! and every later input rechecks it. Clipboard writes exclude credentials
 //! from Windows history and cloud sync, then clear them after typing.
 
+#[cfg(any(windows, test))]
+use std::ffi::OsString;
+#[cfg(any(windows, test))]
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
 /// Alt+Tab back to the previously focused window, then type credentials.
+///
+/// The target is pinned after the switch: its image path must be the Riot
+/// Client of the installation that Riot's `client_path` metadata names, and
+/// one process handle keeps every later keystroke tied to that same, still
+/// running process. A window from any other program is never typed into.
 pub fn auto_type_credentials(account_id: &str, password: &str) -> bool {
     // Do not inject input while a physical shortcut key is still held.
     if !wait_for_shortcut_release() {
@@ -18,6 +29,12 @@ pub fn auto_type_credentials(account_id: &str, password: &str) -> bool {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, VK_MENU, VK_TAB};
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             GetForegroundWindow, GetWindowThreadProcessId,
+        };
+
+        // Riot's install metadata is the trusted source for where the client
+        // lives. Without it the previous window cannot be identified.
+        let Some(services) = crate::riot_client::client_path() else {
+            return false;
         };
 
         let original = unsafe { GetForegroundWindow() };
@@ -46,8 +63,9 @@ pub fn auto_type_credentials(account_id: &str, password: &str) -> bool {
             return false;
         }
         // Wait for an actual switch to another process, not just a successful
-        // SendInput call. Pin that target for the entire typing sequence.
-        let mut target = std::ptr::null_mut();
+        // SendInput call. Once stable, pin that process for the whole typing
+        // sequence and refuse it unless it is this installation's client.
+        let mut target = None;
         let mut stable = 0;
         for _ in 0..20 {
             thread::sleep(Duration::from_millis(100));
@@ -55,24 +73,146 @@ pub fn auto_type_credentials(account_id: &str, password: &str) -> bool {
             let mut pid = 0;
             unsafe { GetWindowThreadProcessId(current, &mut pid) };
             if current.is_null() || current == original || pid == 0 || pid == std::process::id() {
-                target = std::ptr::null_mut();
+                target = None;
                 stable = 0;
-            } else if current == target {
-                stable += 1;
-                if stable >= 3 {
-                    return type_credentials(account_id, password, || unsafe {
-                        GetForegroundWindow() == target
+                continue;
+            }
+            match target {
+                Some((window, seen_pid)) if window == current && seen_pid == pid => {
+                    stable += 1;
+                    if stable < 3 {
+                        continue;
+                    }
+                    let Some(process) = target_process::open(pid) else {
+                        return false;
+                    };
+                    let valid = process.alive()
+                        && process
+                            .image_path()
+                            .is_some_and(|image| is_riot_client_executable(&image, &services));
+                    if !valid {
+                        return false;
+                    }
+                    return type_credentials(account_id, password, || {
+                        process.alive() && process.focused(current)
                     });
                 }
-            } else {
-                target = current;
-                stable = 0;
+                _ => {
+                    target = Some((current, pid));
+                    stable = 0;
+                }
             }
         }
         false
     }
     #[cfg(not(windows))]
     type_credentials(account_id, password, || true)
+}
+
+/// Whether `image` is the Riot Client executable of the installation that
+/// `services` belongs to. Riot's metadata names `RiotClientServices.exe`;
+/// newer installs run `RiotClientElectron\Riot Client.exe`, and older ones
+/// `RiotClientUx.exe` beside the service.
+#[cfg(any(windows, test))]
+fn is_riot_client_executable(image: &Path, services: &Path) -> bool {
+    let Some(root) = services.parent().map(path_components) else {
+        return false;
+    };
+    let image = path_components(image);
+    let Some((name, parent)) = image.split_last() else {
+        return false;
+    };
+    let name = name.to_string_lossy();
+    let mut electron = root.clone();
+    electron.push(OsString::from("riotclientelectron"));
+    match name.as_ref() {
+        "riot client.exe" => parent == root.as_slice() || parent == electron.as_slice(),
+        "riotclientux.exe" => parent == root.as_slice(),
+        _ => false,
+    }
+}
+
+/// Compare paths the way Windows resolves them: case-insensitively and with
+/// either separator, while still requiring whole path components to match.
+#[cfg(any(windows, test))]
+fn path_components(path: &Path) -> Vec<OsString> {
+    path.components()
+        .map(|component| component.as_os_str().to_ascii_lowercase())
+        .collect()
+}
+
+/// One process handle per login target, so every keystroke is checked against
+/// the same process rather than a pid that could be reused.
+#[cfg(windows)]
+mod target_process {
+    use std::path::PathBuf;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessId, OpenProcess, QueryFullProcessImageNameW,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
+
+    pub(super) struct PinnedProcess {
+        handle: HANDLE,
+        pid: u32,
+    }
+
+    pub(super) fn open(pid: u32) -> Option<PinnedProcess> {
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if handle.is_null() {
+            return None;
+        }
+        if unsafe { GetProcessId(handle) } != pid {
+            unsafe { CloseHandle(handle) };
+            return None;
+        }
+        Some(PinnedProcess { handle, pid })
+    }
+
+    impl PinnedProcess {
+        pub(super) fn alive(&self) -> bool {
+            unsafe { WaitForSingleObject(self.handle, 0) == WAIT_TIMEOUT }
+        }
+
+        pub(super) fn image_path(&self) -> Option<PathBuf> {
+            let mut buffer = [0u16; 32_768];
+            let mut length = buffer.len() as u32;
+            let ok = unsafe {
+                QueryFullProcessImageNameW(self.handle, 0, buffer.as_mut_ptr(), &mut length)
+            };
+            if ok == 0 {
+                return None;
+            }
+            Some(PathBuf::from(String::from_utf16_lossy(
+                &buffer[..length as usize],
+            )))
+        }
+
+        pub(super) fn focused(&self, expected: windows_sys::Win32::Foundation::HWND) -> bool {
+            let window = unsafe { GetForegroundWindow() };
+            if window.is_null() || window != expected {
+                return false;
+            }
+            let mut pid = 0;
+            unsafe { GetWindowThreadProcessId(window, &mut pid) };
+            pid == self.pid
+        }
+    }
+
+    impl Drop for PinnedProcess {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
 }
 
 /// Type into the focused window: paste ID, Tab, paste password, Enter.
@@ -372,5 +512,37 @@ mod tests {
             assert_eq!(actions, expected);
             assert_eq!(prepared, expected_prepared);
         }
+    }
+
+    fn test_path(parts: &[&str]) -> std::path::PathBuf {
+        parts.iter().copied().collect()
+    }
+
+    #[test]
+    fn only_the_client_under_the_installed_riot_folder_is_accepted() {
+        let services = test_path(&["Riot Games", "Riot Client", "RiotClientServices.exe"]);
+        for image in [
+            test_path(&["Riot Games", "Riot Client", "RiotClientElectron", "Riot Client.exe"]),
+            test_path(&["Riot Games", "Riot Client", "Riot Client.exe"]),
+            test_path(&["RIOT GAMES", "RIOT CLIENT", "RIOTCLIENTUX.EXE"]),
+        ] {
+            assert!(is_riot_client_executable(&image, &services), "{}", image.display());
+        }
+        for image in [
+            test_path(&["Riot Games", "Riot Client", "RiotClientServices.exe"]),
+            test_path(&["Riot Games", "Riot Client", "Another.exe"]),
+            test_path(&["Riot Games", "Riot Client", "nested", "Riot Client.exe"]),
+            test_path(&["Riot Games", "Riot Client", "RiotClientElectron", "Another.exe"]),
+            test_path(&["Riot Games", "Riot Client Evil", "Riot Client.exe"]),
+            test_path(&["Elsewhere", "Riot Client.exe"]),
+            test_path(&["Riot Games", "Riot Client", "RiotClientElectron", "..", "RiotClientUx.exe"]),
+        ] {
+            assert!(!is_riot_client_executable(&image, &services), "{}", image.display());
+        }
+        #[cfg(windows)]
+        assert!(is_riot_client_executable(
+            Path::new(r"C:/Riot Games/Riot Client/RiotClientElectron/Riot Client.exe"),
+            Path::new(r"C:\Riot Games\Riot Client\RiotClientServices.exe"),
+        ));
     }
 }
