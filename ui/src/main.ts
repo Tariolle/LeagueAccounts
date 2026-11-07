@@ -240,6 +240,7 @@ function renderAccounts(): void {
       element.className = "card";
       element.dataset.key = id;
       element.tabIndex = 0;
+      element.addEventListener("focusin", () => select(id));
       element.style.setProperty("--i", String(Math.min(entering++, 14)));
       element.classList.add(firstRender ? "enter-stagger" : "enter");
       element.addEventListener("animationend", (event) => {
@@ -335,17 +336,17 @@ function upsert(account: AccountView): void {
 const describe = (error: unknown): string =>
   error instanceof ApiError ? errorText(error.code, error.detail) : errorText("unknown", String(error));
 
-async function guard<T>(work: () => Promise<T>, failTitle: MessageKey): Promise<T | undefined> {
+async function guard<T>(work: () => Promise<T>, failTitle: MessageKey): Promise<{ ok: true; value: T } | { ok: false }> {
   try {
-    return await work();
+    return { ok: true, value: await work() };
   } catch (error) {
     toast("error", t(failTitle), describe(error), 5000);
-    return undefined;
+    return { ok: false };
   }
 }
 
 async function copyId(account: AccountView): Promise<void> {
-  if ((await guard(() => api.copyAccountId(keyOf(account)), "toast.copyFailed")) !== undefined) {
+  if ((await guard(() => api.copyAccountId(keyOf(account)), "toast.copyFailed")).ok) {
     toast("success", t("toast.idCopied"), account.accountId);
   }
 }
@@ -377,7 +378,7 @@ async function copyRiotId(account: AccountView): Promise<void> {
 
 async function copyPassword(account: AccountView): Promise<void> {
   const ttl = await guard(() => api.copyPassword(keyOf(account)), "toast.passFailed");
-  if (ttl !== undefined) toast("success", t("toast.passCopied"), t("toast.passCopiedText", { seconds: ttl }));
+  if (ttl.ok) toast("success", t("toast.passCopied"), t("toast.passCopiedText", { seconds: ttl.value }));
 }
 
 let loginBusy = false;
@@ -436,8 +437,9 @@ async function runLogin(account: AccountView, closeRunning = false, launchBanned
 
   // Never sign another account in under an open League client or match.
   if (viaRiot && !closeRunning) {
-    const status = await guard(() => api.gameStatus(key), "toast.loginFailed");
-    if (!status) return;
+    const checked = await guard(() => api.gameStatus(key), "toast.loginFailed");
+    if (!checked.ok) return;
+    const status = checked.value;
     if ((status.clientOpen || status.inGame) && !status.sameAccount) {
       if (!(await confirmCloseLeague(account, status.inGame))) return;
       return runLogin(account, true, launchBanned);
@@ -651,8 +653,8 @@ async function editAccount(account: AccountView): Promise<void> {
       const updated = await guard(() => api.updateAccount(keyOf(account), input),
         "toast.saveFailed",
       );
-      if (!updated) return false;
-      upsert(updated);
+      if (!updated.ok) return false;
+      upsert(updated.value);
       render();
       toast("success", t("toast.updated"));
       return true;
@@ -676,7 +678,7 @@ async function deleteAccount(account: AccountView): Promise<void> {
   });
   if (answer !== "delete") return;
   const id = keyId(keyOf(account));
-  if ((await guard(() => api.deleteAccount(keyOf(account)), "toast.deleteFailed")) === undefined) return;
+  if (!(await guard(() => api.deleteAccount(keyOf(account)), "toast.deleteFailed")).ok) return;
   const element = document.querySelector<HTMLElement>(`#accounts > .card[data-key="${CSS.escape(id)}"]`);
   if (element) await leave(element, "card-out");
   state.accounts = state.accounts.filter((candidate) => keyId(keyOf(candidate)) !== id);
@@ -708,12 +710,12 @@ async function refreshAll(force = false): Promise<void> {
   state.refreshDone = 0;
   renderSchedule();
   const count = await guard(() => api.refreshRanks(force), "toast.refreshFailed");
-  if (count === undefined) {
+  if (!count.ok) {
     state.refreshing = false;
     renderSchedule();
     return;
   }
-  state.refreshTotal = count;
+  state.refreshTotal = count.value;
   renderSchedule();
 }
 
@@ -758,8 +760,9 @@ function renderSchedule(): void {
 const UI_SCALES = [80, 90, 100, 110, 125, 150, 175, 200];
 
 async function openSettings(): Promise<void> {
-  const current = await guard(() => api.getSettings(), "toast.settingsFailed");
-  if (!current) return;
+  const loaded = await guard(() => api.getSettings(), "toast.settingsFailed");
+  if (!loaded.ok) return;
+  const current = loaded.value;
   const languageOptions = LANGUAGES.map(
     (language) => `<option value="${language.code}"${language.code === lang() ? " selected" : ""}>${esc(language.name)}</option>`,
   ).join("");
@@ -866,10 +869,10 @@ async function openSettings(): Promise<void> {
           }),
         "toast.settingsFailed",
       );
-      if (!saved) return false;
-      state.settings = saved;
+      if (!saved.ok) return false;
+      state.settings = saved.value;
       const language = $<HTMLSelectElement>('[name="language"]', root).value as Lang;
-      if (language !== lang()) changeLanguage(language);
+      if (language !== lang() && !(await changeLanguage(language))) return false;
       toast("success", t("settings.saved"));
       return true;
     },
@@ -1011,14 +1014,14 @@ function openAddDrawer(tab: "single" | "multi" = "single"): void {
       "toast.addFailed",
     );
     button.disabled = false;
-    if (!added) return;
-    upsert(added);
-    state.selected = keyId(keyOf(added));
+    if (!added.ok) return;
+    upsert(added.value);
+    state.selected = keyId(keyOf(added.value));
     render();
     single.reset();
     $<HTMLSelectElement>('[name="region"]', single).value = lastRegion();
     $<HTMLInputElement>('[name="accountId"]', single).focus();
-    toast("success", t("toast.added"), added.name ? t("toast.addedText", { name: added.name }) : added.accountId);
+    toast("success", t("toast.added"), added.value.name ? t("toast.addedText", { name: added.value.name }) : added.value.accountId);
   });
 
   const multi = $<HTMLFormElement>('[data-panel="multi"]', overlay);
@@ -1040,8 +1043,9 @@ function openAddDrawer(tab: "single" | "multi" = "single"): void {
     textarea.readOnly = true;
     regionSelect.disabled = true;
     try {
-      const result = await guard(() => api.multiAdd(text, region, locale || null), "toast.multiFailed");
-      if (!result) return;
+      const response = await guard(() => api.multiAdd(text, region, locale || null), "toast.multiFailed");
+      if (!response.ok) return;
+      const result = response.value;
       const lines = text.split("\n");
       textarea.value = result.skippedLines.map((index) => lines[index]).join("\n");
       updateMultiCount();
@@ -1118,12 +1122,13 @@ async function exportData(): Promise<void> {
   });
   if (answer !== "export") return;
   const path = await guard(() => api.exportData(t("export.dialog")), "toast.exportFailed");
-  if (path) toast("success", t("toast.exported"), path, 4500);
+  if (path.ok && path.value) toast("success", t("toast.exported"), path.value, 4500);
 }
 
 async function importData(): Promise<void> {
-  const result = await guard(() => api.importData(t("import.dialog")), "toast.importFailed");
-  if (!result) return;
+  const response = await guard(() => api.importData(t("import.dialog")), "toast.importFailed");
+  if (!response.ok || !response.value) return;
+  const result = response.value;
   state.accounts = await api.listAccounts();
   render();
   toast(
@@ -1190,13 +1195,7 @@ async function welcomeLanguage(): Promise<void> {
     actions: [{ label: t("common.ok"), value: "ok", kind: "primary" }],
     onSubmit: async (_value, root) => {
       const language = $<HTMLSelectElement>('[name="language"]', root).value as Lang;
-      // Not `changeLanguage`: on first run the picked language can equal the
-      // untranslated default, and skipping the write would ask again next time.
-      setLang(language);
-      void api.setUiLanguage(language).catch(() => {});
-      applyLanguage();
-      render();
-      return true;
+      return changeLanguage(language);
     },
   });
   // Closed without choosing — Escape, the X, or a click outside: keep the
@@ -1204,9 +1203,7 @@ async function welcomeLanguage(): Promise<void> {
   // next launch. Only answering used to store a choice, so a dismissal made
   // the question repeat forever.
   if (answer === null) {
-    setLang(lang());
-    void api.setUiLanguage(lang()).catch(() => {});
-    applyLanguage();
+    await changeLanguage(lang());
   }
 }
 
@@ -1223,13 +1220,14 @@ function applyLanguage(): void {
   friendTier.value = selectedTier;
 }
 
-function changeLanguage(next: Lang): void {
-  if (next === lang()) return;
+async function changeLanguage(next: Lang): Promise<boolean> {
+  const saved = await guard(() => api.setUiLanguage(next), "toast.settingsFailed");
+  if (!saved.ok) return false;
+  // Only publish the choice after its durable settings write succeeds.
   setLang(next);
-  // Durable copy: the webview's localStorage is a cache and can be rebuilt.
-  void api.setUiLanguage(next).catch(() => {});
   applyLanguage();
   render();
+  return true;
 }
 
 // ---------------------------------------------------------------- wiring
@@ -1490,6 +1488,7 @@ async function wireWindow(): Promise<void> {
 
 async function wireEvents(): Promise<void> {
   await events.onLoginStep((step) => activeLogin?.step(step));
+  await events.onLoginUpdate((progress) => activeLogin?.update(progress));
   await events.onRefreshStarted(({ total }) => {
     state.refreshing = true;
     state.refreshTotal = total;
@@ -1595,7 +1594,7 @@ async function start(): Promise<void> {
   } else if (!needsLanguageChoice() && !remembered) {
     // Chosen before this field existed: copy the cached value into the
     // settings file so the record survives the next cache rebuild.
-    void api.setUiLanguage(lang()).catch(() => {});
+    void guard(() => api.setUiLanguage(lang()), "toast.settingsFailed");
   }
   $("#version").textContent = `v${boot.version}`;
   render();

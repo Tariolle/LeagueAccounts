@@ -1,7 +1,7 @@
 // Full-screen sign-in progress: shows each step reported by the backend
 // ("login-step" events) as it happens.
 
-import { accountLabel, type AccountView, type LoginStep } from "./api";
+import { accountLabel, type AccountView, type LoginStep, type LoginUpdate } from "./api";
 import { $, esc, fragment, leave } from "./dom";
 import { t, type MessageKey } from "./i18n";
 import { icon } from "./icons";
@@ -25,10 +25,22 @@ const LABELS: Record<LoginStep, MessageKey> = {
 
 export interface LoginOverlay {
   step(step: LoginStep): void;
+  update(progress: LoginUpdate | null): void;
   succeed(title: string, detail: string): void;
   finishInClient(): void;
   fail(message: string, title?: string): void;
   close(): void;
+}
+
+/** Minutes and seconds (or hours), matching the client's compact style. */
+function formatRemaining(ms: number): string {
+  const total = Math.max(1, Math.round(ms / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const mm = String(minutes).padStart(2, "0");
+  const ss = String(seconds).padStart(2, "0");
+  return hours > 0 ? `${hours}:${mm}:${ss}` : `${minutes}:${ss}`;
 }
 
 export function openLoginOverlay(options: {
@@ -81,6 +93,10 @@ export function openLoginOverlay(options: {
             )
             .join("")}
         </ol>
+        <div class="login-update" hidden>
+          <span class="login-update-percent"></span>
+          <span class="login-update-eta" hidden></span>
+        </div>
         <p class="login-message" hidden></p>
         <div class="login-actions">
           <button class="btn btn-ghost" data-login="cancel">${esc(t("common.cancel"))}</button>
@@ -130,7 +146,12 @@ export function openLoginOverlay(options: {
   };
 
   // The result stays on screen until the user closes it.
+  const hideUpdate = () => {
+    $(".login-update", overlay).hidden = true;
+  };
+
   const finish = (kind: "success" | "info" | "error", message: string) => {
+    hideUpdate();
     showCrest();
     overlay.classList.add(`is-${kind}`);
     progress.setAttribute("aria-valuetext", $(".login-title", overlay).textContent ?? "");
@@ -166,7 +187,10 @@ export function openLoginOverlay(options: {
         render();
         return;
       }
-      if (step === "launchGame") updating = false;
+      if (step === "launchGame") {
+        updating = false;
+        hideUpdate();
+      }
       if (step === "done") {
         updating = false;
         steps.forEach((candidate) => {
@@ -185,6 +209,22 @@ export function openLoginOverlay(options: {
       });
       states.set(step, "active");
       render();
+    },
+    update(progress) {
+      const line = $(".login-update", overlay);
+      if (!progress || progress.percent === null) {
+        line.hidden = true;
+        return;
+      }
+      const percent = Math.round(Math.min(100, Math.max(0, progress.percent)));
+      $(".login-update-percent", line).textContent = t("login.update.percent", { percent });
+      const eta = $(".login-update-eta", line);
+      const remaining = progress.remainingMs ?? 0;
+      eta.hidden = remaining <= 0;
+      if (remaining > 0) {
+        eta.textContent = t("login.update.remaining", { time: formatRemaining(remaining) });
+      }
+      line.hidden = false;
     },
     succeed(title, detail) {
       api.step("done");

@@ -1,3 +1,5 @@
+import { api } from "./api";
+
 /** Decode the first screen, including CSS backgrounds and icon masks, offscreen. */
 export async function revealApp(): Promise<void> {
   const images = [...document.images].map(image => image.decode().catch(() => {}));
@@ -24,6 +26,7 @@ export async function revealApp(): Promise<void> {
   document.body.classList.add("ready");
   document.body.setAttribute("aria-busy", "false");
   document.querySelector("#startup-loader")?.remove();
+  void api.appReady().catch(error => console.error("Update health could not be recorded", error));
 }
 
 export function failStartup(error: unknown): void {

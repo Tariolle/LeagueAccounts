@@ -7,7 +7,7 @@ import { errorText, lang, t } from "./i18n";
 import { icon } from "./icons";
 
 const DISMISSED_UPDATE = "leagueaccounts.dismissedUpdate";
-/** Hold the loading screen up to this long after page load for the launch check. */
+/** Hold the loading screen up to this long from the start of the launch check. */
 const LAUNCH_HOLD_MS = 3000;
 const RESTART_SECONDS = 10;
 const IDLE_POLL_MS = 15_000;
@@ -19,6 +19,10 @@ const changed = new Set<() => void>();
 
 let screen: HTMLElement | null = null;
 let revealAfterScreen: (() => Promise<void>) | null = null;
+/** The app was shown before the download started: track it in a banner. */
+let progressBanner: HTMLElement | null = null;
+/** "Continue in the background" or dismissing the progress banner. */
+let silent = false;
 let holding = false;
 let notice: HTMLElement | null = null;
 let watcher: number | undefined;
@@ -41,8 +45,11 @@ function apply(status: UpdateStatus): void {
   current = status;
   changed.forEach((listener) => listener());
   renderScreen();
+  renderProgress();
   renderResult();
   const { phase, release } = status;
+  if (phase === "downloading" && status.launch && !screen && !silent) showProgress();
+  if (phase !== "downloading") removeProgress();
   if ((phase === "available" || phase === "failed") && previous?.phase !== phase && release) {
     if (screen) void closeScreen();
     showUpdateBanner(release);
@@ -65,8 +72,9 @@ const launchPending = (): boolean =>
  */
 export async function launchUpdate(reveal: () => Promise<void>): Promise<boolean> {
   holding = true;
-  const remaining = LAUNCH_HOLD_MS - performance.now();
-  if (launchPending() && remaining > 0) {
+  // Start the budget here, not at navigation: a cold WebView and a large
+  // account list can take longer than the hold by the time this runs.
+  if (launchPending()) {
     await new Promise<void>((resolve) => {
       const finish = () => {
         changed.delete(check);
@@ -76,7 +84,7 @@ export async function launchUpdate(reveal: () => Promise<void>): Promise<boolean
       const check = () => {
         if (!launchPending()) finish();
       };
-      const timer = setTimeout(finish, remaining);
+      const timer = setTimeout(finish, LAUNCH_HOLD_MS);
       changed.add(check);
     });
   }
@@ -89,6 +97,8 @@ export async function launchUpdate(reveal: () => Promise<void>): Promise<boolean
   const loader = document.querySelector<HTMLElement>("#startup-loader");
   if (!loader) return false;
   revealAfterScreen = reveal;
+  // The app was never shown, so the loading screen is the only progress UI.
+  removeProgress();
   loader.setAttribute("aria-label", t("update.screen"));
   screen = fragment(`
     <div class="update-screen">
@@ -98,7 +108,10 @@ export async function launchUpdate(reveal: () => Promise<void>): Promise<boolean
       <button type="button" class="text-button">${esc(t("update.background"))}</button>
     </div>`);
   loader.append(screen);
-  $("button", screen).addEventListener("click", () => void closeScreen());
+  $("button", screen).addEventListener("click", () => {
+    silent = true;
+    void closeScreen();
+  });
   renderScreen();
   if (phase === "ready") void restart();
   return true;
@@ -119,6 +132,49 @@ function renderScreen(): void {
     : current.total
       ? `${megabytes(current.received)} / ${megabytes(current.total)} MB`
       : "";
+}
+
+/**
+ * The launch check outlived the loading screen: show the download where the
+ * app already is, so a slow check still has visible progress.
+ */
+function showProgress(): void {
+  // Only after the app is visible: before that, launchUpdate owns the screen.
+  if (progressBanner || !current?.release || !document.body.classList.contains("ready")) return;
+  document.querySelector(".update-banner")?.remove();
+  const label = t("update.downloading", { version: current.release.version });
+  const element = fragment(`
+    <div class="update-banner" role="status" data-update-progress>
+      <div class="update-body">
+        <strong>${esc(label)}</strong>
+        <div class="update-meter" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="${esc(label)}"><span></span></div>
+        <span class="update-progress-detail"></span>
+      </div>
+      <button class="icon-btn" data-update-progress="close" aria-label="${esc(t("common.close"))}" data-tooltip="${esc(t("common.close"))}">${icon("x")}</button>
+    </div>`);
+  progressBanner = element;
+  $("#toasts").before(element);
+  // Only the close button dismisses: the body is status text, not a control.
+  $("button[data-update-progress='close']", element).addEventListener("click", () => {
+    silent = true;
+    removeProgress();
+  });
+  renderProgress();
+}
+
+function renderProgress(): void {
+  if (!progressBanner || !current) return;
+  const fraction = current.total ? Math.min(1, current.received / current.total) : 0;
+  $("span", $(".update-meter", progressBanner)).style.transform = `scaleX(${fraction})`;
+  $(".update-meter", progressBanner).setAttribute("aria-valuenow", String(Math.floor(fraction * 100)));
+  $(".update-progress-detail", progressBanner).textContent = current.total
+    ? `${megabytes(current.received)} / ${megabytes(current.total)} MB`
+    : "";
+}
+
+function removeProgress(): void {
+  progressBanner?.remove();
+  progressBanner = null;
 }
 
 /** Show the app; an installed update then waits for an idle moment instead. */

@@ -1,7 +1,7 @@
 // Development-only stand-in for the Tauri backend, used when the UI is opened
 // in a plain browser (`npm run dev`).
 // Never bundled into release builds. Everything lives only in memory.
-import { ApiError, api, events, keyId, parseAccountLine, type AccountView, type BulkAddResult, type Key, type LoginStep, type NewAccount, type RefreshDone, type Settings, type UpdateAccount, type UpdateStatus } from "./api";
+import { ApiError, api, events, keyId, parseAccountLine, type AccountView, type BulkAddResult, type Key, type LoginStep, type LoginUpdate, type NewAccount, type RefreshDone, type Settings, type UpdateAccount, type UpdateStatus } from "./api";
 
 const lol = (tier: string, division: string, lp: string, finished = "Gold II", reached = finished) => ({
   tier,
@@ -45,6 +45,7 @@ const sample: AccountView[] = [
 type Handler<T> = (payload: T) => void;
 const listeners = {
   step: [] as Handler<LoginStep>[],
+  progress: [] as Handler<LoginUpdate | null>[],
   pending: [] as Handler<Key[]>[],
   update: [] as Handler<AccountView>[],
   done: [] as Handler<RefreshDone>[],
@@ -95,11 +96,13 @@ function simulateInstall(launch: boolean): void {
 
 export function installMock(): void {
   const scene = new URLSearchParams(location.search).get("scene");
+  const slowStart = scene === "slow-update" || scene === "late-update";
+  const checkDelay = scene === "late-update" ? 7000 : scene === "slow-update" ? 3800 : scene === "restart" ? 1500 : 300;
   setTimeout(() => {
-    if (scene === "updating") simulateInstall(true);
+    if (scene === "updating" || slowStart) simulateInstall(true);
     else if (scene === "restart") setUpdate({ phase: "ready", release, launch: false });
     else setUpdate({ phase: "upToDate", release: { ...release, version: "3.0.3" } });
-  }, scene === "restart" ? 1500 : 300);
+  }, checkDelay);
   let accounts = structuredClone(sample);
   const find = (key: Key) => accounts.find((account) => keyId(account) === keyId(key));
   const fakeFetch = (targets: AccountView[], exclusive = false) => {
@@ -117,7 +120,9 @@ export function installMock(): void {
   };
 
   Object.assign(api, {
-    bootstrap: async () => ({
+    bootstrap: async () => {
+      if (slowStart) await wait(3200);
+      return {
       accounts,
       regions: ["EUW", "EUNE", "NA", "KR", "TR", "BR", "JP", "OCE", "RU", "LAN", "LAS", "ME", "SEA", "TW", "VN"],
       locales: [
@@ -133,7 +138,9 @@ export function installMock(): void {
       loadError: null,
       settings,
       schedule: { enabled: true, intervalMinutes: 30, nextAt: Date.now() + 23 * 60_000, lastAt: Date.now() - 7 * 60_000, running: false },
-    }),
+      };
+    },
+    appReady: async () => false,
     getSettings: async () => settings,
     updateSettings: async (input: object) => Object.assign(settings, input),
     login: async (key: Key, _tft: boolean, _closeRunning: boolean, launchBanned: boolean) => {
@@ -142,6 +149,12 @@ export function installMock(): void {
       for (const step of steps) {
         if (ban && settings.launchGame && !launchBanned && step === "launchGame") throw new ApiError("account_banned", ban.until == null ? "" : String(ban.until));
         listeners.step.forEach((handler) => handler(step));
+        if (step === "updating") {
+          for (const percent of [18, 42, 67, 91]) {
+            listeners.progress.forEach((handler) => handler({ percent, remainingMs: (100 - percent) * 1200 }));
+            await wait(160);
+          }
+        }
         await wait(step === "signIn" ? 1400 : 700);
       }
       return "signedIn";
@@ -235,6 +248,7 @@ export function installMock(): void {
   } satisfies typeof api);
   Object.assign(events, {
     onLoginStep: async (handler: Handler<LoginStep>) => (listeners.step.push(handler), unlisten()),
+    onLoginUpdate: async (handler: Handler<LoginUpdate | null>) => (listeners.progress.push(handler), unlisten()),
     onUpdateStatus: async (handler: Handler<UpdateStatus>) => (listeners.status.push(handler), unlisten()),
     onRefreshStarted: async () => unlisten(),
     onSchedule: async () => unlisten(),

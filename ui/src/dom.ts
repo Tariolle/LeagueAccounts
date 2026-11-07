@@ -82,6 +82,8 @@ export interface ModalAction {
 /**
  * Show a modal; resolves with the clicked action value, or null on dismiss.
  * `onSubmit` can validate a form and keep the modal open by returning false.
+ * While a submission is pending the controls are disabled and the modal cannot
+ * be dismissed, so a slow save cannot be duplicated or raced.
  */
 export function modal(options: {
   title: string;
@@ -118,10 +120,36 @@ export function modal(options: {
     const previousFocus = document.activeElement as HTMLElement | null;
     $("#modal-root").append(overlay);
     options.onOpen?.(overlay);
-    const first = overlay.querySelector<HTMLElement>("input, textarea, select, .btn-primary, .btn-danger");
-    first?.focus();
+    const fields = overlay.querySelector<HTMLElement>("input, textarea, select");
+    /** A no-input danger confirm defaults to its cancel action, not the danger. */
+    const defaultAction = (): ModalAction | undefined => {
+      if (!fields && options.actions.some((action) => action.kind === "danger")) {
+        return options.actions.find((action) => action.kind !== "danger");
+      }
+      return options.actions.find((action) => action.kind === "primary" || action.kind === "danger");
+    };
+    const actionButtons = [...overlay.querySelectorAll<HTMLButtonElement>(".modal-foot button[data-value]")];
+    const defaultButton = actionButtons.find((button) => button.dataset.value === defaultAction()?.value);
+    (fields ?? defaultButton ?? overlay.querySelector<HTMLElement>(".modal-close"))?.focus();
 
     let closed = false;
+    let submitting = false;
+    const wasDisabled = new Map<HTMLButtonElement | HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement, boolean>();
+    const lock = (locked: boolean) => {
+      if (locked) {
+        overlay.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(
+          "button, input, select, textarea",
+        ).forEach((control) => {
+          wasDisabled.set(control, control.disabled);
+          control.disabled = true;
+        });
+      } else {
+        wasDisabled.forEach((original, control) => {
+          control.disabled = original;
+        });
+        wasDisabled.clear();
+      }
+    };
     const close = (value: string | null) => {
       if (closed) return;
       closed = true;
@@ -131,7 +159,24 @@ export function modal(options: {
       resolve(value);
     };
     const submit = async (value: string) => {
-      if (options.onSubmit && !(await options.onSubmit(value, overlay))) return;
+      if (closed || submitting) return;
+      if (!options.onSubmit) {
+        close(value);
+        return;
+      }
+      submitting = true;
+      lock(true);
+      let accepted = false;
+      try {
+        accepted = await options.onSubmit(value, overlay);
+      } catch {
+        // A failed save leaves the form open so it can be submitted again.
+        return;
+      } finally {
+        submitting = false;
+        lock(false);
+      }
+      if (closed || !accepted) return;
       close(value);
     };
     const onKey = (event: KeyboardEvent) => {
@@ -140,26 +185,27 @@ export function modal(options: {
       const top = [...document.querySelectorAll("#modal-root > .overlay:not(.overlay-out)")].at(-1);
       if (closed || top !== overlay) return;
       if (event.key === "Tab") {
-        const controls = [...overlay.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex='0']")]
+        const focusable = [...overlay.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex='0']")]
           .filter(control => control.getClientRects().length > 0);
-        const first = controls[0];
-        const last = controls.at(-1);
+        const first = focusable[0];
+        const last = focusable.at(-1);
         if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
         else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
       }
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopImmediatePropagation();
-        close(null);
+        if (!submitting) close(null);
       }
     };
     document.addEventListener("keydown", onKey, true);
     overlay.addEventListener("mousedown", (event) => {
-      if (event.target === overlay) close(null);
+      if (event.target === overlay && !submitting) close(null);
     });
     overlay.querySelectorAll<HTMLButtonElement>("[data-value]").forEach((button) => {
       button.addEventListener("click", (event) => {
         event.preventDefault();
+        if (submitting) return;
         const value = button.dataset.value ?? "";
         if (value === "__close") close(null);
         else void submit(value);
@@ -167,7 +213,7 @@ export function modal(options: {
     });
     overlay.querySelector("form")?.addEventListener("submit", (event) => {
       event.preventDefault();
-      const primary = options.actions.find((action) => action.kind === "primary" || action.kind === "danger");
+      const primary = defaultAction();
       if (primary) void submit(primary.value);
     });
   });

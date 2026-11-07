@@ -64,6 +64,14 @@ export type LoginStep =
   | "updating"
   | "done";
 
+/** Progress Riot reports while an update keeps the game from launching. */
+export interface LoginUpdate {
+  /** Share of the update already applied, 0-100, when Riot reports it. */
+  percent: number | null;
+  /** Riot's estimate of the time left, when it reports one. */
+  remainingMs: number | null;
+}
+
 export interface GameStatus {
   clientOpen: boolean;
   inGame: boolean;
@@ -255,6 +263,7 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
 
 export const api = {
   bootstrap: () => call<Bootstrap>("bootstrap"),
+  appReady: () => call<boolean>("app_ready"),
   listAccounts: () => call<AccountView[]>("list_accounts"),
   addAccount: (input: NewAccount) => call<AccountView>("add_account", { input }),
   multiAdd: (text: string, region: string, locale: string | null) =>
@@ -294,6 +303,8 @@ export const api = {
 export const events = {
   onLoginStep: (handler: (step: LoginStep) => void): Promise<UnlistenFn> =>
     listen<LoginStep>("login-step", (event) => handler(event.payload)),
+  onLoginUpdate: (handler: (update: LoginUpdate | null) => void): Promise<UnlistenFn> =>
+    listen<LoginUpdate | null>("login-update", (event) => handler(event.payload)),
   onUpdateStatus: (handler: (status: UpdateStatus) => void): Promise<UnlistenFn> =>
     listen<UpdateStatus>("update-status", (event) => handler(event.payload)),
   onRefreshStarted: (handler: (started: RefreshStarted) => void): Promise<UnlistenFn> =>
