@@ -4,11 +4,20 @@
 
 Requirements: [Rust](https://rustup.rs) (MSVC toolchain), [Node.js](https://nodejs.org) 20+, and the Visual Studio C++ Build Tools.
 
+`rust-toolchain.toml` pins the MSVC toolchain. A GNU toolchain also compiles,
+but it links `WebView2Loader.dll` dynamically: that exe only starts next to the
+DLL the build leaves in `target/release`. MSVC links the loader statically, so
+the exe is portable on its own.
+
 ```bash
 npm install
 npx tauri dev                # run with hot reload
 npx tauri build --no-bundle  # build target/release/LeagueAccounts.exe
 ```
+
+To use a local build, close the app and replace the `LeagueAccounts.exe` you
+run, keeping the previous exe beside it as `LeagueAccounts.exe.bak-YYYYMMDD`.
+Account data lives in `%APPDATA%\LeagueAccounts` and is untouched.
 
 | Folder | Contents |
 |---|---|
