@@ -83,6 +83,7 @@ username2----password2
 |---|---|
 | *Riot Client was not found* | Install the Riot Client, or use **Settings → Login → Type into the previous window**. |
 | *The Riot Client login screen or sign-in status wasn't ready in time* | Open the Riot Client once manually (it may be updating), then retry. |
+| Shown online while using [Deceive](https://github.com/molenzwiebel/Deceive) | Start Deceive first, then log in with League Accounts. A Riot Client that League Accounts opens itself doesn't go through Deceive. |
 | Ranks show **Unavailable** or *Riot ID not found* | Check the Riot ID and region; OP.GG may also be rate-limiting. |
 | Anything else | Attach the newest file from **Log folder** (sidebar) to an [issue](https://github.com/Tariolle/LeagueAccounts/issues). |
 

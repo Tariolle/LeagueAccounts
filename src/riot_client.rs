@@ -1079,6 +1079,83 @@ mod windows {
         let path = String::from_utf16_lossy(&buffer[..length as usize]);
         Some(std::path::PathBuf::from(path))
     }
+
+    /// Arguments `pid` was started with, split as Windows splits them.
+    pub fn process_args(pid: u32) -> Option<Vec<std::ffi::OsString>> {
+        use std::mem::size_of;
+        use std::os::windows::ffi::OsStringExt;
+        use windows_sys::Wdk::System::Threading::{
+            NtQueryInformationProcess, ProcessCommandLineInformation,
+        };
+        use windows_sys::Win32::Foundation::{LocalFree, UNICODE_STRING};
+        use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+
+        // SAFETY: plain query handle, closed below.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return None;
+        }
+        let mut bytes = 0;
+        // SAFETY: the empty-buffer call only reports the required size.
+        unsafe {
+            NtQueryInformationProcess(
+                process,
+                ProcessCommandLineInformation,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes,
+            )
+        };
+        // Word-aligned for the UNICODE_STRING header that starts the buffer.
+        let mut buffer = vec![0usize; (bytes as usize).div_ceil(size_of::<usize>())];
+        // SAFETY: buffer and size describe a writable, word-aligned buffer.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                process,
+                ProcessCommandLineInformation,
+                buffer.as_mut_ptr().cast(),
+                (buffer.len() * size_of::<usize>()) as u32,
+                &mut bytes,
+            )
+        };
+        // SAFETY: handle opened above.
+        unsafe { CloseHandle(process) };
+        if status < 0 || buffer.len() * size_of::<usize>() < size_of::<UNICODE_STRING>() {
+            return None;
+        }
+        // SAFETY: on success the buffer starts with a UNICODE_STRING whose
+        // text lies inside the same buffer.
+        let mut line = unsafe {
+            let text = &*buffer.as_ptr().cast::<UNICODE_STRING>();
+            if text.Buffer.is_null() {
+                return None;
+            }
+            std::slice::from_raw_parts(text.Buffer, text.Length as usize / 2).to_vec()
+        };
+        if line.is_empty() {
+            return None;
+        }
+        line.push(0);
+        let mut count = 0;
+        // SAFETY: `line` is a terminated UTF-16 string.
+        let argv = unsafe { CommandLineToArgvW(line.as_ptr(), &mut count) };
+        if argv.is_null() {
+            return None;
+        }
+        let args = (0..count as usize)
+            .map(|index| {
+                // SAFETY: Windows returned `count` terminated strings.
+                unsafe {
+                    let arg = *argv.add(index);
+                    let length = (0..).take_while(|&unit| *arg.add(unit) != 0).count();
+                    std::ffi::OsString::from_wide(std::slice::from_raw_parts(arg, length))
+                }
+            })
+            .collect();
+        // SAFETY: CommandLineToArgvW allocates the array with LocalAlloc.
+        unsafe { LocalFree(argv.cast()) };
+        Some(args)
+    }
 }
 
 #[cfg(not(windows))]
@@ -1088,6 +1165,10 @@ mod windows {
     }
 
     pub fn process_path(_: u32) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    pub fn process_args(_: u32) -> Option<Vec<std::ffi::OsString>> {
         None
     }
 }
@@ -1372,6 +1453,39 @@ mod tests {
                 .to_ascii_lowercase()
         );
         assert_eq!(windows::process_path(current.pid), Some(executable));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn process_arguments_are_read_as_windows_splits_them() {
+        use std::ffi::OsString;
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let own: Vec<OsString> = std::env::args_os().collect();
+        assert_eq!(windows::process_args(std::process::id()), Some(own));
+        // Deceive quotes only the value; `rem` keeps cmd waiting on stdin.
+        let mut child = Command::new("cmd.exe")
+            .raw_arg(r#"/d /k rem --client-config-url="http://127.0.0.1:5000""#)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .unwrap();
+        let args = windows::process_args(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            args.unwrap()[1..],
+            [
+                "/d",
+                "/k",
+                "rem",
+                "--client-config-url=http://127.0.0.1:5000"
+            ]
+            .map(OsString::from),
+        );
     }
 
     #[test]
