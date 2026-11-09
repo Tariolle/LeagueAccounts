@@ -10,12 +10,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Single freshness threshold for Manual and Auto; the UI ages it via `fresh_until`.
 pub const MAX_AGE: Duration = Duration::from_secs(15 * 60);
+/// Wall-clock budget for one renewal exchange: shared-reference discovery plus
+/// the POST/poll exchange. The permit wait is budgeted separately by
+/// `PERMIT_WAIT`, so a queued renewal never eats another one's budget.
 pub const RENEWAL_TIMEOUT: Duration = Duration::from_secs(20);
 /// Waiting for a permit has its own budget so it never eats the renewal's.
 const PERMIT_WAIT: Duration = Duration::from_secs(40);
 pub const MAX_CONCURRENT_RENEWALS: usize = 2;
 const FAILED_RETRY_DELAY: Duration = Duration::from_secs(60);
 const ACTION_CACHE_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+/// Cap for any rate-limit cooldown, including provider-supplied `Retry-After`
+/// values. 15 minutes covers OP.GG's normal bursts without ever suspending
+/// renewals for hours on a malformed or absurd header.
+const MAX_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_COOLDOWN: Duration = Duration::from_secs(60);
 const ASSET_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
@@ -27,6 +35,7 @@ pub(super) struct RenewalState {
     cooldown: Mutex<Option<Instant>>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
 struct CachedActions {
     build: String,
     /// The asset that supplied both references. Other profile chunks can differ.
@@ -68,14 +77,29 @@ impl RenewalState {
             .is_some_and(|until| until > Instant::now())
     }
 
+    /// A provider `Retry-After` is honored up to [`MAX_COOLDOWN`], so a
+    /// malformed or absurd header can never suspend renewal indefinitely.
     pub(super) fn set_cooldown(&self, seconds: Option<u64>) {
+        let wait = cooldown(seconds);
         if let Ok(mut until) = self.cooldown.lock() {
-            let now = Instant::now();
-            let next = now
-                .checked_add(Duration::from_secs(seconds.unwrap_or(60).max(1)))
-                .unwrap_or(now + Duration::from_secs(u32::MAX.into()));
+            let next = Instant::now() + wait;
             *until = Some(until.map_or(next, |previous| previous.max(next)));
         }
+    }
+
+    /// Atomically reserve this profile's retry slot. Only call this when the
+    /// renewal POST is about to be sent: a pre-flight failure is not an attempt.
+    fn admit_attempt(&self, url: &str) -> Result<(), RankFetchError> {
+        let mut attempts = self
+            .attempts
+            .lock()
+            .map_err(|_| RankFetchError::ProviderUnavailable)?;
+        attempts.retain(|_, at| at.elapsed() < FAILED_RETRY_DELAY);
+        if attempts.contains_key(url) {
+            return Err(RankFetchError::RenewalFailed);
+        }
+        attempts.insert(url.to_owned(), Instant::now());
+        Ok(())
     }
 
     fn acquire(self: &Arc<Self>, deadline: Instant) -> Result<Permit, RankFetchError> {
@@ -106,6 +130,13 @@ pub(super) fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default()
+}
+
+/// Honor a provider wait up to [`MAX_COOLDOWN`]; a missing value uses the
+/// burst default. The cap is the single place that bounds every cooldown.
+fn cooldown(seconds: Option<u64>) -> Duration {
+    let requested = Duration::from_secs(seconds.unwrap_or(DEFAULT_COOLDOWN.as_secs()).max(1));
+    requested.min(MAX_COOLDOWN)
 }
 
 pub(super) fn retry_after(value: &str) -> Option<u64> {
@@ -268,17 +299,20 @@ impl RankFetcher {
         }
         // Share valid references across profiles, but rediscover on action-asset
         // rotation or expiry even if the release prefix stays the same.
-        let mut cache = self
-            .renewal
-            .actions
-            .lock()
-            .map_err(|_| RankFetchError::ProviderUnavailable)?;
         let build = scripts[0]
             .split("/_next/static/")
             .next()
             .unwrap_or_default()
             .to_owned();
-        if let Some(cached) = &*cache {
+        // Snapshot the shared references, then drop the lock: another profile
+        // must be able to read or refresh them while this one fetches assets.
+        let snapshot = self
+            .renewal
+            .actions
+            .lock()
+            .map_err(|_| RankFetchError::ProviderUnavailable)?
+            .clone();
+        if let Some(cached) = &snapshot {
             let reusable = if cached.result.is_ok() {
                 cached.at.elapsed() < ACTION_CACHE_MAX_AGE
                     && cached
@@ -304,12 +338,21 @@ impl RankFetcher {
             }
             Err(RankFetchError::ParsingFailed)
         })();
-        *cache = Some(CachedActions {
-            build,
-            script_url,
-            result: result.clone(),
-            at: Instant::now(),
-        });
+        let mut cache = self
+            .renewal
+            .actions
+            .lock()
+            .map_err(|_| RankFetchError::ProviderUnavailable)?;
+        // Commit only when no other worker replaced the cache meanwhile: a slow
+        // round must not overwrite newer references or a fresh invalidation.
+        if *cache == snapshot {
+            *cache = Some(CachedActions {
+                build,
+                script_url,
+                result: result.clone(),
+                at: Instant::now(),
+            });
+        }
         result
     }
 
@@ -350,6 +393,13 @@ impl RankFetcher {
         result
     }
 
+    /// Renew one profile standing.
+    ///
+    /// Everything inside is bounded by [`RENEWAL_TIMEOUT`], which starts after
+    /// the permit wait and the rate-limit check and covers both reference
+    /// discovery and the POST/poll exchange. Pre-flight failures (permit, cooldown,
+    /// discovery) report [`RenewalError::NotSent`] and do not consume this
+    /// profile's retry slot, so a later normal request can still proceed.
     pub(super) fn renew_profile(
         &self,
         url: &str,
@@ -361,24 +411,19 @@ impl RankFetcher {
             .renewal
             .acquire(Instant::now() + PERMIT_WAIT)
             .map_err(RenewalError::NotSent)?;
-        let deadline = Instant::now() + RENEWAL_TIMEOUT;
         if self.renewal.rate_limited() {
             return Err(RenewalError::NotSent(RankFetchError::RateLimited));
         }
-        {
-            let mut attempts = self
-                .renewal
-                .attempts
-                .lock()
-                .map_err(|_| RenewalError::NotSent(RankFetchError::ProviderUnavailable))?;
-            attempts.retain(|_, at| at.elapsed() < FAILED_RETRY_DELAY);
-            if attempts.contains_key(url) {
-                return Err(RenewalError::NotSent(RankFetchError::RenewalFailed));
-            }
-            attempts.insert(url.to_owned(), Instant::now());
-        }
+        let deadline = Instant::now() + RENEWAL_TIMEOUT;
         let actions = self
             .discover_actions(body, deadline)
+            .map_err(RenewalError::NotSent)?;
+        // Admit only now that the POST is one step away: this single check+insert
+        // keeps concurrent renewals of the same profile from double-posting, and
+        // a failure after admission is reported as a real attempt. Nothing is
+        // ever replayed.
+        self.renewal
+            .admit_attempt(url)
             .map_err(RenewalError::NotSent)?;
         self.poll_renewal(url, region, profile, &actions, deadline)
             .map_err(RenewalError::Failed)
@@ -752,6 +797,117 @@ mod tests {
         let provenance = fresh.provenance.unwrap();
         assert_eq!(provenance.error, None);
         assert!(provenance.fresh_until.is_some());
+        assert!(
+            !fetcher.renewal.attempts.lock().unwrap().contains_key(&url),
+            "a cooldown skip never reached the POST and is not an attempt"
+        );
+    }
+
+    #[test]
+    fn discovery_failure_is_not_sent_and_does_not_consume_the_retry_slot() {
+        let now = now_ms();
+        let (fetcher, url, thread) = server(vec![
+            (
+                "POST",
+                200,
+                "1:{\"status\":\"RENEWING\",\"delay\":50}".into(),
+            ),
+            ("POST", 200, finished(now)),
+        ]);
+        let update = ProfileUpdate::parse(&profile(now - 3_600_000, 10)).unwrap();
+        // A page we cannot read a bundle from fails before any POST exists.
+        assert_eq!(
+            fetcher.renew_profile(
+                &url,
+                "kr",
+                r#"<img src="profile_icons/profileIcon6.jpg">"#,
+                &update
+            ),
+            Err(RenewalError::NotSent(RankFetchError::ParsingFailed))
+        );
+        assert!(fetcher.renewal.attempts.lock().unwrap().is_empty());
+        // The pre-flight failure must not block the next normal renewal.
+        assert!(fetcher
+            .renew_profile(&url, "kr", &profile(now - 3_600_000, 10), &update)
+            .is_ok());
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn renewal_admission_is_per_profile_and_survives_only_the_retry_window() {
+        let state = RenewalState::default();
+        state.admit_attempt("https://op.gg/lol/summoners/kr/a").unwrap();
+        assert_eq!(
+            state.admit_attempt("https://op.gg/lol/summoners/kr/a"),
+            Err(RankFetchError::RenewalFailed)
+        );
+        assert!(state.admit_attempt("https://op.gg/lol/summoners/kr/b").is_ok());
+        state
+            .attempts
+            .lock()
+            .unwrap()
+            .insert(
+                "https://op.gg/lol/summoners/kr/c".into(),
+                Instant::now() - FAILED_RETRY_DELAY,
+            );
+        assert!(state.admit_attempt("https://op.gg/lol/summoners/kr/c").is_ok());
+    }
+
+    #[test]
+    fn action_discovery_never_holds_the_cache_lock_across_requests() {
+        let fetcher = RankFetcher::default();
+        let body = profile(now_ms(), 10);
+        let result = fetcher
+            .discover_actions_with(&body, Instant::now() + RENEWAL_TIMEOUT, |_, _| {
+                // A profile read or another discovery must be able to proceed.
+                assert!(fetcher.renewal.actions.try_lock().is_ok());
+                Ok(rotated_bundle())
+            })
+            .unwrap();
+        assert_eq!(result.renewal, "a".repeat(40));
+        assert!(fetcher.renewal.actions.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_slow_discovery_round_does_not_overwrite_newer_references() {
+        let fetcher = RankFetcher::default();
+        let body = profile(now_ms(), 10);
+        let newer = Actions {
+            renewal: "c".repeat(40),
+            status: "d".repeat(40),
+        };
+        let discovered = fetcher
+            .discover_actions_with(&body, Instant::now() + RENEWAL_TIMEOUT, |_, _| {
+                // A newer round publishes while this one is still fetching.
+                *fetcher.renewal.actions.lock().unwrap() = Some(CachedActions {
+                    build: "https://c-lol-web.op.gg/newer-build".into(),
+                    script_url: None,
+                    result: Ok(newer.clone()),
+                    at: Instant::now(),
+                });
+                Ok(rotated_bundle())
+            })
+            .unwrap();
+        // This round still reports what it discovered...
+        assert_eq!(discovered.renewal, "a".repeat(40));
+        // ...but the newer cache wins instead of being overwritten.
+        let cached = fetcher.renewal.actions.lock().unwrap();
+        let cached = cached.as_ref().expect("newer cache retained");
+        assert_eq!(cached.build, "https://c-lol-web.op.gg/newer-build");
+        assert_eq!(cached.result.as_ref(), Ok(&newer));
+    }
+
+    #[test]
+    fn retry_after_is_honored_but_bounded() {
+        assert_eq!(cooldown(None), DEFAULT_COOLDOWN);
+        assert_eq!(cooldown(Some(0)), Duration::from_secs(1));
+        assert_eq!(cooldown(Some(120)), Duration::from_secs(120));
+        assert_eq!(cooldown(Some(u64::MAX)), MAX_COOLDOWN);
+        let state = RenewalState::default();
+        state.set_cooldown(Some(u64::MAX));
+        assert!(state.rate_limited());
+        let until = state.cooldown.lock().unwrap().unwrap();
+        assert!(until <= Instant::now() + MAX_COOLDOWN);
     }
 
     #[test]

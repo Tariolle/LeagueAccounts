@@ -38,7 +38,7 @@ Requires Windows 10 or 11 with [WebView2](https://developer.microsoft.com/micros
 
 ```text
 username1--Player One#EUW--password1
-username2----password2
+username2--password2
 ```
 
 **Log in** with the card's **Log in** button. If another account is signed in, it is signed out first, and you're warned before an open League client is closed (or a match left). For 2FA or a captcha, finish in the Riot window; the game launches once the sign-in is confirmed. If Riot reports a ban, the game isn't started: the card shows the time left, and logging in again before it ends asks whether to launch the game anyway. With game launch off, a banned account still signs in to the Riot Client.
@@ -85,6 +85,7 @@ username2----password2
 | *The Riot Client login screen or sign-in status wasn't ready in time* | Open the Riot Client once manually (it may be updating), then retry. |
 | Shown online while using [Deceive](https://github.com/molenzwiebel/Deceive) | Start Deceive first, then log in with League Accounts. A Riot Client that League Accounts opens itself doesn't go through Deceive. |
 | Ranks show **Unavailable** or *Riot ID not found* | Check the Riot ID and region; OP.GG may also be rate-limiting. |
+| The client's **home page is blank or broken** while the game language is `zh_CN` | Riot never published every home-page (activity-center) asset for `zh_CN`, so pages such as `jade-home` return 404 and the home page fails to render. Switch the account's game language to `zh_MY` or `zh_TW`, or install ABC's [zh-cn-home-locale](https://github.com/pengu-lol/pengu-loader) Pengu Loader plugin, which retries a failed page with `locale=zh_TW` inside the game client. |
 | Anything else | Attach the newest file from **Log folder** (sidebar) to an [issue](https://github.com/Tariolle/LeagueAccounts/issues). |
 
 Want to build or contribute? See [CONTRIBUTING.md](CONTRIBUTING.md).

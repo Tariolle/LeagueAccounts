@@ -1,0 +1,4 @@
+[toolchain]
+# The MSVC toolchain links the WebView2 loader statically; a GNU toolchain
+# builds too but makes the exe import WebView2Loader.dll from target/release.
+channel = "stable-x86_64-pc-windows-msvc"

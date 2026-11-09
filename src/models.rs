@@ -36,6 +36,17 @@ pub struct Account {
     pub rank_provenance: Option<RankProvenance>,
     #[serde(default)]
     pub tft_provenance: Option<RankProvenance>,
+    /// Product locale the game should start in, independent of `region`.
+    /// `None` leaves Riot's own choice untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
+    /// Skip Riot's "update your profile" flow at sign-in. VN accounts are
+    /// blocked by the region's identity provider: Riot waits for a domain the
+    /// tool patches out of `hosts`, retries until its internal limit, then
+    /// continues. With the patch in place this flag makes the wait worthwhile
+    /// instead of showing a login that never completes.
+    #[serde(default)]
+    pub skip_profile_update: bool,
     /// League suspension Riot reported at the last sign-in through the app.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ban: Option<Ban>,
@@ -199,55 +210,213 @@ impl RankInfo {
         // Accounts saved before provenance existed have a level from a past fetch.
         let fetched_before = account.rank_provenance.is_some() || !account.level.is_empty();
         let tft_fetched_before = fetched_before || account.tft_provenance.is_some();
-        if let Some(not_found) = self.riot_id_not_found {
-            account.riot_id_not_found = not_found;
-        }
-        // A failed request must not replace the last known standing with Unranked.
-        if self.tier != "Error" || self.riot_id_not_found == Some(true) {
-            account.tier = if self.tier.is_empty() {
-                "Unranked".to_owned()
+        // League and TFT sources advance independently. A result whose known
+        // source time is older than what the account already records cannot
+        // roll that path back, but it must not discard the other path's result.
+        if !source_is_older(self.provenance.as_ref(), account.rank_provenance.as_ref()) {
+            if let Some(not_found) = self.riot_id_not_found {
+                account.riot_id_not_found = not_found;
+            }
+            // A failed request must not replace the last known standing with
+            // Unranked.
+            if self.tier != "Error" || self.riot_id_not_found == Some(true) {
+                account.tier = if self.tier.is_empty() {
+                    "Unranked".to_owned()
+                } else {
+                    self.tier.clone()
+                };
+                account.division = self.division.clone();
+                account.lp = self.lp.clone();
+                account.level = self.level.clone();
+                account.reached_last_season = if self.reached_last_season.is_empty() {
+                    "N/A".to_owned()
+                } else {
+                    self.reached_last_season.clone()
+                };
+                account.finished_last_season = if self.finished_last_season.is_empty() {
+                    "N/A".to_owned()
+                } else {
+                    self.finished_last_season.clone()
+                };
+            } else if !fetched_before && (account.tier.is_empty() || account.tier == "Unranked")
+            {
+                // No successful fetch yet: show Error rather than an invented
+                // standing.
+                account.tier = "Error".to_owned();
+            }
+            if self.tier == "Error" && self.provenance.is_none() {
+                let provenance = account
+                    .rank_provenance
+                    .get_or_insert_with(RankProvenance::default);
+                provenance.error = Some(RankFetchError::ProviderUnavailable);
+                provenance.freshness = Freshness::Stale;
             } else {
-                self.tier.clone()
-            };
-            account.division = self.division.clone();
-            account.lp = self.lp.clone();
-            account.level = self.level.clone();
-            account.reached_last_season = if self.reached_last_season.is_empty() {
-                "N/A".to_owned()
-            } else {
-                self.reached_last_season.clone()
-            };
-            account.finished_last_season = if self.finished_last_season.is_empty() {
-                "N/A".to_owned()
-            } else {
-                self.finished_last_season.clone()
-            };
-        } else if !fetched_before && (account.tier.is_empty() || account.tier == "Unranked") {
-            // No successful fetch yet: show Error rather than an invented standing.
-            account.tier = "Error".to_owned();
+                account.rank_provenance = self.provenance.clone();
+            }
         }
-        if let Some(tft) = &self.tft {
-            account.tft = tft.clone();
-        } else if !tft_fetched_before && account.tft.tier == "Unranked" {
-            account.tft = TftRank::error();
+        if !source_is_older(self.tft_provenance.as_ref(), account.tft_provenance.as_ref()) {
+            if let Some(tft) = &self.tft {
+                account.tft = tft.clone();
+            } else if !tft_fetched_before && account.tft.tier == "Unranked" {
+                account.tft = TftRank::error();
+            }
+            if self.tft.is_none() && self.tft_provenance.is_none() {
+                let provenance = account
+                    .tft_provenance
+                    .get_or_insert_with(RankProvenance::default);
+                provenance.error = Some(RankFetchError::ProviderUnavailable);
+                provenance.freshness = Freshness::Stale;
+            } else {
+                account.tft_provenance = self.tft_provenance.clone();
+            }
         }
-        if self.tier == "Error" && self.provenance.is_none() {
-            let provenance = account
+    }
+}
+
+/// True only when both sides publish an update time and the incoming result is
+/// earlier. Unknown times keep the existing error-retention rules.
+fn source_is_older(
+    incoming: Option<&RankProvenance>,
+    existing: Option<&RankProvenance>,
+) -> bool {
+    match (
+        incoming.and_then(|provenance| provenance.source_updated_at),
+        existing.and_then(|provenance| provenance.source_updated_at),
+    ) {
+        (Some(incoming), Some(existing)) => incoming < existing,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fetched_account(lol_time: Option<u64>, tft_time: Option<u64>) -> Account {
+        Account {
+            tier: "Diamond".into(),
+            division: "I".into(),
+            lp: "10".into(),
+            level: "200".into(),
+            reached_last_season: "Diamond".into(),
+            finished_last_season: "Diamond".into(),
+            tft: TftRank {
+                tier: "Diamond".into(),
+                division: "I".into(),
+                lp: "20".into(),
+                last_set: "Set 10".into(),
+            },
+            rank_provenance: Some(RankProvenance {
+                source: "OP.GG".into(),
+                source_updated_at: lol_time,
+                ..RankProvenance::default()
+            }),
+            tft_provenance: Some(RankProvenance {
+                source: "OP.GG".into(),
+                source_updated_at: tft_time,
+                ..RankProvenance::default()
+            }),
+            ..Account::default()
+        }
+    }
+
+    fn timestamped_provenance(time: Option<u64>) -> Option<RankProvenance> {
+        Some(RankProvenance {
+            source: "OP.GG".into(),
+            source_updated_at: time,
+            ..RankProvenance::default()
+        })
+    }
+
+    #[test]
+    fn newer_league_source_updates_while_older_tft_is_ignored() {
+        let mut account = fetched_account(Some(1_000), Some(2_000));
+        let info = RankInfo {
+            tier: "Gold".into(),
+            provenance: timestamped_provenance(Some(2_000)),
+            tft: Some(TftRank {
+                tier: "Gold".into(),
+                ..TftRank::default()
+            }),
+            tft_provenance: timestamped_provenance(Some(1_000)),
+            ..RankInfo::default()
+        };
+
+        info.apply_to(&mut account);
+
+        assert_eq!(account.tier, "Gold");
+        assert_eq!(
+            account
                 .rank_provenance
-                .get_or_insert_with(RankProvenance::default);
-            provenance.error = Some(RankFetchError::ProviderUnavailable);
-            provenance.freshness = Freshness::Stale;
-        } else {
-            account.rank_provenance = self.provenance.clone();
-        }
-        if self.tft.is_none() && self.tft_provenance.is_none() {
-            let provenance = account
+                .as_ref()
+                .and_then(|provenance| provenance.source_updated_at),
+            Some(2_000)
+        );
+        assert_eq!(account.tft.tier, "Diamond");
+        assert_eq!(
+            account
                 .tft_provenance
-                .get_or_insert_with(RankProvenance::default);
-            provenance.error = Some(RankFetchError::ProviderUnavailable);
-            provenance.freshness = Freshness::Stale;
-        } else {
-            account.tft_provenance = self.tft_provenance.clone();
-        }
+                .as_ref()
+                .and_then(|provenance| provenance.source_updated_at),
+            Some(2_000)
+        );
+    }
+
+    #[test]
+    fn older_league_source_is_ignored_while_newer_tft_updates() {
+        let mut account = fetched_account(Some(2_000), Some(1_000));
+        let info = RankInfo {
+            tier: "Gold".into(),
+            provenance: timestamped_provenance(Some(1_000)),
+            tft: Some(TftRank {
+                tier: "Gold".into(),
+                ..TftRank::default()
+            }),
+            tft_provenance: timestamped_provenance(Some(2_000)),
+            ..RankInfo::default()
+        };
+
+        info.apply_to(&mut account);
+
+        assert_eq!(account.tier, "Diamond");
+        assert_eq!(
+            account
+                .rank_provenance
+                .as_ref()
+                .and_then(|provenance| provenance.source_updated_at),
+            Some(2_000)
+        );
+        assert_eq!(account.tft.tier, "Gold");
+        assert_eq!(
+            account
+                .tft_provenance
+                .as_ref()
+                .and_then(|provenance| provenance.source_updated_at),
+            Some(2_000)
+        );
+    }
+
+    #[test]
+    fn unknown_source_times_keep_error_retention() {
+        let mut account = fetched_account(Some(2_000), Some(2_000));
+
+        RankInfo::error().apply_to(&mut account);
+
+        assert_eq!(account.tier, "Diamond");
+        assert_eq!(
+            account
+                .rank_provenance
+                .as_ref()
+                .and_then(|provenance| provenance.error),
+            Some(RankFetchError::ProviderUnavailable)
+        );
+        assert_eq!(account.tft.tier, "Diamond");
+        assert_eq!(
+            account
+                .tft_provenance
+                .as_ref()
+                .and_then(|provenance| provenance.error),
+            Some(RankFetchError::ProviderUnavailable)
+        );
     }
 }

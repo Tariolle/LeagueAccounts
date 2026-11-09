@@ -12,6 +12,7 @@ use leagueaccounts::utils::sort_accounts;
 use leagueaccounts::AccountManager;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
@@ -40,6 +41,13 @@ pub struct Settings {
     pub auto_update: bool,
     /// Interface size in percent, from Settings › Interface size.
     pub ui_scale: u32,
+    /// Interface language code, and the record that the choice was made.
+    /// Empty means "never chosen", which is what the welcome dialog keys off.
+    /// It lives here as well as in the webview's storage because that storage
+    /// is a cache: a rebuilt WebView2 profile loses it and the dialog would
+    /// reappear on a launch that is not the first.
+    #[serde(default)]
+    pub ui_language: String,
     /// A release whose executable reported an older version than the release.
     /// It is never installed automatically, so it cannot update in a loop.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -66,6 +74,7 @@ impl Default for Settings {
             launch_game: true,
             auto_update: true,
             ui_scale: 100,
+            ui_language: String::new(),
             mislabeled_release: None,
             last_full_refresh: 0,
         }
@@ -85,14 +94,24 @@ impl Settings {
         settings
     }
 
-    pub fn save(&self, path: Option<&PathBuf>) {
-        let Some(path) = path else { return };
-        let result = serde_json::to_string_pretty(self)
-            .map_err(std::io::Error::other)
-            .and_then(|json| std::fs::write(path, json));
-        if let Err(error) = result {
-            logging::record(Event::SettingsSaveFailed, Reason::from_error(&error));
+    pub fn save(&self, path: Option<&PathBuf>) -> std::io::Result<()> {
+        let result = (|| {
+            let path = path.ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::NotFound, "settings location is unavailable",
+            ))?;
+            let parent = path.parent().ok_or_else(|| std::io::Error::other("settings need a parent directory"))?;
+            std::fs::create_dir_all(parent)?;
+            let mut file = tempfile::NamedTempFile::new_in(parent)?;
+            serde_json::to_writer_pretty(&mut file, self).map_err(std::io::Error::other)?;
+            file.flush()?;
+            file.as_file().sync_all()?;
+            file.persist(path).map_err(|error| error.error)?;
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            logging::record(Event::SettingsSaveFailed, Reason::from_error(error));
         }
+        result
     }
 
     fn next_refresh_at(&self) -> Option<u64> {
@@ -105,7 +124,6 @@ pub struct Shared {
     pub manager: Mutex<AccountManager>,
     pub settings: Mutex<Settings>,
     pub settings_path: Option<PathBuf>,
-    pub refresh_running: Mutex<bool>,
     pub clipboard_generation: AtomicU64,
     pub login: Arc<LoginControl>,
     pub updater: Updater,
@@ -131,7 +149,7 @@ pub struct Schedule {
 
 pub fn schedule(shared: &Shared) -> Schedule {
     let settings = shared.settings.lock().map(|s| s.clone()).unwrap_or_default();
-    let running = shared.refresh_running.lock().map(|r| *r).unwrap_or(false);
+    let running = shared.login.refresh_running();
     Schedule {
         enabled: settings.auto_refresh,
         interval_minutes: settings.interval_minutes,
@@ -170,20 +188,26 @@ struct RefreshDone {
 
 /// Fetch ranks on background workers and stream each result to the UI.
 /// Full refreshes are exclusive; partial ones may run alongside.
-/// Returns false when a full refresh is already running.
+/// Returns false when shutdown or another full refresh prevents admission.
 pub fn start_refresh(app: AppHandle, shared: Arc<Shared>, accounts: Vec<Account>, kind: RefreshKind) -> bool {
     if accounts.is_empty() {
         return true;
     }
     let exclusive = kind != RefreshKind::Partial;
-    if exclusive {
-        let Ok(mut running) = shared.refresh_running.lock() else {
-            return false;
-        };
-        if *running {
-            return false;
+    let Some(guard) = shared.login.try_start_refresh(exclusive) else { return false };
+    let jobs = match shared.manager.lock() {
+        Ok(mut manager) => {
+            let provider = Arc::clone(&manager.rank_fetcher);
+            let jobs = accounts.into_iter().filter_map(|account| {
+                manager.begin_rank_refresh(&account.key())
+            }).collect::<Vec<_>>();
+            (provider, jobs)
         }
-        *running = true;
+        Err(_) => return false,
+    };
+    let (provider, accounts) = jobs;
+    if exclusive {
+        // Admission and exit share one lock; errors below drop the guard.
         let _ = app.emit(
             "refresh-started",
             RefreshStarted {
@@ -200,14 +224,11 @@ pub fn start_refresh(app: AppHandle, shared: Arc<Shared>, accounts: Vec<Account>
         },
         Reason::None,
     );
-    let keys: Vec<Key> = accounts.iter().map(Key::from).collect();
+    let keys: Vec<Key> = accounts.iter().map(|job| Key::from(&job.account)).collect();
     let _ = app.emit("rank-pending", &keys);
 
-    let provider = match shared.manager.lock() {
-        Ok(manager) => Arc::clone(&manager.rank_fetcher),
-        Err(_) => return false,
-    };
     thread::spawn(move || {
+        let guard = guard;
         let queue = Arc::new(Mutex::new(VecDeque::from(accounts)));
         let workers: Vec<_> = (0..4)
             .map(|_| {
@@ -216,10 +237,11 @@ pub fn start_refresh(app: AppHandle, shared: Arc<Shared>, accounts: Vec<Account>
                 let shared = Arc::clone(&shared);
                 let app = app.clone();
                 thread::spawn(move || loop {
+                    if shared.login.is_exiting() { break; }
                     let job = queue.lock().ok().and_then(|mut queue| queue.pop_front());
-                    let Some(account) = job else { break };
+                    let Some(job) = job else { break };
                     let info = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        provider.fetch_rank_with_mode(&account, match kind {
+                        provider.fetch_rank_with_mode(&job.account, match kind {
                             RefreshKind::Auto => RefreshMode::Auto,
                             RefreshKind::Force => RefreshMode::Force,
                             _ => RefreshMode::Manual,
@@ -229,9 +251,9 @@ pub fn start_refresh(app: AppHandle, shared: Arc<Shared>, accounts: Vec<Account>
                         logging::record(Event::RankWorkerPanicked, Reason::None);
                         RankInfo::error()
                     });
-                    let key = account.key();
+                    let key = job.account.key();
                     let Ok(mut manager) = shared.manager.lock() else { break };
-                    if !manager.apply_rank_info(&account, &info) {
+                    if !manager.apply_rank_info(&job, &info) {
                         continue;
                     }
                     if let Some(updated) = manager.account(&key) {
@@ -244,7 +266,7 @@ pub fn start_refresh(app: AppHandle, shared: Arc<Shared>, accounts: Vec<Account>
             let _ = worker.join();
         }
 
-        let error = match shared.manager.lock() {
+        let mut error = match shared.manager.lock() {
             Ok(mut manager) => {
                 sort_accounts(&mut manager.accounts);
                 manager
@@ -259,13 +281,16 @@ pub fn start_refresh(app: AppHandle, shared: Arc<Shared>, accounts: Vec<Account>
         }
         if exclusive {
             if let Ok(mut settings) = shared.settings.lock() {
-                settings.last_full_refresh = now_ms();
-                settings.save(shared.settings_path.as_ref());
-            }
-            if let Ok(mut running) = shared.refresh_running.lock() {
-                *running = false;
+                let mut candidate = settings.clone();
+                candidate.last_full_refresh = now_ms();
+                match candidate.save(shared.settings_path.as_ref()) {
+                    Ok(()) => *settings = candidate,
+                    Err(failure) if error.is_none() => error = Some(fail_with("save_failed", failure)),
+                    Err(_) => {},
+                }
             }
         }
+        drop(guard);
         let _ = app.emit(
             "refresh-done",
             RefreshDone {
@@ -339,5 +364,26 @@ mod tests {
             assert_eq!(Settings::load(Some(&path)).ui_scale, expected, "{json}");
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn settings_commit_replaces_existing_file_and_preserves_it_on_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let first = Settings { interval_minutes: 15, ..Settings::default() };
+        first.save(Some(&path)).unwrap();
+        let next = Settings { interval_minutes: 45, ..first.clone() };
+        next.save(Some(&path)).unwrap();
+        assert_eq!(Settings::load(Some(&path)).interval_minutes, 45);
+        let bytes = std::fs::read(&path).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let _locked = std::fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+            assert!(first.save(Some(&path)).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        assert!(next.save(None).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }

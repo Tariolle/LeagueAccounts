@@ -78,6 +78,18 @@ fn belongs_to_installation(path: &Path, root: &Path) -> bool {
     path.starts_with(root)
 }
 
+/// How long a client tree may take to exit after `taskkill /F /T`.
+/// Riot's crash handler and renderer children can take a few seconds each.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Kill sweeps before giving up; covers the service re-launching its UI once.
+const MAX_SWEEPS: u32 = 4;
+
+/// Client processes of this installation that are still alive.
+///
+/// A process that is exiting has no queryable path for a moment, so a missing
+/// path is treated as "already gone" and simply skipped. Failing there turned
+/// every kill into a hard error: the process is in the task list, but
+/// `OpenProcess` can no longer open it.
 fn client_processes(root: &Path) -> Result<Vec<Process>, LoginError> {
     let mut processes = Vec::new();
     for process in running_processes().into_iter().filter(|p| {
@@ -129,29 +141,61 @@ fn service_args(path: &Path) -> Result<Vec<OsString>, LoginError> {
     Ok(kept)
 }
 
+/// End every client process of this installation.
+///
+/// `taskkill /F /PID` ends only the named process: Riot's UX spawns renderer,
+/// GPU, utility and crash-handler children, and `RiotClientServices` restarts
+/// its UI. The children keep the tree alive, so `/T` is required to take the
+/// whole installation down.
 fn stop_client(path: &Path, cancel: &AtomicBool) -> Result<(), LoginError> {
     let root = path.parent().ok_or(LoginError::ClientMissing)?;
-    let processes = client_processes(root)?;
+    stop_client_with(
+        cancel,
+        CLOSE_TIMEOUT,
+        || client_processes(root),
+        |processes| {
+            // Exact processes under this Riot installation only; never game
+            // processes. One call keeps the restart quick: Deceive exits when
+            // no Riot Client replaces its own within 3 seconds.
+            let mut taskkill = command(Path::new("taskkill.exe"));
+            taskkill.args(["/F", "/T"]);
+            for process in processes {
+                taskkill.args(["/PID", &process.pid.to_string()]);
+            }
+            let _ = taskkill.status();
+        },
+        || {
+            let _ = wait(cancel, Duration::from_millis(200));
+        },
+    )
+}
+
+/// Sweep the client tree until it is gone. A survivor after the first sweep is
+/// killed again, because Riot's service owns the UI and can restart it.
+fn stop_client_with(
+    cancel: &AtomicBool,
+    timeout: Duration,
+    mut remaining: impl FnMut() -> Result<Vec<Process>, LoginError>,
+    mut kill: impl FnMut(&[Process]),
+    mut wait: impl FnMut(),
+) -> Result<(), LoginError> {
     check_cancelled(cancel)?;
-    if !processes.is_empty() {
-        // Exact processes under this Riot installation only; never game
-        // processes. One call keeps the restart quick: Deceive exits when no
-        // Riot Client replaces its own within 3 seconds.
-        let mut taskkill = command(Path::new("taskkill.exe"));
-        taskkill.arg("/F");
-        for process in &processes {
-            taskkill.args(["/PID", &process.pid.to_string()]);
-        }
-        let _ = taskkill.status();
-    }
     let start = Instant::now();
-    while !client_processes(root)?.is_empty() {
-        if start.elapsed() > Duration::from_secs(10) {
+    let mut sweeps = 0;
+    loop {
+        let processes = remaining()?;
+        if processes.is_empty() {
+            return Ok(());
+        }
+        // Bounded: a tree that refuses to die is reported, not hammered.
+        if sweeps >= MAX_SWEEPS || start.elapsed() > timeout {
             return Err(LoginError::RiotCloseFailed);
         }
-        wait(cancel, Duration::from_millis(200))?;
+        sweeps += 1;
+        kill(&processes);
+        wait();
+        check_cancelled(cancel)?;
     }
-    Ok(())
 }
 
 pub(super) fn debugger_url(value: &str, port: u16) -> bool {
@@ -401,7 +445,7 @@ pub(super) fn sign_in(
     }
     check_cancelled(cancel)?;
     let service = renderer.service.clone();
-    progress(LoginStep::Connect);
+    progress(LoginStep::SignIn);
     renderer.ensure_controllable()?;
     renderer.service_args = service_args(&service)?;
     renderer.restore_needed = true;
@@ -537,7 +581,6 @@ pub(super) fn sign_in(
     renderer.cdp = Some(Cdp::connect(&endpoint, port)?);
     let cdp = renderer.cdp.as_mut().ok_or(LoginError::RendererFailed)?;
     cdp.eval(include_str!("riot_renderer.js"), cancel)?;
-    progress(LoginStep::FindWindow);
     let start = Instant::now();
     while cdp.eval("globalThis.__leagueAccountsLogin.ready()", cancel)? != true {
         if start.elapsed() > Duration::from_secs(30) {
@@ -551,7 +594,6 @@ pub(super) fn sign_in(
     if current.base != api.base || current.session() != Session::SignedOut {
         return Err(LoginError::AccountMismatch);
     }
-    progress(LoginStep::Type);
     let mut expression = format!(
         "globalThis.__leagueAccountsLogin.fill(...{})",
         json!([username, password])
@@ -564,7 +606,6 @@ pub(super) fn sign_in(
     if cdp.eval("globalThis.__leagueAccountsLogin.submit()", cancel)? != true {
         return Err(LoginError::RendererFailed);
     }
-    progress(LoginStep::Confirm);
     let start = Instant::now();
     let mut verification = false;
     loop {
@@ -661,6 +702,56 @@ mod tests {
             STARTS.with(|starts| starts.borrow().clone()),
             vec![(false, kept)]
         );
+    }
+
+    #[test]
+    fn a_surviving_client_tree_is_killed_again_instead_of_timed_out() {
+        // Riot's service owns the UX and restarts it, so the first sweep can
+        // leave a fresh tree behind. The second sweep must take it down rather
+        // than waiting for CLOSE_TIMEOUT and reporting close_failed.
+        let cancel = AtomicBool::new(false);
+        let alive = RefCell::new(2usize);
+        let kills = RefCell::new(Vec::new());
+        let result = stop_client_with(
+            &cancel,
+            Duration::from_secs(1),
+            || {
+                Ok((0..*alive.borrow())
+                    .map(|pid| Process {
+                        name: "riot client.exe".to_owned(),
+                        pid: pid as u32 + 100,
+                    })
+                    .collect())
+            },
+            |processes| {
+                kills.borrow_mut().extend(processes.iter().map(|p| p.pid));
+                *alive.borrow_mut() = 0;
+            },
+            || {},
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(*kills.borrow(), vec![100, 101]);
+    }
+
+    #[test]
+    fn a_tree_that_never_exits_is_reported_as_close_failed() {
+        let cancel = AtomicBool::new(false);
+        let sweeps = RefCell::new(0usize);
+        let result = stop_client_with(
+            &cancel,
+            Duration::from_millis(50),
+            || {
+                Ok(vec![Process {
+                    name: "riotclientservice.exe".to_owned(),
+                    pid: 7,
+                }])
+            },
+            |_| *sweeps.borrow_mut() += 1,
+            || {},
+        );
+        assert_eq!(result, Err(LoginError::RiotCloseFailed));
+        // Bounded: it stops sweeping instead of hammering the process forever.
+        assert_eq!(*sweeps.borrow(), MAX_SWEEPS as usize);
     }
 
     #[test]

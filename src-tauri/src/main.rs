@@ -15,8 +15,9 @@ use leagueaccounts::account_manager::KEYRING_SERVICE;
 use leagueaccounts::autotype::auto_type_credentials;
 use leagueaccounts::credentials;
 use leagueaccounts::logging::{self, Event, Reason};
-use leagueaccounts::models::{Account, AccountKey, Ban, RankInfo};
+use leagueaccounts::models::{Account, AccountKey, Ban};
 use leagueaccounts::rank_fetcher::{RankFetcher, RankProvider};
+use leagueaccounts::locales;
 use leagueaccounts::riot_client::{self, Game, LoginError, LoginOutcome, LoginStep};
 use leagueaccounts::utils::{app_data_dir, parse_account_line, region_from_display, settings_file, REGION_MAP};
 use leagueaccounts::AccountManager;
@@ -27,7 +28,7 @@ use refresh::{
     MIN_INTERVAL_MINUTES,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
@@ -54,6 +55,8 @@ struct SettingsView {
     launch_game: bool,
     auto_update: bool,
     ui_scale: u32,
+    /// Empty until the welcome dialog has been answered once.
+    ui_language: String,
     riot_client_found: bool,
     tft_installed: bool,
 }
@@ -71,11 +74,38 @@ struct SettingsInput {
     ui_scale: u32,
 }
 
+/// Fields the edit dialog can change. `password: None` keeps the stored
+/// credential; an empty value is a no-op so an untouched field cannot wipe it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateAccount {
+    name: String,
+    description: String,
+    locale: Option<String>,
+    password: Option<String>,
+    skip_profile_update: Option<bool>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocaleOption {
+    code: &'static str,
+    name: &'static str,
+    /// False for locales whose client home page does not render, so the UI
+    /// can warn before the user picks one.
+    home_page_works: bool,
+    /// False when the Riot Client substitutes another locale at launch, so the
+    /// UI does not promise a language the game will not load.
+    launchable: bool,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Bootstrap {
     accounts: Vec<AccountView>,
     regions: Vec<String>,
+    /// Every game locale the client can install, with display names.
+    locales: Vec<LocaleOption>,
     version: &'static str,
     logging_available: bool,
     load_error: Option<AppError>,
@@ -92,6 +122,12 @@ struct NewAccount {
     region: String,
     password: String,
     description: String,
+    /// Product locale the game should start in; omitted means Riot's choice.
+    #[serde(default)]
+    locale: Option<String>,
+    /// Skip Riot's "update your profile" flow at sign-in (VN accounts).
+    #[serde(default)]
+    skip_profile_update: bool,
 }
 
 #[derive(Serialize)]
@@ -106,6 +142,20 @@ struct BatchResult {
 struct BulkAddResult {
     added: usize,
     skipped_lines: Vec<usize>,
+}
+
+/// Validate a locale coming from the web view. An empty value clears the
+/// override; an unknown one is rejected instead of silently becoming `en_US`.
+fn normalize_locale(value: Option<&str>) -> CommandResult<Option<String>> {
+    if value.is_some_and(|value| value.chars().any(char::is_control)) {
+        return Err(fail("invalid_locale"));
+    }
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => locales::normalize(value)
+            .map(|locale| Some(locale.to_owned()))
+            .ok_or_else(|| fail("invalid_locale")),
+    }
 }
 
 fn manager(state: &Shared) -> CommandResult<MutexGuard<'_, AccountManager>> {
@@ -152,18 +202,34 @@ fn settings_view(app: &AppHandle, state: &Shared) -> SettingsView {
         launch_game: settings.launch_game,
         auto_update: settings.auto_update,
         ui_scale: settings.ui_scale,
+        ui_language: settings.ui_language.clone(),
         riot_client_found: riot_client::client_path().is_some(),
         tft_installed: riot_client::game_installed(Game::Tft),
     }
 }
 
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> CommandResult<T> + Send + 'static) -> CommandResult<T> {
+    tauri::async_runtime::spawn_blocking(work).await.map_err(|_| fail("operation_failed"))?
+}
+
 #[tauri::command]
-fn bootstrap(app: AppHandle, state: AppState<'_>) -> CommandResult<Bootstrap> {
+async fn bootstrap(app: AppHandle, state: AppState<'_>) -> CommandResult<Bootstrap> {
+    let state = Arc::clone(&state);
+    blocking(move || {
     Ok(Bootstrap {
         accounts: views(&state)?,
         regions: REGION_MAP
             .iter()
             .map(|(label, _)| (*label).to_owned())
+            .collect(),
+        locales: locales::GAME_LOCALES
+            .iter()
+            .map(|code| LocaleOption {
+                code,
+                name: locales::locale_name(code),
+                home_page_works: locales::home_page_works(code),
+                launchable: locales::is_launchable(code),
+            })
             .collect(),
         version: env!("CARGO_PKG_VERSION"),
         logging_available: logging::is_available(),
@@ -171,15 +237,19 @@ fn bootstrap(app: AppHandle, state: AppState<'_>) -> CommandResult<Bootstrap> {
         settings: settings_view(&app, &state),
         schedule: schedule(&state),
     })
+    }).await
 }
 
 #[tauri::command]
-fn list_accounts(state: AppState<'_>) -> CommandResult<Vec<AccountView>> {
-    views(&state)
+async fn list_accounts(state: AppState<'_>) -> CommandResult<Vec<AccountView>> {
+    let state = Arc::clone(&state);
+    blocking(move || views(&state)).await
 }
 
 #[tauri::command]
-fn add_account(app: AppHandle, state: AppState<'_>, input: NewAccount) -> CommandResult<AccountView> {
+async fn add_account(app: AppHandle, state: AppState<'_>, input: NewAccount) -> CommandResult<AccountView> {
+    let state = Arc::clone(&state);
+    blocking(move || {
     let account_id = input.account_id.trim().to_owned();
     let name = input.name.trim().to_owned();
     let password = input.password.trim().to_owned();
@@ -188,6 +258,7 @@ fn add_account(app: AppHandle, state: AppState<'_>, input: NewAccount) -> Comman
     }
     let region_label = input.region.trim().to_owned();
     let region = region_from_display(&region_label).ok_or_else(|| fail("invalid_region"))?;
+    let locale = normalize_locale(input.locale.as_deref())?;
     let account = {
         let mut manager = manager(&state)?;
         if manager.accounts.iter().any(|account| {
@@ -202,6 +273,8 @@ fn add_account(app: AppHandle, state: AppState<'_>, input: NewAccount) -> Comman
             region_display: region_label,
             password,
             description: input.description.trim().to_owned(),
+            locale,
+            skip_profile_update: input.skip_profile_update,
             tier: "Unranked".to_owned(),
             reached_last_season: "N/A".to_owned(),
             finished_last_season: "N/A".to_owned(),
@@ -215,12 +288,22 @@ fn add_account(app: AppHandle, state: AppState<'_>, input: NewAccount) -> Comman
     let view = account_view(&account);
     start_refresh(app, Arc::clone(&state), vec![account], RefreshKind::Partial);
     Ok(view)
+    }).await
 }
 
 #[tauri::command]
-fn multi_add(app: AppHandle, state: AppState<'_>, text: String, region: String) -> CommandResult<BulkAddResult> {
+async fn multi_add(
+    app: AppHandle,
+    state: AppState<'_>,
+    text: String,
+    region: String,
+    locale: Option<String>,
+) -> CommandResult<BulkAddResult> {
+    let state = Arc::clone(&state);
+    blocking(move || {
     let region_label = region.trim().to_owned();
     let region = region_from_display(&region_label).ok_or_else(|| fail("invalid_region"))?;
+    let locale = normalize_locale(locale.as_deref())?;
     let mut candidates = Vec::new();
     let mut source_lines = Vec::new();
     let mut skipped_lines = Vec::new();
@@ -240,6 +323,7 @@ fn multi_add(app: AppHandle, state: AppState<'_>, text: String, region: String) 
             region_display: region_label.clone(),
             password: password.to_owned(),
             description: String::new(),
+            locale: locale.clone(),
             tier: "Unranked".to_owned(),
             reached_last_season: "N/A".to_owned(),
             finished_last_season: "N/A".to_owned(),
@@ -254,50 +338,50 @@ fn multi_add(app: AppHandle, state: AppState<'_>, text: String, region: String) 
     let added = result.added.len();
     start_refresh(app, Arc::clone(&state), result.added, RefreshKind::Partial);
     Ok(BulkAddResult { added, skipped_lines })
+    }).await
 }
 
 #[tauri::command]
-fn update_account(
+async fn update_account(
     app: AppHandle,
     state: AppState<'_>,
     key: Key,
-    name: String,
-    description: String,
+    input: UpdateAccount,
 ) -> CommandResult<AccountView> {
+    let state = Arc::clone(&state);
+    blocking(move || {
     let key = AccountKey::from(key);
-    let name = name.trim().to_owned();
-    let (updated, renamed) = {
-        let mut manager = manager(&state)?;
-        let account = manager.account_mut(&key).ok_or_else(|| fail("not_found"))?;
-        let renamed = account.name != name;
-        account.name = name;
-        if renamed {
-            account.riot_id_not_found = false;
-            RankInfo::unranked().apply_to(account);
-        }
-        account.description = description.trim().to_owned();
-        let updated = account.clone();
-        manager
-            .save_accounts()
-            .map_err(|error| fail_with("save_failed", error))?;
-        (updated, renamed)
+    let changes = leagueaccounts::account_manager::AccountChanges {
+        name: input.name.trim().to_owned(),
+        description: input.description.trim().to_owned(),
+        locale: normalize_locale(input.locale.as_deref())?,
+        skip_profile_update: input.skip_profile_update.unwrap_or(false),
+        password: input.password.map(|password| password.trim().to_owned()).filter(|password| !password.is_empty()),
     };
+    let (updated, renamed) = manager(&state)?.update_account(&key, changes)
+        .map_err(|error| fail_with("save_failed", error))?;
     let view = account_view(&updated);
     if renamed {
         start_refresh(app, Arc::clone(&state), vec![updated], RefreshKind::Partial);
     }
     Ok(view)
+    }).await
 }
 
 #[tauri::command]
-fn delete_account(state: AppState<'_>, key: Key) -> CommandResult<()> {
+async fn delete_account(state: AppState<'_>, key: Key) -> CommandResult<()> {
+    let state = Arc::clone(&state);
+    blocking(move || {
     manager(&state)?
         .delete_account(&key.account_id, &key.region)
         .map_err(|error| fail_with("delete_failed", error))
+    }).await
 }
 
 #[tauri::command]
-fn refresh_ranks(app: AppHandle, state: AppState<'_>, force: Option<bool>) -> CommandResult<usize> {
+async fn refresh_ranks(app: AppHandle, state: AppState<'_>, force: Option<bool>) -> CommandResult<usize> {
+    let state = Arc::clone(&state);
+    blocking(move || {
     let accounts = manager(&state)?.accounts.clone();
     if accounts.is_empty() {
         return Err(fail("no_accounts"));
@@ -308,46 +392,78 @@ fn refresh_ranks(app: AppHandle, state: AppState<'_>, force: Option<bool>) -> Co
         return Err(fail("refresh_running"));
     }
     Ok(count)
+    }).await
 }
 
 #[tauri::command]
-fn get_settings(app: AppHandle, state: AppState<'_>) -> SettingsView {
-    settings_view(&app, &state)
+async fn get_settings(app: AppHandle, state: AppState<'_>) -> CommandResult<SettingsView> {
+    let state = Arc::clone(&state);
+    blocking(move || Ok(settings_view(&app, &state))).await
+}
+
+/// Record the interface language the user picked.
+///
+/// The webview's localStorage already holds it, but that storage is a cache: a
+/// rebuilt WebView2 profile loses it, and the welcome dialog then reappeared on
+/// launches that were not the first. This is the durable copy.
+#[tauri::command]
+async fn set_ui_language(state: AppState<'_>, language: String) -> CommandResult<()> {
+    let state = Arc::clone(&state);
+    blocking(move || {
+    // A short ASCII code; the webview rejects anything it has no dictionary for.
+    if language.len() > 8 || !language.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(fail("invalid_language"));
+    }
+    let mut settings = state.settings.lock().map_err(|_| fail("storage_locked"))?;
+    if settings.ui_language == language {
+        return Ok(());
+    }
+    let mut candidate = settings.clone();
+    candidate.ui_language = language;
+    candidate.save(state.settings_path.as_ref()).map_err(|error| fail_with("save_failed", error))?;
+    *settings = candidate;
+    Ok(())
+    }).await
 }
 
 #[tauri::command]
-fn update_settings(app: AppHandle, state: AppState<'_>, input: SettingsInput) -> CommandResult<SettingsView> {
+async fn update_settings(app: AppHandle, state: AppState<'_>, input: SettingsInput) -> CommandResult<SettingsView> {
+    let state = Arc::clone(&state);
+    blocking(move || {
     let ui_scale = input.ui_scale.clamp(scale::MIN_UI_SCALE, scale::MAX_UI_SCALE);
-    let previous_scale = {
-        let mut settings = state.settings.lock().map_err(|_| fail("storage_locked"))?;
-        settings.auto_refresh = input.auto_refresh;
-        settings.interval_minutes = input
-            .interval_minutes
-            .clamp(MIN_INTERVAL_MINUTES, MAX_INTERVAL_MINUTES);
-        settings.start_minimized = input.start_minimized;
-        settings.login_method = input.login_method;
-        settings.launch_game = input.launch_game;
-        settings.auto_update = input.auto_update;
-        let previous = std::mem::replace(&mut settings.ui_scale, ui_scale);
-        settings.save(state.settings_path.as_ref());
-        previous
-    };
+    let autolaunch = app.autolaunch();
+    let previous_autostart = autolaunch.is_enabled().map_err(|error| fail_with("autostart_failed", error))?;
+    let mut settings = state.settings.lock().map_err(|_| fail("storage_locked"))?;
+    let mut candidate = settings.clone();
+    candidate.auto_refresh = input.auto_refresh;
+    candidate.interval_minutes = input.interval_minutes.clamp(MIN_INTERVAL_MINUTES, MAX_INTERVAL_MINUTES);
+    candidate.start_minimized = input.start_minimized;
+    candidate.login_method = input.login_method;
+    candidate.launch_game = input.launch_game;
+    candidate.auto_update = input.auto_update;
+    candidate.ui_scale = ui_scale;
+    if previous_autostart != input.launch_at_startup {
+        let result = if input.launch_at_startup { autolaunch.enable() } else { autolaunch.disable() };
+        result.map_err(|error| fail_with("autostart_failed", error))?;
+    }
+    if let Err(error) = candidate.save(state.settings_path.as_ref()) {
+        if previous_autostart != input.launch_at_startup {
+            let rollback = if previous_autostart { autolaunch.enable() } else { autolaunch.disable() };
+            rollback.map_err(|rollback| fail_with("autostart_failed", rollback))?;
+        }
+        return Err(fail_with("save_failed", error));
+    }
+    let previous_scale = settings.ui_scale;
+    *settings = candidate;
+    drop(settings);
     if previous_scale != ui_scale {
         if let Some(window) = app.get_webview_window("main") {
             scale::apply(&window, previous_scale, ui_scale);
         }
     }
-    let autolaunch = app.autolaunch();
-    if autolaunch.is_enabled().unwrap_or(false) != input.launch_at_startup {
-        let result = if input.launch_at_startup {
-            autolaunch.enable()
-        } else {
-            autolaunch.disable()
-        };
-        result.map_err(|error| fail_with("autostart_failed", error))?;
-    }
     let _ = app.emit("schedule", schedule(&state));
     Ok(settings_view(&app, &state))
+    }).await
 }
 
 fn set_clipboard(text: &str) -> CommandResult<()> {
@@ -360,15 +476,20 @@ fn set_clipboard(text: &str) -> CommandResult<()> {
 }
 
 #[tauri::command]
-fn copy_account_id(state: AppState<'_>, key: Key) -> CommandResult<()> {
+async fn copy_account_id(state: AppState<'_>, key: Key) -> CommandResult<()> {
+    let state = Arc::clone(&state);
+    blocking(move || {
     let account = find_account(&state, key)?;
     set_clipboard(&account.account_id)?;
     state.clipboard_generation.fetch_add(1, Ordering::SeqCst);
     Ok(())
+    }).await
 }
 
 #[tauri::command]
-fn copy_password(state: AppState<'_>, key: Key) -> CommandResult<u64> {
+async fn copy_password(state: AppState<'_>, key: Key) -> CommandResult<u64> {
+    let state = Arc::clone(&state);
+    blocking(move || {
     let account = find_account(&state, key)?;
     let password = password_for(&account);
     if password.is_empty() {
@@ -390,6 +511,7 @@ fn copy_password(state: AppState<'_>, key: Key) -> CommandResult<u64> {
         }
     });
     Ok(PASSWORD_CLIPBOARD_TTL.as_secs())
+    }).await
 }
 
 #[derive(Serialize)]
@@ -418,7 +540,6 @@ async fn login(
 ) -> CommandResult<LoginResult> {
     let account = find_account(&state, key)?;
     let guard = state.login.try_start().ok_or_else(|| fail("login_busy"))?;
-    let password = password_for(&account);
     let settings = state.settings.lock().map(|s| s.clone()).unwrap_or_default();
     let shared = Arc::clone(&state);
     let account_key = account.key();
@@ -428,6 +549,7 @@ async fn login(
         if shared.login.cancel.load(Ordering::SeqCst) {
             return Err(LoginError::Cancelled);
         }
+        let password = password_for(&account);
         logging::record(
             Event::LoginStarted,
             if settings.login_method == LoginMethod::Previous {
@@ -439,6 +561,9 @@ async fn login(
         let mut progress = |step: LoginStep| {
             step.record();
             let _ = app.emit("login-step", step.code());
+        };
+        let mut on_update = |progress: Option<riot_client::UpdateProgress>| {
+            let _ = app.emit("login-update", progress);
         };
         let mut on_ban = |ban: Option<Ban>| {
             remember_ban(&app, &shared, &account_key, ban);
@@ -461,15 +586,30 @@ async fn login(
                 Game::League
             }
         });
-        riot_client::login(
+        let outcome = riot_client::login(
             &account.account_id,
             &password,
-            game,
-            close_running,
+            riot_client::LaunchOptions {
+                game,
+                locale: account.locale.as_deref(),
+                close_running,
+                skip_profile_update: account.skip_profile_update,
+            },
             &mut progress,
+            &mut on_update,
             &mut on_ban,
             &shared.login.cancel,
-        )
+        );
+        // Bulk-imported accounts usually have no Riot ID. The client now knows
+        // it, so record it instead of making the user look it up. Done on its
+        // own thread: the lookup can wait up to a minute, and the login (its
+        // guard, the overlay) has already succeeded and must not wait on it.
+        if outcome.is_ok() && needs_riot_id(&shared, &account_key) {
+            let (app, shared, key) = (app.clone(), Arc::clone(&shared), account_key.clone());
+            let wait_for_client = game.is_some();
+            thread::spawn(move || adopt_riot_id(&app, &shared, &key, wait_for_client));
+        }
+        outcome
     })
     .await
     .unwrap_or(Err(LoginError::WorkerPanicked));
@@ -504,6 +644,84 @@ fn remember_ban(app: &AppHandle, state: &Shared, key: &AccountKey, ban: Option<B
     let _ = manager.save_accounts();
     drop(manager);
     let _ = app.emit("account-update", view);
+}
+
+/// Wait for the League client's session, record the Riot ID it reports, then
+/// refresh that account's rank.
+///
+/// The client is still starting when the Riot sign-in finishes: it needs a few
+/// more seconds before `/lol-summoner/v1/current-summoner` answers. A single
+/// immediate read therefore usually found nothing and the account stayed
+/// nameless, so this polls for a bounded time.
+///
+/// Only an empty name is filled: a name the user typed is never replaced, and
+/// giving up (no client, unnamed account) leaves the account untouched. The
+/// rank refresh rides on that same condition — it only runs when this call
+/// actually supplied the ID, because a rank lookup needs a Riot ID and the
+/// account that already had one has been refreshable all along.
+fn adopt_riot_id(app: &AppHandle, shared: &Arc<Shared>, key: &AccountKey, wait_for_client: bool) {
+    if !needs_riot_id(shared, key) {
+        return;
+    }
+    let Some(riot_id) = wait_for_riot_id(
+        &shared.login.cancel,
+        wait_for_client,
+        riot_client::game_client_running,
+        || riot_client::signed_in_riot_id_for(&key.account_id),
+    ) else { return };
+    if shared.login.cancel.load(Ordering::SeqCst) { return; }
+    let Ok(mut manager) = manager(shared) else { return };
+    if shared.login.cancel.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(stored) = manager.account_mut(key) else { return };
+    // Re-checked against the stored value: an edit may have landed meanwhile.
+    if !stored.name.trim().is_empty() {
+        return;
+    }
+    let changes = leagueaccounts::account_manager::AccountChanges {
+        name: riot_id,
+        description: stored.description.clone(),
+        locale: stored.locale.clone(),
+        skip_profile_update: stored.skip_profile_update,
+        password: None,
+    };
+    let Ok((account, _)) = manager.update_account(key, changes) else { return };
+    let view = account_view(&account);
+    drop(manager);
+    let _ = app.emit("account-update", view);
+    start_refresh(app.clone(), Arc::clone(shared), vec![account], RefreshKind::Partial);
+}
+
+fn wait_for_riot_id(
+    cancel: &AtomicBool,
+    wait_for_client: bool,
+    mut client_running: impl FnMut() -> bool,
+    mut lookup: impl FnMut() -> Option<String>,
+) -> Option<String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        if cancel.load(Ordering::SeqCst) || (!wait_for_client && !client_running()) { return None; }
+        let found = lookup();
+        if cancel.load(Ordering::SeqCst) { return None; }
+        if found.is_some() { return found; }
+        if !wait_for_client { return None; }
+        // Each lookup snapshots every process and queries the client's API.
+        thread::sleep(Duration::from_millis(500));
+    }
+    None
+}
+
+/// Whether the account still has no Riot ID to fill in.
+fn needs_riot_id(state: &Shared, key: &AccountKey) -> bool {
+    manager(state)
+        .ok()
+        .and_then(|manager| {
+            manager
+                .account(key)
+                .map(|account| account.name.trim().is_empty())
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Serialize)]
@@ -548,6 +766,8 @@ async fn export_data(state: AppState<'_>, title: String) -> CommandResult<Option
     else {
         return Ok(None);
     };
+    let state = Arc::clone(&state);
+    blocking(move || {
     let json = manager(&state)?.export_accounts().map_err(|error| {
         logging::record(Event::ExportFailed, Reason::from_error(error.as_ref()));
         fail_with("export_failed", error)
@@ -557,6 +777,7 @@ async fn export_data(state: AppState<'_>, title: String) -> CommandResult<Option
         fail_with("file_write", error)
     })?;
     Ok(Some(path.display().to_string()))
+    }).await
 }
 
 #[tauri::command]
@@ -572,6 +793,8 @@ async fn import_data(state: AppState<'_>, title: String) -> CommandResult<Option
     else {
         return Ok(None);
     };
+    let state = Arc::clone(&state);
+    blocking(move || {
     let json = std::fs::read_to_string(&path).map_err(|error| {
         logging::record(Event::ImportFailed, Reason::from_error(&error));
         fail_with("file_read", error)
@@ -581,11 +804,14 @@ async fn import_data(state: AppState<'_>, title: String) -> CommandResult<Option
         fail_with("import_failed", error)
     })?;
     Ok(Some(BatchResult { added, skipped }))
+    }).await
 }
 
 /// Open the account's OP.GG page (LoL or TFT) in the default browser.
 #[tauri::command]
-fn open_profile(state: AppState<'_>, key: Key, tft: bool) -> CommandResult<()> {
+async fn open_profile(state: AppState<'_>, key: Key, tft: bool) -> CommandResult<()> {
+    let state = Arc::clone(&state);
+    blocking(move || {
     let account = find_account(&state, key)?;
     if account.name.is_empty() {
         return Err(fail("riot_id_missing"));
@@ -601,6 +827,7 @@ fn open_profile(state: AppState<'_>, key: Key, tft: bool) -> CommandResult<()> {
         .spawn()
         .map(|_| ())
         .map_err(|_| fail("browser"))
+    }).await
 }
 
 /// The update state now; `update-status` events carry every later change.
@@ -627,13 +854,15 @@ async fn update_idle(state: AppState<'_>) -> CommandResult<bool> {
 }
 
 #[tauri::command]
-fn restart_to_update(app: AppHandle, state: AppState<'_>) -> CommandResult<()> {
-    updater::restart(&app, &state)
+async fn restart_to_update(app: AppHandle, state: AppState<'_>) -> CommandResult<()> {
+    let state = Arc::clone(&state);
+    blocking(move || updater::restart(&app, &state)).await
 }
 
 /// Open a release page of this app's repository in the default browser.
 #[tauri::command]
-fn open_release(url: String) -> CommandResult<()> {
+async fn open_release(url: String) -> CommandResult<()> {
+    blocking(move || {
     if !updates::is_release_url(&url) {
         return Err(fail("browser"));
     }
@@ -642,10 +871,39 @@ fn open_release(url: String) -> CommandResult<()> {
         .spawn()
         .map(|_| ())
         .map_err(|_| fail("browser"))
+    }).await
+}
+
+/// Open ABC's Bilibili page, where the zh-cn-home-locale Pengu plugin is
+/// published. The URL is fixed here rather than passed in from the UI so the
+/// command cannot be repurposed to open an arbitrary link.
+#[tauri::command]
+async fn open_home_fix_author() -> CommandResult<()> {
+    blocking(move || {
+    std::process::Command::new("explorer.exe")
+        .arg("https://space.bilibili.com/230327779")
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| fail("browser"))
+    }).await
+}
+
+/// Open Pengu Loader's site, which the zh-cn-home-locale plugin needs. Fixed
+/// here for the same reason as the author link above.
+#[tauri::command]
+async fn open_pengu_loader() -> CommandResult<()> {
+    blocking(move || {
+    std::process::Command::new("explorer.exe")
+        .arg("https://pengu.lol")
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| fail("browser"))
+    }).await
 }
 
 #[tauri::command]
-fn open_logs_folder() -> CommandResult<()> {
+async fn open_logs_folder() -> CommandResult<()> {
+    blocking(move || {
     // Fall back to the default location when file logging failed to start,
     // and recreate the folder if it was deleted while the app was running.
     let directory = logging::directory()
@@ -660,6 +918,7 @@ fn open_logs_folder() -> CommandResult<()> {
             logging::record(Event::LogFolderOpenFailed, Reason::from_error(&error));
             fail("logs_folder")
         })
+    }).await
 }
 
 /// Windows 11 rounds undecorated windows that keep a shadow; the League client's
@@ -680,46 +939,21 @@ fn square_corners(window: &tauri::WebviewWindow) {
     }
 }
 
-fn main() {
-    logging::install_panic_hook();
-    // A logging failure must not prevent users from opening their accounts.
-    let _ = logging::init();
-    updater::finish_previous_update();
-
-    let provider: Arc<dyn RankProvider> = Arc::new(RankFetcher::new());
-    let mut manager = match AccountManager::new(provider) {
-        Ok(manager) => manager,
-        Err(_) => {
-            logging::record(Event::AppRunFailed, Reason::Storage);
-            std::process::exit(1);
+#[tauri::command]
+async fn app_ready(state: AppState<'_>) -> CommandResult<bool> {
+    let state = Arc::clone(&state);
+    blocking(move || {
+        if state.load_error.is_some() { return Ok(false); }
+        let Some(paths) = leagueaccounts::self_update::Paths::current() else { return Ok(false); };
+        if leagueaccounts::self_update::installed_target(&paths).as_deref() != Some(env!("CARGO_PKG_VERSION")) {
+            return Ok(false);
         }
-    };
-    let load_error = manager
-        .load_accounts()
-        .err()
-        .map(|error| fail_with("load_failed", error));
-    let settings_path = settings_file().ok();
-    let mut settings = Settings::load(settings_path.as_ref());
-    // Remember a mislabeled release across launches, not just this restart.
-    if let Some(release) = updater::mislabeled_release() {
-        settings.mislabeled_release = Some(release);
-        settings.save(settings_path.as_ref());
-    }
-    let updater = Updater::new(&settings);
-    let ui_scale = settings.ui_scale;
-    let start_minimized = (settings.start_minimized && std::env::args().any(|arg| arg == AUTOSTART_FLAG))
-        || updater::start_minimized_after_restart();
+        leagueaccounts::self_update::mark_healthy(&paths, env!("CARGO_PKG_VERSION")).map_err(|error| fail_with("update_failed", error))?;
+        Ok(true)
+    }).await
+}
 
-    let shared = Arc::new(Shared {
-        manager: Mutex::new(manager),
-        settings: Mutex::new(settings),
-        settings_path,
-        refresh_running: Mutex::new(false),
-        clipboard_generation: AtomicU64::new(0),
-        login: Arc::new(LoginControl::default()),
-        updater,
-        load_error,
-    });
+fn main() {
 
     let result = tauri::Builder::default()
         // Must come first. A second launch (shortcut, Start menu, autostart while the
@@ -739,11 +973,9 @@ fn main() {
             MacosLauncher::LaunchAgent,
             Some(vec![AUTOSTART_FLAG]),
         ))
-        .plugin(login_control::plugin(Arc::clone(&shared.login)))
-        .plugin(updater::plugin(Arc::clone(&shared)))
-        .manage(Arc::clone(&shared))
         .invoke_handler(tauri::generate_handler![
             bootstrap,
+            app_ready,
             list_accounts,
             add_account,
             multi_add,
@@ -752,6 +984,7 @@ fn main() {
             refresh_ranks,
             get_settings,
             update_settings,
+            set_ui_language,
             copy_account_id,
             copy_password,
             login,
@@ -766,8 +999,53 @@ fn main() {
             restart_to_update,
             open_release,
             open_logs_folder,
+            open_home_fix_author,
+            open_pengu_loader,
         ])
         .setup(move |app| {
+    logging::install_panic_hook();
+    // A logging failure must not prevent users from opening their accounts.
+    let _ = logging::init();
+    updater::finish_previous_update();
+    // A VN login that was killed mid-way could not restore `hosts` itself.
+    leagueaccounts::vn_hosts::restore_leftovers();
+
+    let provider: Arc<dyn RankProvider> = Arc::new(RankFetcher::new());
+    let mut manager = match AccountManager::new(provider) {
+        Ok(manager) => manager,
+        Err(_) => {
+            logging::record(Event::AppRunFailed, Reason::Storage);
+            std::process::exit(1);
+        }
+    };
+    let load_error = manager
+        .load_accounts()
+        .err()
+        .map(|error| fail_with("load_failed", error));
+    let settings_path = settings_file().ok();
+    let mut settings = Settings::load(settings_path.as_ref());
+    // Remember a mislabeled release across launches, not just this restart.
+    if let Some(release) = updater::mislabeled_release() {
+        settings.mislabeled_release = Some(release);
+        let _ = settings.save(settings_path.as_ref());
+    }
+    let updater = Updater::new(&settings);
+    let ui_scale = settings.ui_scale;
+    let start_minimized = (settings.start_minimized && std::env::args().any(|arg| arg == AUTOSTART_FLAG))
+        || updater::start_minimized_after_restart();
+
+    let shared = Arc::new(Shared {
+        manager: Mutex::new(manager),
+        settings: Mutex::new(settings),
+        settings_path,
+        clipboard_generation: AtomicU64::new(0),
+        login: Arc::new(LoginControl::default()),
+        updater,
+        load_error,
+    });
+            app.manage(Arc::clone(&shared));
+            app.handle().plugin(login_control::plugin(Arc::clone(&shared.login)))?;
+            app.handle().plugin(updater::plugin(Arc::clone(&shared)))?;
             if let Some(window) = app.get_webview_window("main") {
                 square_corners(&window);
                 // The window opens at its configured size, which is 100%.
@@ -796,4 +1074,25 @@ fn main() {
             logging::record(Event::SessionEnded, Reason::None);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_completion_does_not_wait_without_a_requested_game_or_client() {
+        let cancel = AtomicBool::new(false);
+        assert_eq!(wait_for_riot_id(&cancel, false, || false, || panic!("no API exists")), None);
+    }
+
+    #[test]
+    fn profile_completion_rejects_results_after_cancellation() {
+        let cancel = AtomicBool::new(false);
+        assert_eq!(wait_for_riot_id(&cancel, true, || true, || {
+            cancel.store(true, Ordering::SeqCst);
+            Some("Player#TAG".into())
+        }), None);
+        assert_eq!(wait_for_riot_id(&cancel, true, || true, || panic!("cancelled")), None);
+    }
 }

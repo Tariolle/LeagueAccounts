@@ -68,7 +68,7 @@
 
 .login-title {
   margin: 0;
-  font-family: Beaufort, serif;
+  font-family: Beaufort, WenKai, NotoCJK, serif;
   font-weight: 600;
   font-size: 26px;
   letter-spacing: 0.06em;
@@ -175,6 +175,24 @@
   color: var(--muted);
   line-height: 1.55;
 }
+.login-update {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 12px;
+  text-align: center;
+  color: #c8aa6e;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+}
+.login-update[hidden],
+.login-update-eta[hidden] {
+  display: none;
+}
+.login-update-eta {
+  color: var(--muted);
+  font-size: 13px;
+}
 .login-actions {
   display: flex;
   gap: 10px;
@@ -263,6 +281,20 @@
 .update-banner .btn {
   height: 34px;
 }
+/* The launch check can finish after the app is visible; keep its progress
+   compact so it reads as a status line, not the launch screen. */
+.update-banner[data-update-progress] .update-body {
+  min-width: 190px;
+}
+.update-banner[data-update-progress] .update-meter {
+  width: 100%;
+  height: 10px;
+  padding: 2px;
+  margin-top: 2px;
+}
+.update-progress-detail {
+  font-variant-numeric: tabular-nums;
+}
 
 .update-row {
   display: flex;
@@ -298,7 +330,7 @@
 }
 .update-screen-title {
   margin: 0;
-  font-family: Beaufort, serif;
+  font-family: Beaufort, WenKai, NotoCJK, serif;
   font-size: 18px;
   font-weight: 700;
   letter-spacing: 0.1em;

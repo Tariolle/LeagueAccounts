@@ -1,7 +1,7 @@
 // Full-screen sign-in progress: shows each step reported by the backend
 // ("login-step" events) as it happens.
 
-import { accountLabel, type AccountView, type LoginStep } from "./api";
+import { accountLabel, type AccountView, type LoginStep, type LoginUpdate } from "./api";
 import { $, esc, fragment, leave } from "./dom";
 import { t, type MessageKey } from "./i18n";
 import { icon } from "./icons";
@@ -13,24 +13,34 @@ type StepState = "pending" | "active" | "done" | "error";
 const LABELS: Record<LoginStep, MessageKey> = {
   closeLeague: "login.step.closeLeague",
   openClient: "login.step.openClient",
-  waitAuth: "login.step.waitAuth",
   signOut: "login.step.signOut",
-  connect: "login.step.connect",
+  signIn: "login.step.signIn",
   verification: "login.step.verification",
-  findWindow: "login.step.findWindow",
   focus: "login.step.focus",
   type: "login.step.type",
-  confirm: "login.step.confirm",
   launchGame: "login.step.launchGame",
+  updating: "login.step.updating",
   done: "login.step.done",
 };
 
 export interface LoginOverlay {
   step(step: LoginStep): void;
+  update(progress: LoginUpdate | null): void;
   succeed(title: string, detail: string): void;
   finishInClient(): void;
   fail(message: string, title?: string): void;
   close(): void;
+}
+
+/** Minutes and seconds (or hours), matching the client's compact style. */
+function formatRemaining(ms: number): string {
+  const total = Math.max(1, Math.round(ms / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const mm = String(minutes).padStart(2, "0");
+  const ss = String(seconds).padStart(2, "0");
+  return hours > 0 ? `${hours}:${mm}:${ss}` : `${minutes}:${ss}`;
 }
 
 export function openLoginOverlay(options: {
@@ -41,22 +51,25 @@ export function openLoginOverlay(options: {
   launchGame: boolean;
   onCancel: () => void;
 }): LoginOverlay {
+  // Starting the client and waiting for its session are one action, and so
+  // are finding the form, typing and confirming: four separate rows only
+  // repeated what the title already said.
   const steps: LoginStep[] = options.viaRiot
     ? [
         ...(options.closeLeague ? (["closeLeague"] as LoginStep[]) : []),
         "openClient",
-        "waitAuth",
         "signOut",
-        "connect",
-        "findWindow",
-        "type",
-        "confirm",
+        "signIn",
         ...(options.launchGame ? (["launchGame"] as LoginStep[]) : []),
       ]
     : ["focus", "type"];
   const states = new Map<LoginStep, StepState>(steps.map((step) => [step, "pending"]));
-  const label = (step: LoginStep) =>
-    step === "focus" && !options.viaRiot ? t("login.step.focusPrevious") : t(LABELS[step]);
+  // A patch replaces the launch label; it is not a separate row.
+  let updating = false;
+  const label = (step: LoginStep) => {
+    if (step === "launchGame" && updating) return t("login.step.updating");
+    return step === "focus" && !options.viaRiot ? t("login.step.focusPrevious") : t(LABELS[step]);
+  };
 
   const overlay = fragment(`
     <div class="login-overlay" role="dialog" aria-modal="true" aria-live="polite" tabindex="-1">
@@ -80,6 +93,10 @@ export function openLoginOverlay(options: {
             )
             .join("")}
         </ol>
+        <div class="login-update" hidden>
+          <span class="login-update-percent"></span>
+          <span class="login-update-eta" hidden></span>
+        </div>
         <p class="login-message" hidden></p>
         <div class="login-actions">
           <button class="btn btn-ghost" data-login="cancel">${esc(t("common.cancel"))}</button>
@@ -105,6 +122,10 @@ export function openLoginOverlay(options: {
     steps.forEach((step) => {
       const state = states.get(step) ?? "pending";
       const item = $(`[data-step="${step}"]`, overlay);
+      // The launch row is renamed while the game is patching.
+      const text = label(step);
+      const caption = $(".step-label", item);
+      if (caption.textContent !== text) caption.textContent = text;
       if (item.className === state) return;
       item.className = state;
       const icons: Record<StepState, string> = {
@@ -125,7 +146,12 @@ export function openLoginOverlay(options: {
   };
 
   // The result stays on screen until the user closes it.
+  const hideUpdate = () => {
+    $(".login-update", overlay).hidden = true;
+  };
+
   const finish = (kind: "success" | "info" | "error", message: string) => {
+    hideUpdate();
     showCrest();
     overlay.classList.add(`is-${kind}`);
     progress.setAttribute("aria-valuetext", $(".login-title", overlay).textContent ?? "");
@@ -147,7 +173,26 @@ export function openLoginOverlay(options: {
         progress.setAttribute("aria-valuetext", message.textContent);
         return;
       }
+      if (step === "updating") {
+        // A patch belongs to the launch row: keep it active and say what is
+        // happening instead of adding a row that is usually skipped.
+        if (!states.has("launchGame")) return;
+        updating = true;
+        const index = steps.indexOf("launchGame");
+        steps.forEach((candidate, position) => {
+          const state = states.get(candidate);
+          if (position < index && state !== "error") states.set(candidate, "done");
+        });
+        states.set("launchGame", "active");
+        render();
+        return;
+      }
+      if (step === "launchGame") {
+        updating = false;
+        hideUpdate();
+      }
       if (step === "done") {
+        updating = false;
         steps.forEach((candidate) => {
           if (states.get(candidate) !== "error") states.set(candidate, "done");
         });
@@ -165,20 +210,38 @@ export function openLoginOverlay(options: {
       states.set(step, "active");
       render();
     },
+    update(progress) {
+      const line = $(".login-update", overlay);
+      if (!progress || progress.percent === null) {
+        line.hidden = true;
+        return;
+      }
+      const percent = Math.round(Math.min(100, Math.max(0, progress.percent)));
+      $(".login-update-percent", line).textContent = t("login.update.percent", { percent });
+      const eta = $(".login-update-eta", line);
+      const remaining = progress.remainingMs ?? 0;
+      eta.hidden = remaining <= 0;
+      if (remaining > 0) {
+        eta.textContent = t("login.update.remaining", { time: formatRemaining(remaining) });
+      }
+      line.hidden = false;
+    },
     succeed(title, detail) {
       api.step("done");
       $(".login-title", overlay).textContent = title;
       finish("success", detail);
     },
     finishInClient() {
+      updating = false;
       steps.forEach((step) => {
-        if (states.get(step) === "active" && step !== "confirm") states.set(step, "done");
+        if (states.get(step) === "active" && step !== "signIn") states.set(step, "done");
       });
       render();
       $(".login-title", overlay).textContent = t("login.finishTitle");
       finish("info", t("toast.finishSignIn"));
     },
     fail(message, title = t("login.failed")) {
+      updating = false;
       steps.forEach((step) => {
         if (states.get(step) === "active") states.set(step, "error");
       });

@@ -1,5 +1,5 @@
-//! Serialize login admission with shutdown, and keep the event loop alive
-//! until the worker has dropped its renderer and restored the normal client.
+//! Serialize login and refresh admission with shutdown, keeping the event
+//! loop alive until native cleanup and admitted storage work have finished.
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use tauri::{plugin::TauriPlugin, AppHandle, RunEvent, WindowEvent, Wry};
@@ -8,6 +8,8 @@ use tauri::{plugin::TauriPlugin, AppHandle, RunEvent, WindowEvent, Wry};
 struct State {
     running: bool,
     exiting: bool,
+    refreshes: usize,
+    full_refresh: bool,
 }
 
 #[derive(Default)]
@@ -18,6 +20,11 @@ pub struct LoginControl {
 }
 
 pub struct LoginGuard(Arc<LoginControl>);
+
+pub struct RefreshGuard {
+    control: Arc<LoginControl>,
+    exclusive: bool,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum ExitAction {
@@ -47,11 +54,32 @@ impl LoginControl {
         self.state.lock().unwrap_or_else(|error| error.into_inner()).running
     }
 
-    /// Close admission for an update restart, unless a login is running:
-    /// a restart never cancels a sign-in.
+    pub fn try_start_refresh(self: &Arc<Self>, exclusive: bool) -> Option<RefreshGuard> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.exiting || (exclusive && state.full_refresh) {
+            return None;
+        }
+        state.refreshes += 1;
+        state.full_refresh |= exclusive;
+        Some(RefreshGuard { control: Arc::clone(self), exclusive })
+    }
+
+    pub fn refresh_running(&self) -> bool {
+        self.state.lock().unwrap_or_else(|error| error.into_inner()).full_refresh
+    }
+
+    pub fn has_refreshes(&self) -> bool {
+        self.state.lock().unwrap_or_else(|error| error.into_inner()).refreshes != 0
+    }
+
+    pub fn is_exiting(&self) -> bool {
+        self.state.lock().unwrap_or_else(|error| error.into_inner()).exiting
+    }
+
+    /// Atomically close all admission only after login and refreshes are idle.
     pub fn close_if_idle(&self) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.running {
+        if state.running || state.refreshes != 0 {
             return false;
         }
         state.exiting = true;
@@ -63,7 +91,7 @@ impl LoginControl {
         let first_request = !state.exiting;
         state.exiting = true;
         self.request_cancel();
-        if !state.running {
+        if !state.running && state.refreshes == 0 {
             ExitAction::Ready
         } else if first_request {
             ExitAction::Wait
@@ -76,7 +104,7 @@ impl LoginControl {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let _idle = self
             .idle
-            .wait_while(state, |state| state.running)
+            .wait_while(state, |state| state.running || state.refreshes != 0)
             .unwrap_or_else(|error| error.into_inner());
     }
 }
@@ -86,6 +114,17 @@ impl Drop for LoginGuard {
         let mut state = self.0.state.lock().unwrap_or_else(|error| error.into_inner());
         state.running = false;
         self.0.idle.notify_all();
+    }
+}
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        let mut state = self.control.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.refreshes -= 1;
+        if self.exclusive {
+            state.full_refresh = false;
+        }
+        self.control.idle.notify_all();
     }
 }
 
@@ -218,5 +257,34 @@ mod tests {
         control.wait_idle();
         assert!(cleaned.load(Ordering::SeqCst));
         assert!(control.try_start().is_some());
+    }
+
+    #[test]
+    fn refresh_admission_blocks_restart_and_is_released_on_failure() {
+        let control = Arc::new(LoginControl::default());
+        let partial = control.try_start_refresh(false).unwrap();
+        let full = control.try_start_refresh(true).unwrap();
+        assert!(control.try_start_refresh(true).is_none());
+        assert!(!control.close_if_idle());
+        drop(full);
+        assert!(!control.refresh_running());
+        assert!(!control.close_if_idle());
+        drop(partial);
+        assert!(control.close_if_idle());
+        assert!(control.try_start_refresh(false).is_none());
+        assert!(control.try_start_refresh(true).is_none());
+    }
+
+    #[test]
+    fn exit_waits_for_all_refreshes_without_readmitting_work() {
+        let control = Arc::new(LoginControl::default());
+        let first = control.try_start_refresh(false).unwrap();
+        let second = control.try_start_refresh(false).unwrap();
+        assert_eq!(control.request_exit(), ExitAction::Wait);
+        assert!(control.try_start_refresh(false).is_none());
+        drop(first);
+        assert_eq!(control.request_exit(), ExitAction::Waiting);
+        drop(second);
+        assert_eq!(control.request_exit(), ExitAction::Ready);
     }
 }

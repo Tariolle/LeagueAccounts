@@ -15,6 +15,7 @@ keyring = { version = "3.6", features = ["windows-native"] }
 regex = "1.12"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 scraper = "0.24"
+semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
@@ -28,6 +29,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Credentials",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

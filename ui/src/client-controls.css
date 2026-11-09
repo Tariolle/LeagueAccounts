@@ -7,7 +7,7 @@
 .native-icon { display: inline-block; flex-shrink: 0; background: currentColor; mask: var(--icon) center / var(--icon-mask-size, contain) no-repeat; }
 .dev-tools { display: flex; align-items: center; gap: 10px; }
 .dev-tools[hidden] { display: none; }
-.dev-badge { font: 11px Spiegel, sans-serif; letter-spacing: .08em; padding: 3px 6px; border: 1px solid #3b7778; color: #8ed6d1; background: #0c262c; white-space: nowrap; }
+.dev-badge { font: 11px Spiegel, NotoCJK, sans-serif; letter-spacing: .08em; padding: 3px 6px; border: 1px solid #3b7778; color: #8ed6d1; background: #0c262c; white-space: nowrap; }
 ::-webkit-scrollbar { width: 11px; height: 11px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { border: 3px solid transparent; border-radius: 0; background: #785a28; background-clip: padding-box; min-height: 32px; }
@@ -33,7 +33,7 @@
 @keyframes client-sheen { from { transform: translateY(-100%) rotate(0); } 10% { transform: translateY(-80%) rotate(-5deg); } to { transform: translateY(100%) rotate(0); } }
 @keyframes client-flare { from, to { opacity: 0; } 25% { opacity: .6; } 50% { opacity: .3; } }
 /* lol-uikit-flat-button-secondary-content: Spiegel 700, #cdbe91. */
-.btn-ghost { font-family: Spiegel, sans-serif; font-weight: 700; color: #cdbe91; text-transform: none; letter-spacing: .025em; border-width: 1px; }
+.btn-ghost { font-family: Spiegel, NotoCJK, sans-serif; font-weight: 700; color: #cdbe91; text-transform: none; letter-spacing: .025em; border-width: 1px; }
 .icon-btn, .view-toggle, .view-toggle button { border-radius: 0; }
 @keyframes client-text-glow { from { text-shadow: 0 0 4px #f0e6d8; } 50% { text-shadow: 0 0 4px #f0e6d880; } to { text-shadow: 0 0 4px #f0e6d800; } }
 
@@ -50,11 +50,11 @@
 .select-wrap:not(.is-open, .is-disabled):is(:hover, :has(.framed-dropdown-current:focus-visible)) { border-image: linear-gradient(to top, #c89b3c, #f0e6d2) 1; background: linear-gradient(to top, rgba(88, 83, 66, .5), rgba(30, 35, 40, .5)); }
 .select-wrap.is-open { border-image: none; border-color: #463714; background: rgba(30, 35, 40, .5); }
 .select-wrap.is-disabled { border-image: none; border-color: #3c3c41; cursor: default; }
-.select-label { padding-right: 8px; font: 12px/16px Spiegel, sans-serif; letter-spacing: .025em; color: #5b5a56; }
+.select-label { padding-right: 8px; font: 12px/16px Spiegel, NotoCJK, sans-serif; letter-spacing: .025em; color: #5b5a56; }
 .select-wrap.is-open .select-label { color: #463714; }
 .field .select-wrap { min-width: 140px; }
 .framed-dropdown { position: relative; display: flex; align-items: center; align-self: stretch; flex: 1 1 auto; min-width: 0; }
-.framed-dropdown-current { flex: 1; min-width: 0; padding: 0 29px 0 0; font: 12px/30px Spiegel, sans-serif; letter-spacing: .025em; color: #a09b8c; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; outline: 0; cursor: pointer; user-select: none; }
+.framed-dropdown-current { flex: 1; min-width: 0; padding: 0 29px 0 0; font: 400 12px/30px Spiegel, NotoCJK, sans-serif; letter-spacing: .025em; color: #a09b8c; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; outline: 0; cursor: pointer; user-select: none; }
 .framed-dropdown-current::after { content: ''; position: absolute; right: 8px; top: 50%; width: 13px; height: 18px; transform: translateY(-50%); background: url('/league/controls/up-down-arrow.png') center no-repeat; }
 .framed-dropdown.is-open .framed-dropdown-current { color: #463714; }
 .framed-dropdown.is-open .framed-dropdown-current::after { background-image: url('/league/controls/up-down-arrow-locked.png'); }
@@ -66,11 +66,16 @@
 /* The flyout opens flush under the frame at its width and reveals over 400ms; closing is
    instant. The frame clips the reveal and only the inner list scrolls, so no scrollbar
    flashes while it grows. */
-.framed-dropdown-options { position: fixed; inset: auto; top: anchor(bottom); left: anchor(left); width: anchor-size(width); position-try-fallbacks: flip-block; box-sizing: border-box; margin: 0; padding: 0; max-height: 0; overflow: hidden; border: 1px solid transparent; border-image: linear-gradient(to top, #695625, #463714) 1; background: #010a13; color: #cdbe91; }
-.framed-dropdown-options:popover-open { max-height: min(400px, 60dvh); transition: max-height 400ms; }
+/* Position and size come from `place()` in dropdown.ts, which measures the
+   room above and below the frame: CSS anchor positioning can pick a side but
+   cannot keep a near-bottom flyout inside the viewport. */
+.framed-dropdown-options { position: fixed; inset: auto; left: anchor(left); width: anchor-size(width); box-sizing: border-box; margin: 0; padding: 0; max-height: 0; overflow: hidden; border: 1px solid transparent; border-image: linear-gradient(to top, #695625, #463714) 1; background: #010a13; color: #cdbe91; }
+.framed-dropdown-options:popover-open { transition: max-height 400ms; }
+
 @starting-style { .framed-dropdown-options:popover-open { max-height: 0; } }
-.framed-dropdown-scroll { position: relative; max-height: calc(min(400px, 60dvh) - 2px); overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; }
-.framed-dropdown-option { position: relative; min-height: 30px; padding: 2px 9px 2px 7px; border-top: 1px solid #1f2123; font: 12px/30px Spiegel, sans-serif; letter-spacing: .025em; color: #cdbe91; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; user-select: none; }
+/* The flyout sets the ceiling (see `place()`); the inner list fills it. */
+.framed-dropdown-scroll { position: relative; max-height: inherit; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; }
+.framed-dropdown-option { position: relative; min-height: 30px; padding: 2px 9px 2px 7px; border-top: 1px solid #1f2123; font: 400 12px/30px Spiegel, NotoCJK, sans-serif; letter-spacing: .025em; color: #cdbe91; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; user-select: none; }
 .framed-dropdown-option[aria-selected="true"] { padding-right: 31px; }
 .framed-dropdown-option[aria-selected="true"]::after { content: ''; position: absolute; right: 13px; top: 50%; width: 14px; height: 11px; transform: translateY(-50%); background: url('/league/controls/dropdown-check.png') center no-repeat; }
 .framed-dropdown-option.is-active { color: #f0e6d2; background: #1e2328; }
@@ -130,7 +135,7 @@
 .win-btn:is(:hover, :focus-visible), .win-close:hover { background: none; color: #f0e6d2; }
 .win-btn:active { color: #5b5a56; }
 .tabs { padding: 0; border: 0; border-bottom: 1px solid #463714; border-radius: 0; background: none; }
-.tabs button { font-family: Beaufort, serif; text-transform: uppercase; letter-spacing: .075em; border-radius: 0; position: relative; }
+.tabs button { font-family: Beaufort, WenKai, NotoCJK, serif; text-transform: uppercase; letter-spacing: .075em; border-radius: 0; position: relative; }
 .tabs button[aria-selected='true'] { color: #f0e6d2; background: linear-gradient(0deg, #cdbe9126, transparent); }
 .tabs button[aria-selected='true']::after { content: ''; position: absolute; height: 1px; left: 0; right: 0; bottom: -1px; background: linear-gradient(90deg, transparent, #cdbe91, transparent); }
 
@@ -146,7 +151,7 @@
 /* lol-uikit context-menu (live: friend-list right-click): flush 29px rows, 18px gold
    glyphs, danger rows in the client's red. */
 .menu { min-width: 127px; padding: 0; border: 2px solid transparent; border-image: linear-gradient(to bottom, #463714, #785a28) 1; border-radius: 0; background: #010a13; box-shadow: 0 0 1px #000, 0 0 1px #000; backdrop-filter: none; animation: client-fade 160ms linear; }
-.menu-item { justify-content: flex-start; height: 29px; padding: 0 10px; gap: 8px; border-radius: 0; font: 12px/29px Spiegel, sans-serif; letter-spacing: normal; text-align: left; color: #cdbe91; white-space: nowrap; transition: none; }
+.menu-item { justify-content: flex-start; height: 29px; padding: 0 10px; gap: 8px; border-radius: 0; font: 12px/29px Spiegel, NotoCJK, sans-serif; letter-spacing: normal; text-align: left; color: #cdbe91; white-space: nowrap; transition: none; }
 .menu-item > span:not(.icon) { flex: 1 1 auto; text-align: left; }
 /* 18px slot as in the client; these PNG glyphs fill their canvas, so mask them smaller. */
 .menu-item .icon { flex: none; --icon-size: 18px; --icon-mask-size: 12px; color: #c8aa6e; }
@@ -156,7 +161,7 @@
 .menu-item.danger:is(:hover, :focus-visible), .menu-item.danger:is(:hover, :focus-visible) .icon { color: #ff4461; background: #1e2328; }
 .menu-item.danger:active, .menu-item.danger:active .icon { color: #ff062c; }
 .toast { border-radius: 0; background: #010a13; border-color: #785a28; }
-.client-tooltip { position: fixed; z-index: 20000; pointer-events: none; box-sizing: border-box; max-width: min(280px, calc(100vw - 16px)); max-height: calc(100vh - 32px); overflow-wrap: anywhere; padding: 10px 12px; border: 2px solid transparent; border-image: linear-gradient(to top, #785a28, #463714 50%) 1; background: #1a1c21; box-shadow: 0 0 0 1px #010a137a, 0 0 10px 1px #0008; color: #cdbe91; font: 12px/18px Spiegel, sans-serif; letter-spacing: .025em; animation: client-fade 160ms linear; }
+.client-tooltip { position: fixed; z-index: 20000; pointer-events: none; box-sizing: border-box; max-width: min(280px, calc(100vw - 16px)); max-height: calc(100vh - 32px); overflow-wrap: anywhere; padding: 10px 12px; border: 2px solid transparent; border-image: linear-gradient(to top, #785a28, #463714 50%) 1; background: #1a1c21; box-shadow: 0 0 0 1px #010a137a, 0 0 10px 1px #0008; color: #cdbe91; font: 12px/18px Spiegel, NotoCJK, sans-serif; letter-spacing: .025em; animation: client-fade 160ms linear; }
 .client-tooltip::after { content: ''; position: absolute; width: 16px; height: 11px; left: calc(var(--caret-x) - 10px); bottom: -11px; background: url('/league/frame/tooltip-system-caret.png') center / contain no-repeat; }
 .client-tooltip[data-position='bottom'] { border-image: linear-gradient(to bottom, #785a28, #463714 50%) 1; }
 .client-tooltip[data-position='bottom']::after { top: -11px; bottom: auto; transform: rotate(180deg); }
