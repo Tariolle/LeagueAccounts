@@ -72,8 +72,14 @@ pub fn write(path: &Path, locale: &str) -> bool {
     // The locale line is edited first: inserting into the list above it would
     // shift its index, and `line` was recorded before any change.
     if current != locale {
-        // The line ends with `"xx_YY"`; swap only the value inside the quotes.
-        lines[line] = lines[line].replace(&format!("{current}\""), &format!("{locale}\""));
+        // The line is `locale: "xx_YY"`; rebuild only the quoted value. A
+        // substring replace of `{current}"` matched every quote when the
+        // current value was empty and left the YAML malformed.
+        let Some(key_end) = lines[line].find("locale:") else {
+            return false;
+        };
+        let prefix = &lines[line][..key_end + "locale:".len()];
+        lines[line] = format!("{prefix} \"{locale}\"");
         changed = true;
     }
     if !allows(&lines, locale) {
@@ -84,9 +90,11 @@ pub fn write(path: &Path, locale: &str) -> bool {
         changed = true;
     }
     if changed {
-        let mut text = lines.join("\n");
+        // `lines()` drops `\r`; write the file back with its own line ending.
+        let newline = if contents.contains("\r\n") { "\r\n" } else { "\n" };
+        let mut text = lines.join(newline);
         if contents.ends_with('\n') {
-            text.push('\n');
+            text.push_str(newline);
         }
         if !write_through_read_only(path, &text) {
             return false;
@@ -293,6 +301,20 @@ mod tests {
         assert_eq!(after.matches("\"zh_MY\"").count(), 2, "{after}");
         assert_eq!(after.lines().count(), sample().lines().count());
         assert_eq!(read(&path).as_deref(), Some("zh_MY"));
+    }
+
+    #[test]
+    fn an_empty_locale_and_crlf_line_endings_are_rewritten_cleanly() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("product_settings.yaml");
+        let crlf = sample().replace("locale: \"zh_TW\"\n    shortcut", "locale: \"\"\n    shortcut")
+            .replace('\n', "\r\n");
+        std::fs::write(&path, &crlf).unwrap();
+
+        assert!(write(&path, "zh_MY"));
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("    locale: \"zh_MY\"\r\n"), "{after:?}");
+        assert!(!after.replace("\r\n", "").contains('\n'), "{after:?}");
     }
 
     #[test]

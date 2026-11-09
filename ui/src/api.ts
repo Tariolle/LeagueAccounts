@@ -230,12 +230,14 @@ export function parseAccountLine(line: string): Pick<NewAccount, "accountId" | "
   // Mirrors `parse_account_line` in Rust: `--` separates fields, two fields
   // mean no Riot ID yet, and a three-field line needs all three filled. A
   // password that starts with `--` therefore fails to parse rather than
-  // silently losing its dashes.
+  // silently losing its dashes. The middle field must look like a Riot ID
+  // (`Name#TAG`, no leading dash), so a password containing `--` or the old
+  // `---` separator form is rejected instead of truncating the password.
   const parts = line.split("--").map((part) => part.trim());
   if (parts.length === 2 && parts[0] && parts[1]) {
     return { accountId: parts[0], name: "", password: parts[1] };
   }
-  if (parts.length === 3 && parts[0] && parts[1] && parts[2]) {
+  if (parts.length === 3 && parts[0] && parts[1].includes("#") && !parts[1].startsWith("-") && parts[2]) {
     return { accountId: parts[0], name: parts[1], password: parts[2] };
   }
   return undefined;

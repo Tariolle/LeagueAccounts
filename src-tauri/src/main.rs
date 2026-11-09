@@ -601,9 +601,13 @@ async fn login(
             &shared.login.cancel,
         );
         // Bulk-imported accounts usually have no Riot ID. The client now knows
-        // it, so record it instead of making the user look it up.
-        if outcome.is_ok() {
-            adopt_riot_id(&app, &shared, &account_key, game.is_some());
+        // it, so record it instead of making the user look it up. Done on its
+        // own thread: the lookup can wait up to a minute, and the login (its
+        // guard, the overlay) has already succeeded and must not wait on it.
+        if outcome.is_ok() && needs_riot_id(&shared, &account_key) {
+            let (app, shared, key) = (app.clone(), Arc::clone(&shared), account_key.clone());
+            let wait_for_client = game.is_some();
+            thread::spawn(move || adopt_riot_id(&app, &shared, &key, wait_for_client));
         }
         outcome
     })
@@ -702,7 +706,8 @@ fn wait_for_riot_id(
         if cancel.load(Ordering::SeqCst) { return None; }
         if found.is_some() { return found; }
         if !wait_for_client { return None; }
-        thread::sleep(Duration::from_millis(100));
+        // Each lookup snapshots every process and queries the client's API.
+        thread::sleep(Duration::from_millis(500));
     }
     None
 }
@@ -1002,6 +1007,8 @@ fn main() {
     // A logging failure must not prevent users from opening their accounts.
     let _ = logging::init();
     updater::finish_previous_update();
+    // A VN login that was killed mid-way could not restore `hosts` itself.
+    leagueaccounts::vn_hosts::restore_leftovers();
 
     let provider: Arc<dyn RankProvider> = Arc::new(RankFetcher::new());
     let mut manager = match AccountManager::new(provider) {

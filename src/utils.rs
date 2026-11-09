@@ -61,7 +61,15 @@ pub fn parse_account_line(line: &str) -> Option<(&str, &str, &str)> {
         // Three fields: the middle one must actually carry a name. An empty
         // middle field means the line had a stray separator (`user----secret`),
         // and guessing which side lost a character is worse than refusing it.
-        [account_id, name, password] if !name.is_empty() => (account_id, name, password),
+        //
+        // The middle field must look like a Riot ID (`Name#TAG`, no leading
+        // dash). Otherwise a two-field line whose password contains `--`
+        // (`user--pa--ss`) or a line in the old `---` separator form
+        // (`user---Name#TAG---pass`) would parse as a different account with
+        // a truncated password instead of being rejected.
+        [account_id, name, password] if name.contains('#') && !name.starts_with('-') => {
+            (account_id, name, password)
+        }
         _ => return None,
     };
     (!account_id.is_empty() && !password.is_empty()).then_some((account_id, name, password))
@@ -154,6 +162,8 @@ mod tests {
             "user----secret",        // empty middle field
             "user--name--pass--x",   // too many fields
             "user----password",      // password begins with `--`, so empty field
+            "user--pa--ss",          // password contains `--`: middle is no Riot ID
+            "user---Name#TAG---pass", // old `---` separator form
         ] {
             assert_eq!(parse_account_line(invalid), None, "{invalid:?}");
         }

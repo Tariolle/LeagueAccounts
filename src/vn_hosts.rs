@@ -15,7 +15,7 @@
 
 use crate::logging::{self, Event, Reason};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The two VN identity-provider endpoints Riot blocks the login on.
 pub const VN_HOSTS: &[&str] = &["login.pp.m.zing.vn", "vn-api.vnggames.app"];
@@ -36,7 +36,11 @@ fn entries() -> Vec<String> {
 
 /// Are all VN domains already blocked?
 pub fn is_patched() -> bool {
-    let Ok(contents) = std::fs::read_to_string(hosts_path()) else {
+    is_patched_at(&hosts_path())
+}
+
+fn is_patched_at(path: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(path) else {
         return false;
     };
     VN_HOSTS.iter().all(|host| {
@@ -49,14 +53,23 @@ pub fn is_patched() -> bool {
 
 /// Append the block entries. Idempotent; admin rights required.
 pub fn patch() -> std::io::Result<()> {
-    if is_patched() {
+    patch_at(&hosts_path())
+}
+
+fn patch_at(path: &Path) -> std::io::Result<()> {
+    if is_patched_at(path) {
         return Ok(());
     }
-    let path = hosts_path();
-    let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
-    writeln!(file)?; // hosts files conventionally end without a newline.
+    let existing = std::fs::read_to_string(path)?;
+    let newline = line_ending(&existing);
+    let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+    // Only terminate an unterminated last line; an unconditional newline left
+    // a blank line behind after every patch/restore cycle.
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        write!(file, "{newline}")?;
+    }
     for entry in entries() {
-        writeln!(file, "{entry}")?;
+        write!(file, "{entry}{newline}")?;
     }
     file.flush()?;
     logging::record(Event::HostsPatched, Reason::None);
@@ -65,19 +78,41 @@ pub fn patch() -> std::io::Result<()> {
 
 /// Remove the marked lines. Leaves every other line untouched.
 pub fn restore() -> std::io::Result<()> {
-    let path = hosts_path();
-    let contents = std::fs::read_to_string(&path)?;
+    restore_at(&hosts_path())
+}
+
+fn restore_at(path: &Path) -> std::io::Result<()> {
+    let contents = std::fs::read_to_string(path)?;
+    if !contents.contains(MARKER) {
+        return Ok(());
+    }
+    let newline = line_ending(&contents);
     let kept: Vec<&str> = contents
         .lines()
         .filter(|line| !line.contains(MARKER))
         .collect();
-    let mut file = std::fs::OpenOptions::new().write(true).truncate(true).open(&path)?;
-    for line in kept {
-        writeln!(file, "{line}")?;
+    let mut text = kept.join(newline);
+    if !text.is_empty() && contents.ends_with('\n') {
+        text.push_str(newline);
     }
-    file.flush()?;
+    std::fs::write(path, text)?;
     logging::record(Event::HostsRestored, Reason::None);
     Ok(())
+}
+
+/// Remove entries a previous run left behind when it was killed or crashed
+/// mid-login, before its guard could restore them. Call once at startup.
+pub fn restore_leftovers() {
+    let _ = restore();
+}
+
+/// The file's own line ending, so a rewrite does not convert CRLF to LF.
+fn line_ending(contents: &str) -> &'static str {
+    if contents.contains("\r\n") || contents.is_empty() {
+        "\r\n"
+    } else {
+        "\n"
+    }
 }
 
 /// Patch on creation, restore on drop. `enabled == false` makes it a no-op, so
@@ -87,20 +122,18 @@ pub struct Guard {
 }
 
 impl Guard {
-    pub fn new(enabled: bool) -> Self {
+    /// Fails when `hosts` cannot be written (usually: not elevated). The caller
+    /// reports it, since the skip flag silently does nothing without the patch.
+    pub fn new(enabled: bool) -> std::io::Result<Self> {
         if enabled {
             if let Err(error) = patch() {
-                // Without admin rights the patch fails. The login continues
-                // unpatched: a VN account then waits out Riot's retries and
-                // may fail, which the error message already covers.
-                logging::record(
-                    Event::LoginWaiting,
-                    Reason::HostsPatchFailed,
-                );
-                let _ = error;
+                logging::record(Event::LoginWaiting, Reason::HostsPatchFailed);
+                // A partial append must not outlive the failed login.
+                let _ = restore();
+                return Err(error);
             }
         }
-        Self { enabled }
+        Ok(Self { enabled })
     }
 }
 
@@ -115,6 +148,55 @@ impl Drop for Guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn patch_then_restore_leaves_the_file_byte_for_byte() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hosts");
+        for original in [
+            "# comment\r\n127.0.0.1 localhost\r\n",
+            "# comment\r\n127.0.0.1 localhost",
+            "# comment\n127.0.0.1 localhost\n",
+        ] {
+            std::fs::write(&path, original).unwrap();
+            for _ in 0..3 {
+                patch_at(&path).unwrap();
+                assert!(is_patched_at(&path));
+                let patched = std::fs::read_to_string(&path).unwrap();
+                assert_eq!(patched.matches(MARKER).count(), VN_HOSTS.len(), "{patched:?}");
+                // Idempotent while patched.
+                patch_at(&path).unwrap();
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), patched);
+                restore_at(&path).unwrap();
+            }
+            let restored = std::fs::read_to_string(&path).unwrap();
+            // An unterminated last line gains its terminator once; otherwise
+            // nothing changes, however many cycles ran.
+            let expected = if original.ends_with('\n') {
+                original.to_owned()
+            } else {
+                format!("{original}\r\n")
+            };
+            assert_eq!(restored, expected);
+            assert!(!is_patched_at(&path));
+        }
+    }
+
+    #[test]
+    fn restore_without_marked_lines_does_not_touch_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hosts");
+        std::fs::write(&path, "127.0.0.1 login.pp.m.zing.vn\n").unwrap();
+        restore_at(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "127.0.0.1 login.pp.m.zing.vn\n");
+    }
+
+    #[test]
+    fn line_ending_follows_the_file() {
+        assert_eq!(line_ending("a\r\nb\r\n"), "\r\n");
+        assert_eq!(line_ending("a\nb\n"), "\n");
+        assert_eq!(line_ending(""), "\r\n");
+    }
 
     #[test]
     fn entries_cover_both_domains_with_the_marker() {

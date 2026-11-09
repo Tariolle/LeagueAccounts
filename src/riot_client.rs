@@ -26,6 +26,8 @@ const REGION_TIMEOUT: Duration = Duration::from_secs(10);
 /// the first request.
 const LOCALE_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCALE_POLL: Duration = Duration::from_millis(300);
+/// Launch-wait ticks (about a second each) between locale re-checks.
+const LOCALE_CHECK_TICKS: u32 = 5;
 const POLL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +162,9 @@ pub enum LoginError {
     AccountMismatch,
     /// Riot reports a League suspension; the game would disconnect at once.
     Banned(Ban),
+    /// The VN profile-update skip needs `hosts`, which could not be written
+    /// (usually because the app is not running as administrator).
+    HostsPatchFailed,
     WorkerPanicked,
 }
 
@@ -185,6 +190,7 @@ impl LoginError {
             LoginError::GameLaunchFailed => "game_launch_failed",
             LoginError::AccountMismatch => "game_account_mismatch",
             LoginError::Banned(_) => "account_banned",
+            LoginError::HostsPatchFailed => "hosts_patch_failed",
             LoginError::WorkerPanicked => "autotype_failed",
         }
     }
@@ -211,6 +217,7 @@ impl LoginError {
             LoginError::GameLaunchFailed => Reason::GameLaunchFailed,
             LoginError::AccountMismatch => Reason::AccountMismatch,
             LoginError::Banned(_) => Reason::AccountBanned,
+            LoginError::HostsPatchFailed => Reason::HostsPatchFailed,
             LoginError::WorkerPanicked => Reason::WorkerPanicked,
         }
     }
@@ -308,6 +315,7 @@ fn launch_game(
             reported_progress = update;
         }
     };
+    let mut locale_ticks: u32 = 0;
     let result = launch_game_with(
         account_id,
         cancel,
@@ -333,10 +341,14 @@ fn launch_game(
             // The client rewrites the product settings from its own metadata
             // a few seconds after it starts, which can undo the locale the
             // login applied and put the region default back before the game
-            // process is spawned. One attempt per tick, so a client that is
-            // still starting never blocks the loop.
+            // process is spawned. One attempt every few ticks, so a client
+            // that is still starting never blocks the loop, and a long patch
+            // does not re-read and re-write Riot's settings file every second.
             if let Some(locale) = locale {
-                ensure_locale(game, locale);
+                if locale_ticks.is_multiple_of(LOCALE_CHECK_TICKS) {
+                    ensure_locale(game, locale);
+                }
+                locale_ticks += 1;
             }
             thread::sleep(Duration::from_secs(1));
         },
@@ -394,15 +406,21 @@ fn launch_game_with(
         // Keep checking after each patch and during login confirmation. Even
         // an observed game process must not hide a newly active patch.
         let snapshot = update();
-        if blocked && snapshot.is_some_and(|snapshot| !snapshot.updating) {
+        if blocked && work.is_some() && snapshot.is_some_and(|snapshot| !snapshot.updating) {
             // A late language patch must still leave the game a full startup
-            // window. An unavailable API alone cannot reset that deadline.
+            // window. An unavailable API alone cannot reset that deadline, and
+            // neither can a 424 whose patch never showed up as active work:
+            // that would re-request every tick and never count as a stall.
             attempts = 0;
             blocked = false;
         }
         let snapshot = snapshot.filter(|snapshot| snapshot.updating);
         check_cancelled(cancel)?;
-        if confirmed && snapshot.is_none() {
+        // Only an active job (Updating/Repairing) holds back a confirmed game.
+        // `OutOfDate`/`NeedsRepair` can describe the *next* launch while this
+        // one runs, and no launch request is sent while the game is up, so
+        // waiting on them would end a working login as a stalled patch.
+        if confirmed && snapshot.is_none_or(|snapshot| snapshot.needs_launch) {
             report(None);
             return Ok(());
         }
@@ -458,6 +476,10 @@ fn launch_game_with(
                     stalled = 0;
                     work = Some(current_work);
                 }
+            } else {
+                // Blocked (Riot answered 424) with no active patch to show:
+                // nothing is progressing, so it counts towards the stall limit.
+                stalled += 1;
             }
             diagnostics.waiting(Reason::Updating);
             update_ticks += 1;
@@ -1189,49 +1211,6 @@ impl GameStatus {
     }
 }
 
-/// The signed-in player's `GameName#TagLine`, from the game client's own API.
-///
-/// `/lol-summoner/v1/current-summoner` belongs to the League client, which
-/// listens on its own port described by its own lockfile. Asking the Riot
-/// Client's API for it always fails, which is why this asks through the same
-/// path as [`game_username`]: the League client process, its install directory,
-/// and a lockfile whose PID matches that process.
-///
-/// Wait up to a minute for the launched client's summoner record. Cancellation
-/// stops discovery without changing the result of the completed sign-in.
-pub fn wait_for_riot_id(cancel: &AtomicBool) -> Option<String> {
-    wait_for_riot_id_with(
-        cancel,
-        Duration::from_secs(60),
-        || riot_id_from_processes(&running_processes()),
-        || thread::sleep(POLL),
-    )
-}
-
-fn wait_for_riot_id_with(
-    cancel: &AtomicBool,
-    timeout: Duration,
-    mut read: impl FnMut() -> Option<String>,
-    mut wait: impl FnMut(),
-) -> Option<String> {
-    let started = Instant::now();
-    while started.elapsed() < timeout {
-        if cancel.load(Ordering::SeqCst) {
-            return None;
-        }
-        let riot_id = read();
-        // Cancellation can arrive during a local API request too.
-        if cancel.load(Ordering::SeqCst) {
-            return None;
-        }
-        if riot_id.is_some() {
-            return riot_id;
-        }
-        wait();
-    }
-    None
-}
-
 /// Whether a game client exists; does not perform local API requests.
 pub fn game_client_running() -> bool {
     running_processes().iter().any(|process| {
@@ -1247,6 +1226,13 @@ pub fn signed_in_riot_id_for(account_id: &str) -> Option<String> {
     riot_id_from_processes(&processes)
 }
 
+/// The signed-in player's `GameName#TagLine`, from the game client's own API.
+///
+/// `/lol-summoner/v1/current-summoner` belongs to the League client, which
+/// listens on its own port described by its own lockfile. Asking the Riot
+/// Client's API for it always fails, which is why this asks through the same
+/// path as [`game_username`]: the League client process, its install directory,
+/// and a lockfile whose PID matches that process.
 fn riot_id_from_processes(processes: &[Process]) -> Option<String> {
     let mut riot_id: Option<String> = None;
     for process in processes
@@ -1395,7 +1381,8 @@ pub fn login(
     // The patch must stay in place for the whole login: Riot's profile flow
     // runs during it, not before. Restored in a scope guard so an error or
     // cancellation cannot leave the machine patched.
-    let _vn_patch = crate::vn_hosts::Guard::new(skip_profile_update);
+    let _vn_patch = crate::vn_hosts::Guard::new(skip_profile_update)
+        .map_err(|_| LoginError::HostsPatchFailed)?;
     let path = client_path().ok_or(LoginError::ClientMissing)?;
     let current = status();
     check_cancelled(cancel)?;
@@ -1483,7 +1470,7 @@ pub fn login(
         // No launch now, but the next manual start should already be in the
         // account's language, so apply it to the product the user plays.
         if let Some(locale) = locale {
-            apply_locale(game.unwrap_or(Game::League), locale, cancel);
+            apply_locale(Game::League, locale, cancel);
         }
         client.restore()?;
         check_cancelled(cancel)?;
@@ -1598,58 +1585,6 @@ mod windows {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
-
-    #[test]
-    fn riot_id_discovery_stops_when_cancelled_before_or_during_a_read() {
-        let cancel = AtomicBool::new(true);
-        let result = wait_for_riot_id_with(
-            &cancel,
-            Duration::from_secs(60),
-            || panic!("cancelled discovery must not query the client"),
-            || panic!("cancelled discovery must not wait"),
-        );
-        assert_eq!(result, None);
-
-        cancel.store(false, Ordering::SeqCst);
-        let result = wait_for_riot_id_with(
-            &cancel,
-            Duration::from_secs(60),
-            || {
-                cancel.store(true, Ordering::SeqCst);
-                Some("Player#EUW".into())
-            },
-            || panic!("cancelled discovery must not wait"),
-        );
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn riot_id_discovery_retries_a_starting_client_and_obeys_its_deadline() {
-        let cancel = AtomicBool::new(false);
-        let reads = Cell::new(0);
-        let waits = Cell::new(0);
-        let result = wait_for_riot_id_with(
-            &cancel,
-            Duration::from_secs(60),
-            || {
-                reads.set(reads.get() + 1);
-                (reads.get() == 2).then(|| "Player#EUW".into())
-            },
-            || waits.set(waits.get() + 1),
-        );
-        assert_eq!(result.as_deref(), Some("Player#EUW"));
-        assert_eq!(reads.get(), 2);
-        assert_eq!(waits.get(), 1);
-        assert_eq!(
-            wait_for_riot_id_with(
-                &cancel,
-                Duration::ZERO,
-                || panic!("expired discovery must not query the client"),
-                || panic!("expired discovery must not wait"),
-            ),
-            None
-        );
-    }
 
     #[test]
     fn summoner_riot_id_joins_name_and_uppercased_tag() {
@@ -2657,6 +2592,36 @@ mod tests {
     }
 
     #[test]
+    fn a_confirmed_game_is_not_held_back_by_a_pending_next_patch() {
+        // Riot reports OutOfDate/NeedsRepair for the *next* launch while the
+        // confirmed game runs; that must not turn into a stalled-patch failure.
+        let ticks = Cell::new(0u32);
+        let result = launch_game_with(
+            "selected",
+            &AtomicBool::new(false),
+            || GameStatus {
+                client_open: ticks.get() >= 2,
+                signed_in_user: Some("selected".into()),
+                game_user: (ticks.get() >= 2).then(|| "selected".into()),
+                ..GameStatus::default()
+            },
+            || Ok(Launch::Accepted),
+            || {
+                (ticks.get() >= 2).then_some(UpdateSnapshot {
+                    updating: true,
+                    needs_launch: true,
+                    progress: UpdateProgress { percent: None, remaining_ms: None },
+                    work: 0,
+                })
+            },
+            &mut |_| {},
+            || ticks.set(ticks.get() + 1),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(ticks.get(), 2, "confirmed as soon as the game appeared");
+    }
+
+    #[test]
     fn percentage_progress_without_bytes_finishes_and_completed_samples_do_not_block_launch() {
         let ticks = Cell::new(0u32);
         let result = launch_game_with(
@@ -2704,7 +2669,9 @@ mod tests {
             || ticks.set(ticks.get() + 1),
         );
         assert_eq!(result, Err(LoginError::GameLaunchFailed));
-        assert_eq!(ticks.get(), UPDATE_TICKS - 1);
+        // 424 with no observable patch makes no progress, so it ends at the
+        // stall limit rather than spending the whole 30-minute patch budget.
+        assert_eq!(ticks.get(), UPDATE_STALL_TICKS - 1);
         assert_eq!(reported.borrow().first(), Some(&Some(UpdateProgress {
             percent: None,
             remaining_ms: None,
