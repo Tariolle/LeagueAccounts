@@ -1,22 +1,26 @@
 import {
   ArrowDownUp,
   ChevronDown,
+  Download,
   EyeOff,
   FolderOpen,
   Keyboard,
   LayoutGrid,
   List,
+  Upload,
   type IconNode,
 } from "lucide";
 
 const ICONS: Record<string, IconNode> = {
   "arrow-down-up": ArrowDownUp,
   "chevron-down": ChevronDown,
+  download: Download,
   "eye-off": EyeOff,
   "folder-open": FolderOpen,
   keyboard: Keyboard,
   "layout-grid": LayoutGrid,
   list: List,
+  upload: Upload,
 };
 
 const attrs = (values: Record<string, string | number | undefined>): string =>
@@ -28,8 +32,7 @@ const attrs = (values: Record<string, string | number | undefined>): string =>
 // Client masks retain their original silhouettes and take the control's state color.
 const CLIENT_ICONS: Record<string, string> = {
   clock: "clock.svg", settings: "icon_settings.png", check: "check.svg",
-  alert: "warning.svg", copy: "icon_copy.png", download: "icon_export.png",
-  upload: "icon_import.png", "external-link": "external-link-mask.png",
+  alert: "warning.svg", copy: "icon_copy.png", "external-link": "external-link-mask.png",
   eye: "preview.svg", info: "info-icon.svg", key: "lock.svg",
   login: "icon_next.png", minus: "icon_remove.png", more: "ellipses.svg",
   pencil: "icon_edit.png", plus: "icon_plus.png", "refresh-cw": "refresh.png",
