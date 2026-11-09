@@ -48,12 +48,13 @@ fn launch_error(error: &io::Error, fallback: LoginError) -> LoginError {
     }
 }
 
-fn start_service(path: &Path, headless: bool) -> Result<(), LoginError> {
+fn start_service(path: &Path, headless: bool, kept: &[OsString]) -> Result<(), LoginError> {
     let mut process = command(path);
     if headless {
         process.arg("--headless");
     }
     process
+        .args(kept)
         .spawn()
         .map(|_| ())
         .map_err(|error| launch_error(&error, LoginError::LaunchFailed))
@@ -110,6 +111,36 @@ fn client_processes(root: &Path) -> Result<Vec<Process>, LoginError> {
     Ok(processes)
 }
 
+/// Whether a restarted client needs `arg` to work as it did. Chat proxies
+/// such as Deceive start the client with their own configuration server;
+/// restarting without it would show the player online.
+fn kept_arg(arg: &OsString) -> bool {
+    arg.to_str().is_some_and(|arg| arg.starts_with("--client-config-url="))
+}
+
+/// The running service's arguments that a restart must keep.
+fn service_args(path: &Path) -> Result<Vec<OsString>, LoginError> {
+    let root = path.parent().ok_or(LoginError::ClientMissing)?;
+    let mut kept = Vec::new();
+    for process in client_processes(root)?
+        .iter()
+        .filter(|p| p.name == "riotclientservices.exe")
+    {
+        let Some(args) = windows::process_args(process.pid) else {
+            if running_processes().iter().any(|p| p.pid == process.pid) {
+                return Err(LoginError::RiotCloseFailed);
+            }
+            continue;
+        };
+        for arg in args.into_iter().skip(1).filter(kept_arg) {
+            if !kept.contains(&arg) {
+                kept.push(arg);
+            }
+        }
+    }
+    Ok(kept)
+}
+
 /// End every client process of this installation.
 ///
 /// `taskkill /F /PID` ends only the named process: Riot's UX spawns renderer,
@@ -118,19 +149,21 @@ fn client_processes(root: &Path) -> Result<Vec<Process>, LoginError> {
 /// whole installation down.
 fn stop_client(path: &Path, cancel: &AtomicBool) -> Result<(), LoginError> {
     let root = path.parent().ok_or(LoginError::ClientMissing)?;
-    let kill = |process: &Process| {
-        // Exact processes under this Riot installation only; never game processes.
-        // `/T` is required: the UX spawns renderer/GPU/utility/crashpad children,
-        // and a `/PID`-only kill leaves that tree running.
-        let _ = command(Path::new("taskkill.exe"))
-            .args(["/F", "/T", "/PID", &process.pid.to_string()])
-            .status();
-    };
     stop_client_with(
         cancel,
         CLOSE_TIMEOUT,
         || client_processes(root),
-        |processes| processes.iter().for_each(kill),
+        |processes| {
+            // Exact processes under this Riot installation only; never game
+            // processes. One call keeps the restart quick: Deceive exits when
+            // no Riot Client replaces its own within 3 seconds.
+            let mut taskkill = command(Path::new("taskkill.exe"));
+            taskkill.args(["/F", "/T"]);
+            for process in processes {
+                taskkill.args(["/PID", &process.pid.to_string()]);
+            }
+            let _ = taskkill.status();
+        },
         || {
             let _ = wait(cancel, Duration::from_millis(200));
         },
@@ -261,8 +294,10 @@ pub(super) struct Renderer {
     cdp: Option<Cdp>,
     normal: Option<(PathBuf, Vec<OsString>, String)>,
     restore_needed: bool,
+    /// Arguments of the service this login replaced, for every later start.
+    service_args: Vec<OsString>,
     // One seam for deterministic lifecycle tests without launching Riot.
-    service_start: fn(&Path, bool) -> Result<(), LoginError>,
+    service_start: fn(&Path, bool, &[OsString]) -> Result<(), LoginError>,
 }
 
 impl Renderer {
@@ -273,6 +308,7 @@ impl Renderer {
             cdp: None,
             normal: None,
             restore_needed: false,
+            service_args: Vec::new(),
             service_start: start_service,
         }
     }
@@ -301,7 +337,7 @@ impl Renderer {
             // Startup can require MFA or another interactive step before the
             // lifecycle becomes signed out. Keep the normal UI available until
             // sign_in owns a temporary renderer for a confirmed login form.
-            (self.service_start)(&self.service, false)?;
+            (self.service_start)(&self.service, false, &self.service_args)?;
         }
         Ok(())
     }
@@ -359,7 +395,7 @@ impl Renderer {
             }) && command(path).args(args).spawn().is_ok()
         });
         if !restored {
-            (self.service_start)(&self.service, false)?;
+            (self.service_start)(&self.service, false, &self.service_args)?;
         }
         self.restore_needed = false;
         Ok(())
@@ -372,7 +408,7 @@ impl Renderer {
         }
         // An already signed-in client has no temporary renderer to replace;
         // starting the service again opens or raises its normal window.
-        (self.service_start)(&self.service, false)
+        (self.service_start)(&self.service, false, &self.service_args)
     }
 }
 
@@ -411,9 +447,10 @@ pub(super) fn sign_in(
     let service = renderer.service.clone();
     progress(LoginStep::SignIn);
     renderer.ensure_controllable()?;
+    renderer.service_args = service_args(&service)?;
     renderer.restore_needed = true;
     stop_client(&service, cancel)?;
-    (renderer.service_start)(&service, true)?;
+    (renderer.service_start)(&service, true, &renderer.service_args)?;
     let start = Instant::now();
     let api = loop {
         check_cancelled(cancel)?;
@@ -614,11 +651,11 @@ mod tests {
     use std::cell::RefCell;
 
     thread_local! {
-        static STARTS: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+        static STARTS: RefCell<Vec<(bool, Vec<OsString>)>> = const { RefCell::new(Vec::new()) };
     }
 
-    fn fake_start(_: &Path, headless: bool) -> Result<(), LoginError> {
-        STARTS.with(|starts| starts.borrow_mut().push(headless));
+    fn fake_start(_: &Path, headless: bool, kept: &[OsString]) -> Result<(), LoginError> {
+        STARTS.with(|starts| starts.borrow_mut().push((headless, kept.to_vec())));
         Ok(())
     }
 
@@ -630,7 +667,41 @@ mod tests {
     }
 
     fn starts() -> Vec<bool> {
-        STARTS.with(|starts| starts.borrow().clone())
+        STARTS.with(|starts| {
+            starts
+                .borrow()
+                .iter()
+                .map(|(headless, _)| *headless)
+                .collect()
+        })
+    }
+
+    #[test]
+    fn a_restarted_client_keeps_only_a_chat_proxys_configuration_server() {
+        // Deceive's launch, as Windows splits it.
+        let deceive = [
+            r"C:\Riot Games\Riot Client\RiotClientServices.exe",
+            "--client-config-url=http://127.0.0.1:52000",
+            "--launch-product=league_of_legends",
+            "--launch-patchline=live",
+            "--allow-direct-launch",
+        ]
+        .map(OsString::from);
+        let kept: Vec<_> = deceive.into_iter().skip(1).filter(kept_arg).collect();
+        assert_eq!(
+            kept,
+            ["--client-config-url=http://127.0.0.1:52000"].map(OsString::from)
+        );
+
+        // A normal window opened after the login starts with it too.
+        let mut renderer = fixture();
+        renderer.service_args = kept.clone();
+        renderer.restore_needed = true;
+        drop(renderer);
+        assert_eq!(
+            STARTS.with(|starts| starts.borrow().clone()),
+            vec![(false, kept)]
+        );
     }
 
     #[test]
@@ -835,8 +906,8 @@ mod tests {
 
     #[test]
     fn failed_normal_start_is_reported_without_retry_on_drop() {
-        fn fail_start(path: &Path, headless: bool) -> Result<(), LoginError> {
-            fake_start(path, headless)?;
+        fn fail_start(path: &Path, headless: bool, kept: &[OsString]) -> Result<(), LoginError> {
+            fake_start(path, headless, kept)?;
             Err(LoginError::LaunchFailed)
         }
         let mut renderer = fixture();
@@ -868,8 +939,8 @@ mod tests {
 
     #[test]
     fn failed_cleanup_is_logged_apart_from_the_login_result() {
-        fn elevated_start(path: &Path, headless: bool) -> Result<(), LoginError> {
-            fake_start(path, headless)?;
+        fn elevated_start(path: &Path, headless: bool, kept: &[OsString]) -> Result<(), LoginError> {
+            fake_start(path, headless, kept)?;
             Err(LoginError::RiotElevated)
         }
         let log = logging::capture(|| {

@@ -83,6 +83,7 @@ username2--password2
 |---|---|
 | *Riot Client was not found* | Install the Riot Client, or use **Settings → Login → Type into the previous window**. |
 | *The Riot Client login screen or sign-in status wasn't ready in time* | Open the Riot Client once manually (it may be updating), then retry. |
+| Shown online while using [Deceive](https://github.com/molenzwiebel/Deceive) | Start Deceive first, then log in with League Accounts. A Riot Client that League Accounts opens itself doesn't go through Deceive. |
 | Ranks show **Unavailable** or *Riot ID not found* | Check the Riot ID and region; OP.GG may also be rate-limiting. |
 | The client's **home page is blank or broken** while the game language is `zh_CN` | Riot never published every home-page (activity-center) asset for `zh_CN`, so pages such as `jade-home` return 404 and the home page fails to render. Switch the account's game language to `zh_MY` or `zh_TW`, or install ABC's [zh-cn-home-locale](https://github.com/pengu-lol/pengu-loader) Pengu Loader plugin, which retries a failed page with `locale=zh_TW` inside the game client. |
 | Anything else | Attach the newest file from **Log folder** (sidebar) to an [issue](https://github.com/Tariolle/LeagueAccounts/issues). |
