@@ -18,10 +18,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@v4
+      # Node from mise.toml; Rust comes from rustup below.
+      - uses: jdx/mise-action@924e7c586e33d7d4bae9c14e26c5d22e2beb6e78 # v5.3.0
         with:
-          node-version: 22
-          cache: npm
+          install_args: node
+      - uses: actions/cache@v5
+        with:
+          path: ~/AppData/Local/npm-cache
+          key: npm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
       - name: Install stable Rust and Clippy
         run: rustup toolchain install stable --profile minimal --component clippy
       - name: Install frontend dependencies

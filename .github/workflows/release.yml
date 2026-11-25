@@ -19,10 +19,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@v4
+      # Node from mise.toml. No caches in the release job, so nothing restored
+      # from another workflow can reach the published executable.
+      - uses: jdx/mise-action@924e7c586e33d7d4bae9c14e26c5d22e2beb6e78 # v5.3.0
         with:
-          node-version: 22
-          cache: npm
+          install_args: node
+          cache: false
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
       - name: Check the tag and version files
