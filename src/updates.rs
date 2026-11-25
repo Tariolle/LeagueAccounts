@@ -147,10 +147,13 @@ fn debug_feed() -> Option<String> {
 /// Debug builds replace their own executable only when pointed at a test feed.
 pub fn can_install() -> bool {
     #[cfg(debug_assertions)]
-    if debug_feed().is_none() {
-        return false;
+    {
+        debug_feed().is_some()
     }
-    true
+    #[cfg(not(debug_assertions))]
+    {
+        true
+    }
 }
 
 fn client(timeout: Duration) -> Result<reqwest::blocking::Client, UpdateError> {

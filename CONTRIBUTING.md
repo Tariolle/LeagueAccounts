@@ -2,7 +2,11 @@
 
 ## Building from source
 
-Requirements: [Rust](https://rustup.rs) (MSVC toolchain), [Node.js](https://nodejs.org) 20+, and the Visual Studio C++ Build Tools.
+Requirements: [Rust](https://rustup.rs) (MSVC toolchain), [Node.js](https://nodejs.org) 22+, and the Visual Studio C++ Build Tools.
+
+With [mise](https://mise.jdx.dev), `mise install` sets up Node and Rust at the
+versions CI uses, and `mise tasks` lists shortcuts for the commands below
+(`mise run dev`, `mise run test`, `mise run lint`, ...).
 
 `rust-toolchain.toml` pins the MSVC toolchain. A GNU toolchain also compiles,
 but it links `WebView2Loader.dll` dynamically: that exe only starts next to the

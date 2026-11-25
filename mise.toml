@@ -1,0 +1,38 @@
+# Tool versions and common tasks for https://mise.jdx.dev (optional; plain
+# npm and cargo work too). Node matches CI.
+[settings]
+# Take Rust from rust-toolchain.toml (the MSVC pin) rather than a Rust version
+# set in a global mise config, which would override it through RUSTUP_TOOLCHAIN.
+idiomatic_version_file_enable_tools = ["rust"]
+
+[tools]
+node = "22"
+
+[tasks.dev]
+description = "Run the app with hot reload"
+run = "npm run tauri dev"
+
+[tasks.preview]
+description = "Serve the interface with synthetic accounts at http://localhost:1420"
+run = "npm run dev"
+
+[tasks."build:ui"]
+description = "Type-check and build the UI into dist/"
+run = "npm run build"
+
+[tasks.build]
+description = "Build the portable LeagueAccounts.exe"
+run = "npx tauri build --no-bundle"
+
+[tasks.test]
+description = "Renderer and Rust tests (the Rust shell embeds dist/, so the UI is built first)"
+depends = ["build:ui"]
+run = ["npm test", "cargo test --locked --workspace --all-targets"]
+
+[tasks."test:ui"]
+description = "Interface tests in headless Chrome"
+run = "npm run test:ui"
+
+[tasks.lint]
+description = "Clippy with warnings as errors"
+run = "cargo clippy --locked --workspace --all-targets -- -D warnings"
