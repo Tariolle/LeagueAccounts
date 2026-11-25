@@ -22,3 +22,6 @@ desktop.ini
 node_modules/
 dist/
 src-tauri/gen/
+
+# Personal mise overrides
+mise.local.toml
